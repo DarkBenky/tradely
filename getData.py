@@ -48,11 +48,51 @@ def save_combined_data_to_files(combined_data, symbols):
     for symbol in symbols:
         if symbol in combined_data:
             combined_df = combined_data[symbol]
-            
-            # Save to single file with both OHLCV and indicators
-            filename = f"data/{symbol}_complete_data.csv"
+
+            # Diagnostic: check node-based indicator columns
+            print(f"Diagnostics for {symbol} node indicators:")
+            # Volume nodes
+            for prefix in ['hvn_level_', 'hvn_strength_', 'lvn_level_']:
+                for i in range(1, 6):
+                    col = f"{prefix}{i}"
+                    if col in combined_df.columns:
+                        total = combined_df[col].sum(skipna=True)
+                        print(f"  {col}: present, sum={total}")
+                    else:
+                        print(f"  {col}: MISSING")
+            # Time nodes
+            for prefix in ['htn_level_', 'htn_strength_', 'ltn_level_']:
+                for i in range(1, 6):
+                    col = f"{prefix}{i}"
+                    if col in combined_df.columns:
+                        total = combined_df[col].sum(skipna=True)
+                        print(f"  {col}: present, sum={total}")
+                    else:
+                        print(f"  {col}: MISSING")
+            # Trade nodes
+            for prefix in ['trade_htn_level_', 'trade_htn_strength_', 'trade_ltn_level_']:
+                for i in range(1, 6):
+                    col = f"{prefix}{i}"
+                    if col in combined_df.columns:
+                        total = combined_df[col].sum(skipna=True)
+                        print(f"  {col}: present, sum={total}")
+                    else:
+                        print(f"  {col}: MISSING")
+            # Profiles
+            for col in ['volume_profile', 'time_profile', 'trade_profile']:
+                if col in combined_df.columns:
+                    total = combined_df[col].sum(skipna=True)
+                    print(f"  {col}: present, sum={total}")
+                else:
+                    print(f"  {col}: MISSING")
+            # Save to file with both OHLCV and indicators
+            filename = f"data/{symbol}_combined_data.csv"
             combined_df.to_csv(filename, index=False)
             print(f"Saved {filename} with {len(combined_df.columns)} columns ({len(combined_df)} rows)")
+            
+            # Also save as _complete_data.csv for backward compatibility
+            complete_filename = f"data/{symbol}_complete_data.csv"
+            combined_df.to_csv(complete_filename, index=False)
             
             # Also save just the raw OHLCV data for backward compatibility
             ohlcv_cols = ['timestamp', 'open', 'high', 'low', 'close', 'volume', 
@@ -74,7 +114,7 @@ if __name__ == "__main__":
     
     # Use tqdm for progress bar
     for symbol in tqdm(symbols, desc="Fetching data", unit="symbol"):
-        df = fetch_historical_data(symbol, interval, years=3)
+        df = fetch_historical_data(symbol, interval, years=1)
         if df is not None:
             all_data[symbol] = df
     

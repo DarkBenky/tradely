@@ -538,41 +538,22 @@ def calculate_volume_nodes(df: pd.DataFrame, window_size: int = 50, num_bins: in
             volume_per_bin = volume / bin_mask.sum()
             volume_profile[bin_mask] += volume_per_bin
     
-    # Apply smoothing to make volume profile continuous
-    volume_profile_smooth = ta._apply_smoothing(volume_profile, method=smoothing_method, sigma=sigma)
+    # Apply light smoothing to make volume profile continuous
+    volume_profile_smooth = ta._apply_smoothing(volume_profile, method=smoothing_method, sigma=sigma/2)
     
-    # Identify HVN and LVN
-    # HVN: peaks in volume profile (high volume areas)
-    # LVN: valleys in volume profile (low volume areas)
+    # More robust approach: Use quantile-based levels instead of peak detection
+    # Sort volume profile indices by volume strength
+    sorted_indices = np.argsort(volume_profile_smooth)
     
-    # Find local maxima and minima
-    from scipy.signal import find_peaks
+    # Get HVN levels (highest volume areas)
+    hvn_indices = sorted_indices[-multiple_returns:][::-1]  # Top N, highest first
+    hvn_prices = price_bins[hvn_indices]
+    hvn_strengths = volume_profile_smooth[hvn_indices]
     
-    hvn_indices, _ = find_peaks(volume_profile_smooth, height=np.percentile(volume_profile_smooth, 70))
-    lvn_indices, _ = find_peaks(-volume_profile_smooth, height=-np.percentile(volume_profile_smooth, 30))
-    
-    # Create time series aligned with original data
-    hvn_levels = pd.Series(index=df.index, dtype=float)
-    lvn_levels = pd.Series(index=df.index, dtype=float)
-    volume_profile_series = pd.Series(index=df.index, dtype=float)
-    hvn_strength = pd.Series(index=df.index, dtype=float)
-    
-    # Get top HVN and LVN levels
-    hvn_prices = price_bins[hvn_indices] if len(hvn_indices) > 0 else np.array([])
-    hvn_strengths = volume_profile_smooth[hvn_indices] if len(hvn_indices) > 0 else np.array([])
-    lvn_prices = price_bins[lvn_indices] if len(lvn_indices) > 0 else np.array([])
-    lvn_strengths = volume_profile_smooth[lvn_indices] if len(lvn_indices) > 0 else np.array([])
-    
-    # Sort by strength and get top N
-    if len(hvn_prices) > 0:
-        hvn_sorted_idx = np.argsort(hvn_strengths)[::-1]  # Descending order
-        hvn_prices = hvn_prices[hvn_sorted_idx][:multiple_returns]
-        hvn_strengths = hvn_strengths[hvn_sorted_idx][:multiple_returns]
-    
-    if len(lvn_prices) > 0:
-        lvn_sorted_idx = np.argsort(lvn_strengths)  # Ascending order (weakest first for LVN)
-        lvn_prices = lvn_prices[lvn_sorted_idx][:multiple_returns]
-        lvn_strengths = lvn_strengths[lvn_sorted_idx][:multiple_returns]
+    # Get LVN levels (lowest volume areas)
+    lvn_indices = sorted_indices[:multiple_returns]  # Bottom N, lowest first
+    lvn_prices = price_bins[lvn_indices]
+    lvn_strengths = volume_profile_smooth[lvn_indices]
     
     # Create multiple columns for each return
     result = {}
@@ -638,37 +619,22 @@ def calculate_time_nodes(df: pd.DataFrame, window_size: int = 50, num_bins: int 
             # Add 1 time unit to each overlapping bin (could weight by OHLC)
             time_profile[bin_mask] += 1
     
-    # Apply smoothing to make time profile continuous
-    time_profile_smooth = ta._apply_smoothing(time_profile, method=smoothing_method, sigma=sigma)
+    # Apply light smoothing to make time profile continuous
+    time_profile_smooth = ta._apply_smoothing(time_profile, method=smoothing_method, sigma=sigma/2)
     
-    # Find High Time Nodes and Low Time Nodes
-    from scipy.signal import find_peaks
+    # More robust approach: Use quantile-based levels instead of peak detection
+    # Sort time profile indices by time strength
+    sorted_indices = np.argsort(time_profile_smooth)
     
-    htn_indices, _ = find_peaks(time_profile_smooth, height=np.percentile(time_profile_smooth, 70))
-    ltn_indices, _ = find_peaks(-time_profile_smooth, height=-np.percentile(time_profile_smooth, 30))
+    # Get HTN levels (highest time areas)
+    htn_indices = sorted_indices[-multiple_returns:][::-1]  # Top N, highest first
+    htn_prices = price_bins[htn_indices]
+    htn_strengths = time_profile_smooth[htn_indices]
     
-    # Create time series aligned with original data
-    htn_levels = pd.Series(index=df.index, dtype=float)
-    ltn_levels = pd.Series(index=df.index, dtype=float)
-    time_profile_series = pd.Series(index=df.index, dtype=float)
-    htn_strength = pd.Series(index=df.index, dtype=float)
-    
-    # Get top HTN and LTN levels
-    htn_prices = price_bins[htn_indices] if len(htn_indices) > 0 else np.array([])
-    htn_strengths = time_profile_smooth[htn_indices] if len(htn_indices) > 0 else np.array([])
-    ltn_prices = price_bins[ltn_indices] if len(ltn_indices) > 0 else np.array([])
-    ltn_strengths = time_profile_smooth[ltn_indices] if len(ltn_indices) > 0 else np.array([])
-    
-    # Sort by strength and get top N
-    if len(htn_prices) > 0:
-        htn_sorted_idx = np.argsort(htn_strengths)[::-1]  # Descending order
-        htn_prices = htn_prices[htn_sorted_idx][:multiple_returns]
-        htn_strengths = htn_strengths[htn_sorted_idx][:multiple_returns]
-    
-    if len(ltn_prices) > 0:
-        ltn_sorted_idx = np.argsort(ltn_strengths)  # Ascending order (weakest first for LTN)
-        ltn_prices = ltn_prices[ltn_sorted_idx][:multiple_returns]
-        ltn_strengths = ltn_strengths[ltn_sorted_idx][:multiple_returns]
+    # Get LTN levels (lowest time areas)
+    ltn_indices = sorted_indices[:multiple_returns]  # Bottom N, lowest first
+    ltn_prices = price_bins[ltn_indices]
+    ltn_strengths = time_profile_smooth[ltn_indices]
     
     # Create multiple columns for each return
     result = {}
@@ -735,37 +701,22 @@ def calculate_trade_nodes(df: pd.DataFrame, window_size: int = 50, num_bins: int
             trades_per_bin = trades / bin_mask.sum()
             trade_profile[bin_mask] += trades_per_bin
     
-    # Apply smoothing to make trade profile continuous
-    trade_profile_smooth = ta._apply_smoothing(trade_profile, method=smoothing_method, sigma=sigma)
+    # Apply light smoothing to make trade profile continuous
+    trade_profile_smooth = ta._apply_smoothing(trade_profile, method=smoothing_method, sigma=sigma/2)
     
-    # Find High Trade Nodes and Low Trade Nodes
-    from scipy.signal import find_peaks
+    # More robust approach: Use quantile-based levels instead of peak detection
+    # Sort trade profile indices by trade strength
+    sorted_indices = np.argsort(trade_profile_smooth)
     
-    trade_htn_indices, _ = find_peaks(trade_profile_smooth, height=np.percentile(trade_profile_smooth, 70))
-    trade_ltn_indices, _ = find_peaks(-trade_profile_smooth, height=-np.percentile(trade_profile_smooth, 30))
+    # Get Trade HTN levels (highest trade areas)
+    trade_htn_indices = sorted_indices[-multiple_returns:][::-1]  # Top N, highest first
+    trade_htn_prices = price_bins[trade_htn_indices]
+    trade_htn_strengths = trade_profile_smooth[trade_htn_indices]
     
-    # Create time series aligned with original data
-    trade_htn_levels = pd.Series(index=df.index, dtype=float)
-    trade_ltn_levels = pd.Series(index=df.index, dtype=float)
-    trade_profile_series = pd.Series(index=df.index, dtype=float)
-    trade_htn_strength = pd.Series(index=df.index, dtype=float)
-    
-    # Get top Trade HTN and LTN levels
-    trade_htn_prices = price_bins[trade_htn_indices] if len(trade_htn_indices) > 0 else np.array([])
-    trade_htn_strengths = trade_profile_smooth[trade_htn_indices] if len(trade_htn_indices) > 0 else np.array([])
-    trade_ltn_prices = price_bins[trade_ltn_indices] if len(trade_ltn_indices) > 0 else np.array([])
-    trade_ltn_strengths = trade_profile_smooth[trade_ltn_indices] if len(trade_ltn_indices) > 0 else np.array([])
-    
-    # Sort by strength and get top N
-    if len(trade_htn_prices) > 0:
-        trade_htn_sorted_idx = np.argsort(trade_htn_strengths)[::-1]  # Descending order
-        trade_htn_prices = trade_htn_prices[trade_htn_sorted_idx][:multiple_returns]
-        trade_htn_strengths = trade_htn_strengths[trade_htn_sorted_idx][:multiple_returns]
-    
-    if len(trade_ltn_prices) > 0:
-        trade_ltn_sorted_idx = np.argsort(trade_ltn_strengths)  # Ascending order (weakest first for LTN)
-        trade_ltn_prices = trade_ltn_prices[trade_ltn_sorted_idx][:multiple_returns]
-        trade_ltn_strengths = trade_ltn_strengths[trade_ltn_sorted_idx][:multiple_returns]
+    # Get Trade LTN levels (lowest trade areas)
+    trade_ltn_indices = sorted_indices[:multiple_returns]  # Bottom N, lowest first
+    trade_ltn_prices = price_bins[trade_ltn_indices]
+    trade_ltn_strengths = trade_profile_smooth[trade_ltn_indices]
     
     # Create multiple columns for each return
     result = {}
