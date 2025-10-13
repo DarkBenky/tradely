@@ -63,8 +63,8 @@ def test_portfolio_env():
         starting_balance=10000.0,
         fee_rate=0.001,
         lookback_window=50,
-        rebalance_frequency=12,  # Rebalance every 12 steps (1 hour)
-        risk_free_rate=0.02,
+        rebalance_frequency=1,  # Rebalance every 12 steps (1 hour)
+        risk_free_rate=-0.02,
         max_drawdown_penalty=2.0,
         normalize_obs=True
     )
