@@ -9,12 +9,13 @@ from portfolio_env import MultiCurrencyPortfolioEnv
 import torch
 import matplotlib.pyplot as plt
 from datetime import datetime
+import wandb
+import json
 
 
 class PortfolioMetricsCallback(BaseCallback):
-    """Custom callback to log portfolio-specific metrics during training"""
     
-    def __init__(self, eval_env, eval_freq=1000, verbose=1):
+    def __init__(self, eval_env, eval_freq=1000, verbose=1, use_wandb=True, symbols=None):
         super(PortfolioMetricsCallback, self).__init__(verbose)
         self.eval_env = eval_env
         self.eval_freq = eval_freq
@@ -22,18 +23,49 @@ class PortfolioMetricsCallback(BaseCallback):
         self.episode_sharpe_ratios = []
         self.episode_drawdowns = []
         self.best_sharpe = -np.inf
+        self.use_wandb = use_wandb
+        self.symbols = symbols if symbols else []
         
     def _on_step(self) -> bool:
+        if self.use_wandb and hasattr(self.locals.get('infos', [{}])[0], '__iter__'):
+            infos = self.locals.get('infos', [{}])
+            if len(infos) > 0 and 'portfolio_value' in infos[0]:
+                info = infos[0]
+                log_data = {
+                    'train/step': self.n_calls,
+                    'train/portfolio_value': info.get('portfolio_value', 0),
+                    'train/cash_balance': info.get('cash_balance', 0),
+                    'train/total_return': info.get('total_return', 0),
+                    'train/reward': self.locals.get('rewards', [0])[0],
+                }
+                
+                cash_ratio = info.get('cash_balance', 0) / (info.get('portfolio_value', 1) + 1e-8)
+                log_data['train/cash_ratio'] = cash_ratio
+                
+                weights = info.get('weights', {})
+                if weights and self.symbols:
+                    for symbol in self.symbols:
+                        weight = weights.get(symbol, 0)
+                        log_data[f'train/weight_{symbol}'] = weight
+                
+                wandb.log(log_data)
+        
         if self.n_calls % self.eval_freq == 0:
-            # Evaluate current policy
             obs = self.eval_env.reset()[0]
             done = False
             step = 0
+            
+            episode_portfolio_values = []
+            episode_weights = []
+            episode_cash_balances = []
             
             while not done and step < 500:
                 action, _ = self.model.predict(obs, deterministic=True)
                 obs, reward, terminated, truncated, info = self.eval_env.step(action)
                 done = terminated or truncated
+                episode_portfolio_values.append(info.get('portfolio_value', 0))
+                episode_weights.append(info.get('weights', {}))
+                episode_cash_balances.append(info.get('cash_balance', 0))
                 step += 1
             
             metrics = self.eval_env.get_final_metrics()
@@ -41,6 +73,69 @@ class PortfolioMetricsCallback(BaseCallback):
             self.episode_returns.append(metrics['total_return'])
             self.episode_sharpe_ratios.append(metrics['sharpe_ratio'])
             self.episode_drawdowns.append(metrics['max_drawdown'])
+            
+            if self.use_wandb:
+                log_dict = {
+                    'eval/step': self.n_calls,
+                    'eval/total_return': metrics['total_return'],
+                    'eval/sharpe_ratio': metrics['sharpe_ratio'],
+                    'eval/max_drawdown': metrics['max_drawdown'],
+                    'eval/win_rate': metrics['win_rate'],
+                    'eval/profit_factor': metrics.get('profit_factor', 0),
+                    'eval/trades_executed': metrics.get('trades_executed', 0),
+                    'eval/total_fees': metrics.get('total_fees_paid', 0),
+                    'eval/final_portfolio_value': metrics['final_portfolio_value'],
+                    'eval/best_sharpe_so_far': self.best_sharpe,
+                }
+                
+                if episode_cash_balances:
+                    final_cash = episode_cash_balances[-1]
+                    final_portfolio_value = episode_portfolio_values[-1] if episode_portfolio_values else 1
+                    cash_ratio = final_cash / (final_portfolio_value + 1e-8)
+                    log_dict['eval/cash_balance'] = final_cash
+                    log_dict['eval/cash_ratio'] = cash_ratio
+                
+                if episode_weights and self.symbols:
+                    final_weights = episode_weights[-1]
+                    for symbol in self.symbols:
+                        weight = final_weights.get(symbol, 0)
+                        log_dict[f'eval/weight_{symbol}'] = weight
+                
+                if len(episode_portfolio_values) > 0:
+                    plt.figure(figsize=(10, 4))
+                    plt.plot(episode_portfolio_values)
+                    plt.title('Evaluation Portfolio Value')
+                    plt.xlabel('Step')
+                    plt.ylabel('Value ($)')
+                    plt.grid(True, alpha=0.3)
+                    log_dict['eval/portfolio_chart'] = wandb.Image(plt)
+                    plt.close()
+                
+                if episode_weights and self.symbols and len(episode_weights) > 0:
+                    plt.figure(figsize=(12, 6))
+                    weights_array = np.array([[w.get(s, 0) for s in self.symbols] for w in episode_weights])
+                    for i, symbol in enumerate(self.symbols):
+                        plt.plot(weights_array[:, i], label=symbol, alpha=0.7)
+                    plt.title('Asset Allocation Over Time')
+                    plt.xlabel('Step')
+                    plt.ylabel('Weight')
+                    plt.legend(loc='upper right')
+                    plt.grid(True, alpha=0.3)
+                    plt.ylim(0, 1)
+                    log_dict['eval/allocation_chart'] = wandb.Image(plt)
+                    plt.close()
+                
+                if episode_cash_balances and len(episode_cash_balances) > 0:
+                    plt.figure(figsize=(10, 4))
+                    plt.plot(episode_cash_balances, color='green')
+                    plt.title('Cash Balance Over Time')
+                    plt.xlabel('Step')
+                    plt.ylabel('Cash ($)')
+                    plt.grid(True, alpha=0.3)
+                    log_dict['eval/cash_chart'] = wandb.Image(plt)
+                    plt.close()
+                
+                wandb.log(log_dict)
             
             if self.verbose > 0:
                 print(f"\n{'='*60}")
@@ -51,10 +146,25 @@ class PortfolioMetricsCallback(BaseCallback):
                 print(f"  Win Rate: {metrics['win_rate']*100:.1f}%")
                 print(f"{'='*60}\n")
             
-            # Save best model based on Sharpe ratio
-            if metrics['sharpe_ratio'] > self.best_sharpe:
+            if metrics['sharpe_ratio'] > self.best_sharpe and metrics['sharpe_ratio'] > 0:
                 self.best_sharpe = metrics['sharpe_ratio']
-                self.model.save(f"{self.model.logger.dir}/best_model_sharpe_{metrics['sharpe_ratio']:.3f}")
+                model_path = f"{self.model.logger.dir}/best_model_sharpe_{metrics['sharpe_ratio']:.3f}"
+                self.model.save(model_path)
+                
+                if self.use_wandb:
+                    wandb.log({'eval/new_best_sharpe': metrics['sharpe_ratio']})
+                    
+                    import os
+                    zip_file = model_path + ".zip"
+                    if os.path.exists(zip_file):
+                        artifact = wandb.Artifact(
+                            name=f"model-best-sharpe",
+                            type="model",
+                            description=f"Best model with Sharpe ratio {metrics['sharpe_ratio']:.3f}"
+                        )
+                        artifact.add_file(zip_file)
+                        wandb.log_artifact(artifact)
+                
                 if self.verbose > 0:
                     print(f"New best Sharpe ratio! Model saved.")
         
@@ -62,7 +172,6 @@ class PortfolioMetricsCallback(BaseCallback):
 
 
 def load_data(symbols, data_dir='data'):
-    """Load data for all symbols"""
     dfs = {}
     
     for symbol in symbols:
@@ -75,7 +184,6 @@ def load_data(symbols, data_dir='data'):
                 df['datetime'] = pd.to_datetime(df['datetime'])
                 df = df.set_index('datetime')
             
-            # Keep only numeric columns
             numeric_cols = df.select_dtypes(include=[np.number]).columns
             df = df[numeric_cols]
             df = df.dropna()
@@ -89,18 +197,21 @@ def load_data(symbols, data_dir='data'):
     return dfs
 
 
-def create_env(dfs, symbols, starting_balance=10000, is_eval=False):
-    """Create portfolio environment"""
+def create_env(dfs, symbols, starting_balance=10000, is_eval=False,
+               fee_rate=0.001, lookback_window=50, rebalance_frequency=1,
+               risk_free_rate=-0.04, max_drawdown_penalty=2.0, normalize_obs=True,
+               reward_horizon=1):
     env = MultiCurrencyPortfolioEnv(
         dfs=dfs,
         symbols=symbols,
         starting_balance=starting_balance,
-        fee_rate=0.001,
-        lookback_window=50,
-        rebalance_frequency=12,  # Every hour (12 * 5min)
-        risk_free_rate=0.02,
-        max_drawdown_penalty=2.0,
-        normalize_obs=True
+        fee_rate=fee_rate,
+        lookback_window=lookback_window,
+        rebalance_frequency=rebalance_frequency,
+        risk_free_rate=risk_free_rate,
+        max_drawdown_penalty=max_drawdown_penalty,
+        normalize_obs=normalize_obs,
+        reward_horizon=reward_horizon
     )
     
     if not is_eval:
@@ -118,32 +229,31 @@ def train_portfolio_agent(
     n_steps=2048,
     starting_balance=10000,
     save_dir='models/portfolio',
-    log_dir='logs/portfolio'
+    log_dir='logs/portfolio',
+    use_wandb=True,
+    wandb_project='crypto-portfolio-rl',
+    wandb_run_name=None,
+    fee_rate=0.001,
+    lookback_window=50,
+    rebalance_frequency=1,
+    risk_free_rate=-0.04,
+    max_drawdown_penalty=2.0,
+    normalize_obs=True,
+    reward_return_weight=1.0,
+    reward_sharpe_weight=0.5,
+    reward_drawdown_weight=0.3,
+    reward_volatility_weight=0.2,
+    network_size='medium',
+    reward_horizon=1
 ):
-    """
-    Train a multi-currency portfolio rebalancing agent
-    
-    Args:
-        symbols: List of cryptocurrency symbols to trade
-        algorithm: 'PPO', 'A2C', or 'SAC'
-        total_timesteps: Total training steps
-        learning_rate: Learning rate for optimizer
-        batch_size: Batch size for training
-        n_steps: Steps per environment per update (for on-policy algorithms)
-        starting_balance: Initial portfolio balance
-        save_dir: Directory to save models
-        log_dir: Directory for tensorboard logs
-    """
     
     print("=" * 60)
     print("Multi-Currency Portfolio RL Training")
     print("=" * 60)
     
-    # Create directories
     os.makedirs(save_dir, exist_ok=True)
     os.makedirs(log_dir, exist_ok=True)
     
-    # Load data
     print("\nLoading data...")
     dfs = load_data(symbols)
     
@@ -153,7 +263,6 @@ def train_portfolio_agent(
     available_symbols = list(dfs.keys())
     print(f"\nTraining with {len(available_symbols)} symbols: {available_symbols}")
     
-    # Split data into train and validation
     print("\nSplitting data into train/validation sets...")
     train_dfs = {}
     val_dfs = {}
@@ -165,22 +274,89 @@ def train_portfolio_agent(
         val_dfs[symbol] = df.iloc[split_idx:].copy()
         print(f"  {symbol}: {len(train_dfs[symbol])} train, {len(val_dfs[symbol])} val")
     
-    # Create environments
+    if use_wandb:
+        if wandb_run_name is None:
+            wandb_run_name = f"{algorithm}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+        
+        wandb.init(
+            project=wandb_project,
+            name=wandb_run_name,
+            config={
+                'algorithm': algorithm,
+                'total_timesteps': total_timesteps,
+                'learning_rate': learning_rate,
+                'batch_size': batch_size,
+                'n_steps': n_steps,
+                'starting_balance': starting_balance,
+                'num_symbols': len(available_symbols),
+                'symbols': available_symbols,
+                'train_samples': sum(len(df) for df in train_dfs.values()),
+                'val_samples': sum(len(df) for df in val_dfs.values()),
+                'fee_rate': fee_rate,
+                'lookback_window': lookback_window,
+                'rebalance_frequency': rebalance_frequency,
+                'risk_free_rate': risk_free_rate,
+                'max_drawdown_penalty': max_drawdown_penalty,
+                'normalize_obs': normalize_obs,
+                'reward_return_weight': reward_return_weight,
+                'reward_sharpe_weight': reward_sharpe_weight,
+                'reward_drawdown_weight': reward_drawdown_weight,
+                'reward_volatility_weight': reward_volatility_weight,
+                'network_size': network_size,
+                'reward_horizon': reward_horizon,
+            },
+            tags=[algorithm, 'portfolio', 'crypto', f'net_{network_size}', f'horizon_{reward_horizon}'],
+            notes=f"Training {algorithm} agent on {len(available_symbols)} cryptocurrencies with {network_size} network, {reward_horizon}-step reward horizon"
+        )
+        print(f"\nWandB initialized: {wandb.run.url}")
+    
     print("\nCreating environments...")
-    train_env = create_env(train_dfs, available_symbols, starting_balance)
-    eval_env = create_env(val_dfs, available_symbols, starting_balance, is_eval=True)
+    train_env = create_env(train_dfs, available_symbols, starting_balance,
+                          fee_rate=fee_rate, lookback_window=lookback_window,
+                          rebalance_frequency=rebalance_frequency, risk_free_rate=risk_free_rate,
+                          max_drawdown_penalty=max_drawdown_penalty, normalize_obs=normalize_obs,
+                          reward_horizon=reward_horizon)
+    eval_env = create_env(val_dfs, available_symbols, starting_balance, is_eval=True,
+                         fee_rate=fee_rate, lookback_window=lookback_window,
+                         rebalance_frequency=rebalance_frequency, risk_free_rate=risk_free_rate,
+                         max_drawdown_penalty=max_drawdown_penalty, normalize_obs=normalize_obs,
+                         reward_horizon=reward_horizon)
     
     print(f"Observation space: {train_env.observation_space.shape}")
     print(f"Action space: {train_env.action_space.shape}")
     
-    # Create model
-    print(f"\nInitializing {algorithm} agent...")
+    if use_wandb:
+        wandb.config.update({
+            'observation_dim': train_env.observation_space.shape[0],
+            'action_dim': train_env.action_space.shape[0],
+        })
     
-    # Policy kwargs for better performance
+    print(f"\nInitializing {algorithm} agent with {network_size} network...")
+    
+    network_configs = {
+        'small': dict(pi=[128, 64], vf=[128, 64]),
+        'medium': dict(pi=[256, 128], vf=[256, 128]),
+        'large': dict(pi=[512, 256, 128], vf=[512, 256, 128]),
+        'xlarge': dict(pi=[1024, 512, 256], vf=[1024, 512, 256])
+    }
+    
+    if network_size not in network_configs:
+        print(f"Unknown network size '{network_size}', defaulting to 'medium'")
+        network_size = 'medium'
+    
+    net_arch = network_configs[network_size]
+    print(f"Network architecture: Policy={net_arch['pi']}, Value={net_arch['vf']}")
+    
     policy_kwargs = dict(
-        net_arch=dict(pi=[256, 256, 128], vf=[256, 256, 128]),
+        net_arch=net_arch,
         activation_fn=torch.nn.ReLU,
     )
+    
+    if use_wandb:
+        wandb.config.update({
+            'network_pi_layers': net_arch['pi'],
+            'network_vf_layers': net_arch['vf'],
+        })
     
     if algorithm == 'PPO':
         model = PPO(
@@ -231,7 +407,6 @@ def train_portfolio_agent(
     else:
         raise ValueError(f"Unknown algorithm: {algorithm}")
     
-    # Callbacks
     checkpoint_callback = CheckpointCallback(
         save_freq=10000,
         save_path=save_dir,
@@ -241,12 +416,15 @@ def train_portfolio_agent(
     metrics_callback = PortfolioMetricsCallback(
         eval_env=eval_env,
         eval_freq=5000,
-        verbose=1
+        verbose=1,
+        use_wandb=use_wandb,
+        symbols=available_symbols
     )
     
-    # Train
     print(f"\nStarting training for {total_timesteps} timesteps...")
     print("Monitor progress with: tensorboard --logdir=" + log_dir)
+    if use_wandb:
+        print(f"Monitor progress with W&B: {wandb.run.url}")
     print()
     
     try:
@@ -258,12 +436,6 @@ def train_portfolio_agent(
     except KeyboardInterrupt:
         print("\nTraining interrupted by user")
     
-    # Save final model
-    final_model_path = os.path.join(save_dir, f'{algorithm}_portfolio_final')
-    model.save(final_model_path)
-    print(f"\nFinal model saved to: {final_model_path}")
-    
-    # Evaluate final model
     print("\n" + "=" * 60)
     print("Evaluating Final Model")
     print("=" * 60)
@@ -305,24 +477,107 @@ def train_portfolio_agent(
     print(f"Trades Executed: {final_metrics['trades_executed']}")
     print(f"Total Fees: ${final_metrics['total_fees_paid']:.2f}")
     
-    # Plot results
-    plot_results(portfolio_values, actions_history, available_symbols, save_dir)
+    timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+    sharpe_str = f"{final_metrics['sharpe_ratio']:.2f}".replace('.', '_')
+    return_str = f"{final_metrics['total_return']*100:.1f}".replace('.', '_').replace('-', 'neg')
+    
+    final_model_name = f"{algorithm}_sharpe{sharpe_str}_ret{return_str}pct_{timestamp}"
+    final_model_path = os.path.join(save_dir, final_model_name)
+    model.save(final_model_path)
+    
+    config_data = {
+        'model_info': {
+            'filename': final_model_name,
+            'algorithm': algorithm,
+            'timestamp': timestamp,
+            'total_timesteps': total_timesteps,
+        },
+        'performance': {
+            'sharpe_ratio': float(final_metrics['sharpe_ratio']),
+            'total_return': float(final_metrics['total_return']),
+            'max_drawdown': float(final_metrics['max_drawdown']),
+            'win_rate': float(final_metrics['win_rate']),
+            'profit_factor': float(final_metrics['profit_factor']),
+            'final_portfolio_value': float(final_metrics['final_portfolio_value']),
+            'trades_executed': int(final_metrics['trades_executed']),
+            'total_fees_paid': float(final_metrics['total_fees_paid']),
+        },
+        'training_config': {
+            'symbols': available_symbols,
+            'starting_balance': starting_balance,
+            'learning_rate': learning_rate,
+            'batch_size': batch_size,
+            'n_steps': n_steps,
+        },
+        'environment_config': {
+            'fee_rate': fee_rate,
+            'lookback_window': lookback_window,
+            'rebalance_frequency': rebalance_frequency,
+            'risk_free_rate': risk_free_rate,
+            'max_drawdown_penalty': max_drawdown_penalty,
+            'normalize_obs': normalize_obs,
+        },
+        'reward_weights': {
+            'return_weight': reward_return_weight,
+            'sharpe_weight': reward_sharpe_weight,
+            'drawdown_weight': reward_drawdown_weight,
+            'volatility_weight': reward_volatility_weight,
+        },
+        'network': {
+            'size': network_size,
+            'pi_layers': net_arch['pi'],
+            'vf_layers': net_arch['vf'],
+        }
+    }
+    
+    config_path = final_model_path + '_config.json'
+    with open(config_path, 'w') as f:
+        json.dump(config_data, f, indent=2)
+    
+    print(f"\nModel saved to: {final_model_path}.zip")
+    print(f"Config saved to: {config_path}")
+    
+    if use_wandb:
+        artifact = wandb.Artifact(
+            name=f"model-final-{timestamp}",
+            type="model",
+            description=f"Final {algorithm} model - Sharpe: {final_metrics['sharpe_ratio']:.2f}, Return: {final_metrics['total_return']*100:.1f}%"
+        )
+        artifact.add_file(final_model_path + ".zip")
+        artifact.add_file(config_path)
+        wandb.log_artifact(artifact)
+    
+    if use_wandb:
+        wandb.log({
+            'final/total_steps': step,
+            'final/episode_reward': episode_reward,
+            'final/portfolio_value': final_metrics['final_portfolio_value'],
+            'final/total_return': final_metrics['total_return'],
+            'final/sharpe_ratio': final_metrics['sharpe_ratio'],
+            'final/max_drawdown': final_metrics['max_drawdown'],
+            'final/win_rate': final_metrics['win_rate'],
+            'final/profit_factor': final_metrics['profit_factor'],
+            'final/trades_executed': final_metrics['trades_executed'],
+            'final/total_fees': final_metrics['total_fees_paid'],
+        })
+    
+    plot_results(portfolio_values, actions_history, available_symbols, save_dir, use_wandb)
+    
+    if use_wandb:
+        wandb.finish()
     
     return model, final_metrics
 
 
-def plot_results(portfolio_values, actions_history, symbols, save_dir):
-    """Plot training results"""
+def plot_results(portfolio_values, actions_history, symbols, save_dir, use_wandb=True):
     fig, axes = plt.subplots(2, 1, figsize=(12, 8))
     
-    # Portfolio value over time
     axes[0].plot(portfolio_values)
     axes[0].set_title('Portfolio Value Over Time')
     axes[0].set_xlabel('Step')
     axes[0].set_ylabel('Portfolio Value ($)')
     axes[0].grid(True, alpha=0.3)
     
-    # Portfolio weights over time
     if len(actions_history) > 0:
         weights_array = np.array([[w[s] for s in symbols] for w in actions_history])
         for i, symbol in enumerate(symbols):
@@ -337,31 +592,64 @@ def plot_results(portfolio_values, actions_history, symbols, save_dir):
     plot_path = os.path.join(save_dir, 'evaluation_results.png')
     plt.savefig(plot_path, dpi=150)
     print(f"\nPlot saved to: {plot_path}")
+    
+    if use_wandb:
+        wandb.log({'final/evaluation_plot': wandb.Image(plot_path)})
+    
     plt.close()
 
 
 if __name__ == "__main__":
-    # Configuration
-    SYMBOLS = [
-        'BTCUSDT', 'ETHUSDT', 'BNBUSDT', 'SOLUSDT', 'ADAUSDT',
-        'XRPUSDT', 'DOGEUSDT', 'MATICUSDT', 'DOTUSDT', 'AVAXUSDT'
-    ]
+    try:
+        from config import *
+        print("Loaded configuration from config.py")
+    except ImportError:
+        print("No config.py found, using default configuration")
+        SYMBOLS = [
+            'BTCUSDT', 'ETHUSDT', 'BNBUSDT', 'SOLUSDT', 'ADAUSDT',
+            'XRPUSDT', 'DOGEUSDT', 'MATICUSDT', 'DOTUSDT', 'AVAXUSDT'
+        ]
+        ALGORITHM = 'PPO'
+        TOTAL_TIMESTEPS = 100000
+        STARTING_BALANCE = 10000
+        FEE_RATE = 0.001
+        LOOKBACK_WINDOW = 50
+        REBALANCE_FREQUENCY = 1
+        RISK_FREE_RATE = -0.04
+        MAX_DRAWDOWN_PENALTY = 2.0
+        NORMALIZE_OBS = True
+        REWARD_RETURN_WEIGHT = 1.0
+        REWARD_SHARPE_WEIGHT = 0.5
+        REWARD_DRAWDOWN_WEIGHT = 0.3
+        REWARD_VOLATILITY_WEIGHT = 0.2
+        NETWORK_SIZE = 'medium'
+        REWARD_HORIZON = 1
+        LEARNING_RATE = 0.0003
+        BATCH_SIZE = 64
+        N_STEPS = 2048
     
-    ALGORITHM = 'PPO'  # Options: 'PPO', 'A2C', 'SAC'
-    TOTAL_TIMESTEPS = 100000  # Adjust based on your needs
-    STARTING_BALANCE = 10000
-    
-    # Train agent
     model, metrics = train_portfolio_agent(
         symbols=SYMBOLS,
         algorithm=ALGORITHM,
         total_timesteps=TOTAL_TIMESTEPS,
-        learning_rate=0.0003,
-        batch_size=64,
-        n_steps=2048,
+        learning_rate=LEARNING_RATE,
+        batch_size=BATCH_SIZE,
+        n_steps=N_STEPS,
         starting_balance=STARTING_BALANCE,
         save_dir=f'models/portfolio_{ALGORITHM.lower()}',
-        log_dir=f'logs/portfolio_{ALGORITHM.lower()}'
+        log_dir=f'logs/portfolio_{ALGORITHM.lower()}',
+        fee_rate=FEE_RATE,
+        lookback_window=LOOKBACK_WINDOW,
+        rebalance_frequency=REBALANCE_FREQUENCY,
+        risk_free_rate=RISK_FREE_RATE,
+        max_drawdown_penalty=MAX_DRAWDOWN_PENALTY,
+        normalize_obs=NORMALIZE_OBS,
+        reward_return_weight=REWARD_RETURN_WEIGHT,
+        reward_sharpe_weight=REWARD_SHARPE_WEIGHT,
+        reward_drawdown_weight=REWARD_DRAWDOWN_WEIGHT,
+        reward_volatility_weight=REWARD_VOLATILITY_WEIGHT,
+        network_size=NETWORK_SIZE,
+        reward_horizon=REWARD_HORIZON
     )
     
     print("\n" + "=" * 60)

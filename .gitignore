@@ -2,3 +2,6 @@ data
 __pycache__
 *.pyc
 .ccls-cache
+wandb
+models
+logs

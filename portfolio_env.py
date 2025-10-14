@@ -28,7 +28,8 @@ class MultiCurrencyPortfolioEnv(gym.Env):
         rebalance_frequency: int = 12,  # Rebalance every N steps (e.g., every hour for 5min data)
         risk_free_rate: float = 0.02,  # Annual risk-free rate for Sharpe ratio
         max_drawdown_penalty: float = 2.0,  # Penalty multiplier for drawdown
-        normalize_obs: bool = True
+        normalize_obs: bool = True,
+        reward_horizon: int = 1  # Look ahead N steps for reward calculation
     ):
         """
         Initialize multi-currency portfolio environment
@@ -43,6 +44,7 @@ class MultiCurrencyPortfolioEnv(gym.Env):
             risk_free_rate: Annual risk-free rate for Sharpe ratio calculation
             max_drawdown_penalty: Penalty weight for maximum drawdown
             normalize_obs: Whether to normalize observations
+            reward_horizon: Look ahead N steps for reward (1=immediate, 12=1hr, 288=1day)
         """
         super(MultiCurrencyPortfolioEnv, self).__init__()
         
@@ -56,6 +58,7 @@ class MultiCurrencyPortfolioEnv(gym.Env):
         self.risk_free_rate = risk_free_rate
         self.max_drawdown_penalty = max_drawdown_penalty
         self.normalize_obs = normalize_obs
+        self.reward_horizon = reward_horizon
         
         # Find common date range across all symbols
         self._align_dataframes()
@@ -103,6 +106,10 @@ class MultiCurrencyPortfolioEnv(gym.Env):
         self.max_drawdown = 0.0
         self.trades_executed = 0
         self.total_fees_paid = 0.0
+        
+        # Forward-looking reward tracking
+        self.action_history = []  # Store actions for future reward calculation
+        self.value_at_action = []  # Portfolio values when actions were taken
         
         # Steps since last rebalance
         self.steps_since_rebalance = 0
@@ -270,20 +277,41 @@ class MultiCurrencyPortfolioEnv(gym.Env):
     def _calculate_reward(self) -> float:
         """
         Calculate complex reward based on multiple factors:
-        - Portfolio returns
+        - Portfolio returns (over reward_horizon if > 1)
         - Sharpe ratio
         - Maximum drawdown penalty
         - Volatility penalty
         - Fee penalty
+        
+        If reward_horizon > 1, reward is based on future returns from past actions.
+        This encourages the agent to think ahead and optimize for medium-term results.
         """
         current_value = self._calculate_portfolio_value()
         
-        # Calculate return
-        if len(self.portfolio_history) > 0:
-            prev_value = self.portfolio_history[-1]
-            period_return = (current_value - prev_value) / (prev_value + 1e-8)
+        # Store current state for future reward calculation
+        self.value_at_action.append(current_value)
+        
+        # Calculate return based on reward horizon
+        if self.reward_horizon == 1:
+            # Immediate reward: compare to last step
+            if len(self.portfolio_history) > 0:
+                prev_value = self.portfolio_history[-1]
+                period_return = (current_value - prev_value) / (prev_value + 1e-8)
+            else:
+                period_return = 0.0
         else:
-            period_return = 0.0
+            # Forward-looking reward: compare to value N steps ago
+            if len(self.value_at_action) > self.reward_horizon:
+                # Reward for action taken reward_horizon steps ago
+                past_value = self.value_at_action[-self.reward_horizon - 1]
+                period_return = (current_value - past_value) / (past_value + 1e-8)
+            else:
+                # Not enough history yet, use immediate return
+                if len(self.portfolio_history) > 0:
+                    prev_value = self.portfolio_history[-1]
+                    period_return = (current_value - prev_value) / (prev_value + 1e-8)
+                else:
+                    period_return = 0.0
         
         self.returns_history.append(period_return)
         
@@ -358,10 +386,13 @@ class MultiCurrencyPortfolioEnv(gym.Env):
         if self.current_step >= self.max_steps:
             truncated = True
         
-        # Episode ends if portfolio value drops too much
-        if current_value < self.starting_balance * 0.1:  # Lost 90%
+        if current_value < self.starting_balance * 0.5:
             terminated = True
-            reward -= 100  # Large penalty for bankruptcy
+            reward -= 500
+            
+        elif current_value < self.starting_balance * 0.1:
+            terminated = True
+            reward -= 1000
         
         # Get next observation
         observation = self._get_observation()
@@ -425,6 +456,10 @@ class MultiCurrencyPortfolioEnv(gym.Env):
         self.trades_executed = 0
         self.total_fees_paid = 0.0
         self.steps_since_rebalance = self.rebalance_frequency  # Trigger immediate rebalance
+        
+        # Reset forward-looking tracking
+        self.action_history = []
+        self.value_at_action = [self.starting_balance]
         
         observation = self._get_observation()
         info = {
