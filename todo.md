@@ -3,4 +3,5 @@
 - [ ] more (freq) trades
 - [ ] bigger window
 - [ ] bigger model
-- [ ] check normalization try to remove it 
+- [ ] check normalization try to remove it
+- [ ] add current portofolio holding to obs
