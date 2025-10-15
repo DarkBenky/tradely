@@ -1,0 +1,5 @@
+- [ ] log returns
+- [ ] preoritize sharpnes
+- [ ] more (freq) trades
+- [ ] bigger window
+- [ ] bigger model
