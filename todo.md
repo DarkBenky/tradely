@@ -3,3 +3,4 @@
 - [ ] more (freq) trades
 - [ ] bigger window
 - [ ] bigger model
+- [ ] check normalization try to remove it 
