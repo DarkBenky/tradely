@@ -37,14 +37,6 @@ class PortfolioMetricsCallback(BaseCallback):
                     'train/cash_balance': info.get('cash_balance', 0),
                     'train/total_return': info.get('total_return', 0),
                     'train/reward': self.locals.get('rewards', [0])[0],
-                    'train/max_drawdown': info.get('max_drawdown', 0),
-                    'train/sharpe_ratio': info.get('sharpe_ratio', 0),
-                    'train/benchmark_value': info.get('benchmark_value', 0),
-                    'train/benchmark_outperformance': info.get('benchmark_outperformance', 0),
-                    'train/future_profit_potential': info.get('future_profit_potential', 0),
-                    'train/portfolio_volatility': info.get('portfolio_volatility', 0),
-                    'train/diversification_ratio': info.get('diversification_ratio', 0),
-                    'train/value_at_risk': info.get('value_at_risk', 0),
                 }
                 
                 cash_ratio = info.get('cash_balance', 0) / (info.get('portfolio_value', 1) + 1e-8)
@@ -66,8 +58,6 @@ class PortfolioMetricsCallback(BaseCallback):
             episode_portfolio_values = []
             episode_weights = []
             episode_cash_balances = []
-            episode_benchmark_values = []
-            episode_risk_metrics = []
             
             while not done and step < 500:
                 action, _ = self.model.predict(obs, deterministic=True)
@@ -76,12 +66,6 @@ class PortfolioMetricsCallback(BaseCallback):
                 episode_portfolio_values.append(info.get('portfolio_value', 0))
                 episode_weights.append(info.get('weights', {}))
                 episode_cash_balances.append(info.get('cash_balance', 0))
-                episode_benchmark_values.append(info.get('benchmark_value', 0))
-                episode_risk_metrics.append({
-                    'volatility': info.get('portfolio_volatility', 0),
-                    'diversification': info.get('diversification_ratio', 0),
-                    'var': info.get('value_at_risk', 0)
-                })
                 step += 1
             
             metrics = self.eval_env.get_final_metrics()
@@ -102,15 +86,6 @@ class PortfolioMetricsCallback(BaseCallback):
                     'eval/total_fees': metrics.get('total_fees_paid', 0),
                     'eval/final_portfolio_value': metrics['final_portfolio_value'],
                     'eval/best_sharpe_so_far': self.best_sharpe,
-                    'eval/benchmark_return': metrics.get('benchmark_return', 0),
-                    'eval/outperformance': metrics.get('outperformance', 0),
-                    'eval/sortino_ratio': metrics.get('sortino_ratio', 0),
-                    'eval/calmar_ratio': metrics.get('calmar_ratio', 0),
-                    'eval/portfolio_volatility': metrics.get('portfolio_volatility', 0),
-                    'eval/diversification_ratio': metrics.get('diversification_ratio', 0),
-                    'eval/value_at_risk': metrics.get('value_at_risk', 0),
-                    'eval/avg_win': metrics.get('avg_win', 0),
-                    'eval/avg_loss': metrics.get('avg_loss', 0),
                 }
                 
                 if episode_cash_balances:
@@ -126,50 +101,16 @@ class PortfolioMetricsCallback(BaseCallback):
                         weight = final_weights.get(symbol, 0)
                         log_dict[f'eval/weight_{symbol}'] = weight
                 
-                # Portfolio value vs benchmark chart
-                if len(episode_portfolio_values) > 0 and len(episode_benchmark_values) > 0:
-                    plt.figure(figsize=(12, 6))
-                    plt.plot(episode_portfolio_values, label='Portfolio', linewidth=2)
-                    plt.plot(episode_benchmark_values, label='Benchmark', linewidth=2, linestyle='--')
-                    plt.title('Portfolio vs Benchmark Value')
+                if len(episode_portfolio_values) > 0:
+                    plt.figure(figsize=(10, 4))
+                    plt.plot(episode_portfolio_values)
+                    plt.title('Evaluation Portfolio Value')
                     plt.xlabel('Step')
                     plt.ylabel('Value ($)')
-                    plt.legend()
                     plt.grid(True, alpha=0.3)
-                    log_dict['eval/portfolio_vs_benchmark'] = wandb.Image(plt)
+                    log_dict['eval/portfolio_chart'] = wandb.Image(plt)
                     plt.close()
                 
-                # Risk metrics chart
-                if len(episode_risk_metrics) > 0:
-                    plt.figure(figsize=(12, 8))
-                    
-                    plt.subplot(3, 1, 1)
-                    volatilities = [rm['volatility'] for rm in episode_risk_metrics]
-                    plt.plot(volatilities, color='red')
-                    plt.title('Portfolio Volatility Over Time')
-                    plt.ylabel('Volatility')
-                    plt.grid(True, alpha=0.3)
-                    
-                    plt.subplot(3, 1, 2)
-                    diversifications = [rm['diversification'] for rm in episode_risk_metrics]
-                    plt.plot(diversifications, color='green')
-                    plt.title('Diversification Ratio Over Time')
-                    plt.ylabel('Diversification')
-                    plt.grid(True, alpha=0.3)
-                    
-                    plt.subplot(3, 1, 3)
-                    vars = [rm['var'] for rm in episode_risk_metrics]
-                    plt.plot(vars, color='orange')
-                    plt.title('Value at Risk (95%) Over Time')
-                    plt.ylabel('VaR')
-                    plt.xlabel('Step')
-                    plt.grid(True, alpha=0.3)
-                    
-                    plt.tight_layout()
-                    log_dict['eval/risk_metrics'] = wandb.Image(plt)
-                    plt.close()
-                
-                # Asset allocation chart
                 if episode_weights and self.symbols and len(episode_weights) > 0:
                     plt.figure(figsize=(12, 6))
                     weights_array = np.array([[w.get(s, 0) for s in self.symbols] for w in episode_weights])
@@ -184,7 +125,6 @@ class PortfolioMetricsCallback(BaseCallback):
                     log_dict['eval/allocation_chart'] = wandb.Image(plt)
                     plt.close()
                 
-                # Cash balance chart
                 if episode_cash_balances and len(episode_cash_balances) > 0:
                     plt.figure(figsize=(10, 4))
                     plt.plot(episode_cash_balances, color='green')
@@ -198,17 +138,13 @@ class PortfolioMetricsCallback(BaseCallback):
                 wandb.log(log_dict)
             
             if self.verbose > 0:
-                print(f"\n{'='*80}")
+                print(f"\n{'='*60}")
                 print(f"Evaluation at step {self.n_calls}")
                 print(f"  Return: {metrics['total_return']*100:.2f}%")
-                print(f"  Benchmark Return: {metrics.get('benchmark_return', 0)*100:.2f}%")
-                print(f"  Outperformance: {metrics.get('outperformance', 0)*100:.2f}%")
                 print(f"  Sharpe Ratio: {metrics['sharpe_ratio']:.3f}")
-                print(f"  Sortino Ratio: {metrics.get('sortino_ratio', 0):.3f}")
                 print(f"  Max Drawdown: {metrics['max_drawdown']*100:.2f}%")
-                print(f"  Volatility: {metrics.get('portfolio_volatility', 0)*100:.2f}%")
                 print(f"  Win Rate: {metrics['win_rate']*100:.1f}%")
-                print(f"{'='*80}\n")
+                print(f"{'='*60}\n")
             
             if metrics['sharpe_ratio'] > self.best_sharpe and metrics['sharpe_ratio'] > 0:
                 self.best_sharpe = metrics['sharpe_ratio']
@@ -264,9 +200,7 @@ def load_data(symbols, data_dir='data'):
 def create_env(dfs, symbols, starting_balance=10000, is_eval=False,
                fee_rate=0.001, lookback_window=50, rebalance_frequency=1,
                risk_free_rate=-0.04, max_drawdown_penalty=2.0, normalize_obs=True,
-               reward_horizon=1, benchmark_weight=1.0, future_profit_weight=0.5,
-               future_window=6, risk_adjustment=True, dynamic_penalties=True,
-               use_attention_weights=False, volatility_scaling=True):
+               reward_horizon=1):
     env = MultiCurrencyPortfolioEnv(
         dfs=dfs,
         symbols=symbols,
@@ -277,14 +211,7 @@ def create_env(dfs, symbols, starting_balance=10000, is_eval=False,
         risk_free_rate=risk_free_rate,
         max_drawdown_penalty=max_drawdown_penalty,
         normalize_obs=normalize_obs,
-        reward_horizon=reward_horizon,
-        benchmark_weight=benchmark_weight,
-        future_profit_weight=future_profit_weight,
-        future_window=future_window,
-        risk_adjustment=risk_adjustment,
-        dynamic_penalties=dynamic_penalties,
-        use_attention_weights=use_attention_weights,
-        volatility_scaling=volatility_scaling
+        reward_horizon=reward_horizon
     )
     
     if not is_eval:
@@ -312,20 +239,17 @@ def train_portfolio_agent(
     risk_free_rate=-0.04,
     max_drawdown_penalty=2.0,
     normalize_obs=True,
-    reward_horizon=1,
-    benchmark_weight=1.0,
-    future_profit_weight=0.5,
-    future_window=6,
-    risk_adjustment=True,
-    dynamic_penalties=True,
-    use_attention_weights=False,
-    volatility_scaling=True,
-    network_size='medium'
+    reward_return_weight=1.0,
+    reward_sharpe_weight=0.5,
+    reward_drawdown_weight=0.3,
+    reward_volatility_weight=0.2,
+    network_size='medium',
+    reward_horizon=1
 ):
     
-    print("=" * 80)
-    print("Advanced Multi-Currency Portfolio RL Training")
-    print("=" * 80)
+    print("=" * 60)
+    print("Multi-Currency Portfolio RL Training")
+    print("=" * 60)
     
     os.makedirs(save_dir, exist_ok=True)
     os.makedirs(log_dir, exist_ok=True)
@@ -374,42 +298,29 @@ def train_portfolio_agent(
                 'risk_free_rate': risk_free_rate,
                 'max_drawdown_penalty': max_drawdown_penalty,
                 'normalize_obs': normalize_obs,
-                'reward_horizon': reward_horizon,
-                'benchmark_weight': benchmark_weight,
-                'future_profit_weight': future_profit_weight,
-                'future_window': future_window,
-                'risk_adjustment': risk_adjustment,
-                'dynamic_penalties': dynamic_penalties,
-                'use_attention_weights': use_attention_weights,
-                'volatility_scaling': volatility_scaling,
+                'reward_return_weight': reward_return_weight,
+                'reward_sharpe_weight': reward_sharpe_weight,
+                'reward_drawdown_weight': reward_drawdown_weight,
+                'reward_volatility_weight': reward_volatility_weight,
                 'network_size': network_size,
+                'reward_horizon': reward_horizon,
             },
-            tags=[algorithm, 'portfolio', 'crypto', 'advanced', f'net_{network_size}'],
-            notes=f"Training {algorithm} agent on {len(available_symbols)} cryptocurrencies with advanced risk management"
+            tags=[algorithm, 'portfolio', 'crypto', f'net_{network_size}', f'horizon_{reward_horizon}'],
+            notes=f"Training {algorithm} agent on {len(available_symbols)} cryptocurrencies with {network_size} network, {reward_horizon}-step reward horizon"
         )
         print(f"\nWandB initialized: {wandb.run.url}")
     
     print("\nCreating environments...")
-    train_env = create_env(
-        train_dfs, available_symbols, starting_balance,
-        fee_rate=fee_rate, lookback_window=lookback_window,
-        rebalance_frequency=rebalance_frequency, risk_free_rate=risk_free_rate,
-        max_drawdown_penalty=max_drawdown_penalty, normalize_obs=normalize_obs,
-        reward_horizon=reward_horizon, benchmark_weight=benchmark_weight,
-        future_profit_weight=future_profit_weight, future_window=future_window,
-        risk_adjustment=risk_adjustment, dynamic_penalties=dynamic_penalties,
-        use_attention_weights=use_attention_weights, volatility_scaling=volatility_scaling
-    )
-    eval_env = create_env(
-        val_dfs, available_symbols, starting_balance, is_eval=True,
-        fee_rate=fee_rate, lookback_window=lookback_window,
-        rebalance_frequency=rebalance_frequency, risk_free_rate=risk_free_rate,
-        max_drawdown_penalty=max_drawdown_penalty, normalize_obs=normalize_obs,
-        reward_horizon=reward_horizon, benchmark_weight=benchmark_weight,
-        future_profit_weight=future_profit_weight, future_window=future_window,
-        risk_adjustment=risk_adjustment, dynamic_penalties=dynamic_penalties,
-        use_attention_weights=use_attention_weights, volatility_scaling=volatility_scaling
-    )
+    train_env = create_env(train_dfs, available_symbols, starting_balance,
+                          fee_rate=fee_rate, lookback_window=lookback_window,
+                          rebalance_frequency=rebalance_frequency, risk_free_rate=risk_free_rate,
+                          max_drawdown_penalty=max_drawdown_penalty, normalize_obs=normalize_obs,
+                          reward_horizon=reward_horizon)
+    eval_env = create_env(val_dfs, available_symbols, starting_balance, is_eval=True,
+                         fee_rate=fee_rate, lookback_window=lookback_window,
+                         rebalance_frequency=rebalance_frequency, risk_free_rate=risk_free_rate,
+                         max_drawdown_penalty=max_drawdown_penalty, normalize_obs=normalize_obs,
+                         reward_horizon=reward_horizon)
     
     print(f"Observation space: {train_env.observation_space.shape}")
     print(f"Action space: {train_env.action_space.shape}")
@@ -427,7 +338,7 @@ def train_portfolio_agent(
         'medium': dict(pi=[256, 128], vf=[256, 128]),
         'large': dict(pi=[512, 256, 128], vf=[512, 256, 128]),
         'xlarge': dict(pi=[1024, 512, 256], vf=[1024, 512, 256]),
-        'xxlarge': dict(pi=[2048, 1024, 512], vf=[2048, 1024, 512])
+        'xxlarge': dict(pi=[2048, 2048, 128, 2048], vf=[2048, 2048, 128, 2048])
     }
     
     if network_size not in network_configs:
@@ -526,9 +437,9 @@ def train_portfolio_agent(
     except KeyboardInterrupt:
         print("\nTraining interrupted by user")
     
-    print("\n" + "=" * 80)
+    print("\n" + "=" * 60)
     print("Evaluating Final Model")
-    print("=" * 80)
+    print("=" * 60)
     
     obs = eval_env.reset()[0]
     done = False
@@ -536,9 +447,7 @@ def train_portfolio_agent(
     episode_reward = 0
     
     portfolio_values = []
-    benchmark_values = []
     actions_history = []
-    risk_metrics_history = []
     
     while not done and step < 1000:
         action, _ = model.predict(obs, deterministic=True)
@@ -547,40 +456,23 @@ def train_portfolio_agent(
         
         episode_reward += reward
         portfolio_values.append(info['portfolio_value'])
-        benchmark_values.append(info['benchmark_value'])
         actions_history.append(info['weights'])
-        risk_metrics_history.append({
-            'volatility': info.get('portfolio_volatility', 0),
-            'diversification': info.get('diversification_ratio', 0),
-            'var': info.get('value_at_risk', 0),
-            'outperformance': info.get('benchmark_outperformance', 0)
-        })
         step += 1
         
         if step % 100 == 0:
-            print(f"Step {step}: Portfolio = ${info['portfolio_value']:.2f}, "
-                  f"Benchmark = ${info['benchmark_value']:.2f}, "
-                  f"Outperformance = {info.get('benchmark_outperformance', 0)*100:.2f}%")
+            print(f"Step {step}: Portfolio Value = ${info['portfolio_value']:.2f}, Return = {info['total_return']*100:.2f}%")
     
     final_metrics = eval_env.get_final_metrics()
     
-    print("\n" + "=" * 80)
+    print("\n" + "=" * 60)
     print("Final Evaluation Results")
-    print("=" * 80)
+    print("=" * 60)
     print(f"Total Steps: {step}")
     print(f"Episode Reward: {episode_reward:.2f}")
     print(f"Final Portfolio Value: ${final_metrics['final_portfolio_value']:.2f}")
-    print(f"Final Benchmark Value: ${final_metrics['final_benchmark_value']:.2f}")
     print(f"Total Return: {final_metrics['total_return']*100:.2f}%")
-    print(f"Benchmark Return: {final_metrics['benchmark_return']*100:.2f}%")
-    print(f"Outperformance: {final_metrics['outperformance']*100:.2f}%")
     print(f"Sharpe Ratio: {final_metrics['sharpe_ratio']:.3f}")
-    print(f"Sortino Ratio: {final_metrics.get('sortino_ratio', 0):.3f}")
-    print(f"Calmar Ratio: {final_metrics.get('calmar_ratio', 0):.3f}")
     print(f"Max Drawdown: {final_metrics['max_drawdown']*100:.2f}%")
-    print(f"Portfolio Volatility: {final_metrics.get('portfolio_volatility', 0)*100:.2f}%")
-    print(f"Diversification Ratio: {final_metrics.get('diversification_ratio', 0)*100:.1f}%")
-    print(f"Value at Risk (95%): {final_metrics.get('value_at_risk', 0)*100:.2f}%")
     print(f"Win Rate: {final_metrics['win_rate']*100:.1f}%")
     print(f"Profit Factor: {final_metrics['profit_factor']:.2f}")
     print(f"Trades Executed: {final_metrics['trades_executed']}")
@@ -589,9 +481,8 @@ def train_portfolio_agent(
     timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
     sharpe_str = f"{final_metrics['sharpe_ratio']:.2f}".replace('.', '_')
     return_str = f"{final_metrics['total_return']*100:.1f}".replace('.', '_').replace('-', 'neg')
-    outperformance_str = f"{final_metrics['outperformance']*100:.1f}".replace('.', '_').replace('-', 'neg')
     
-    final_model_name = f"{algorithm}_sharpe{sharpe_str}_ret{return_str}pct_outperf{outperformance_str}pct_{timestamp}"
+    final_model_name = f"{algorithm}_sharpe{sharpe_str}_ret{return_str}pct_{timestamp}"
     final_model_path = os.path.join(save_dir, final_model_name)
     model.save(final_model_path)
     
@@ -604,19 +495,11 @@ def train_portfolio_agent(
         },
         'performance': {
             'sharpe_ratio': float(final_metrics['sharpe_ratio']),
-            'sortino_ratio': float(final_metrics.get('sortino_ratio', 0)),
-            'calmar_ratio': float(final_metrics.get('calmar_ratio', 0)),
             'total_return': float(final_metrics['total_return']),
-            'benchmark_return': float(final_metrics['benchmark_return']),
-            'outperformance': float(final_metrics['outperformance']),
             'max_drawdown': float(final_metrics['max_drawdown']),
-            'portfolio_volatility': float(final_metrics.get('portfolio_volatility', 0)),
-            'diversification_ratio': float(final_metrics.get('diversification_ratio', 0)),
-            'value_at_risk': float(final_metrics.get('value_at_risk', 0)),
             'win_rate': float(final_metrics['win_rate']),
             'profit_factor': float(final_metrics['profit_factor']),
             'final_portfolio_value': float(final_metrics['final_portfolio_value']),
-            'final_benchmark_value': float(final_metrics['final_benchmark_value']),
             'trades_executed': int(final_metrics['trades_executed']),
             'total_fees_paid': float(final_metrics['total_fees_paid']),
         },
@@ -634,14 +517,12 @@ def train_portfolio_agent(
             'risk_free_rate': risk_free_rate,
             'max_drawdown_penalty': max_drawdown_penalty,
             'normalize_obs': normalize_obs,
-            'reward_horizon': reward_horizon,
-            'benchmark_weight': benchmark_weight,
-            'future_profit_weight': future_profit_weight,
-            'future_window': future_window,
-            'risk_adjustment': risk_adjustment,
-            'dynamic_penalties': dynamic_penalties,
-            'use_attention_weights': use_attention_weights,
-            'volatility_scaling': volatility_scaling,
+        },
+        'reward_weights': {
+            'return_weight': reward_return_weight,
+            'sharpe_weight': reward_sharpe_weight,
+            'drawdown_weight': reward_drawdown_weight,
+            'volatility_weight': reward_volatility_weight,
         },
         'network': {
             'size': network_size,
@@ -661,9 +542,7 @@ def train_portfolio_agent(
         artifact = wandb.Artifact(
             name=f"model-final-{timestamp}",
             type="model",
-            description=f"Final {algorithm} model - Sharpe: {final_metrics['sharpe_ratio']:.2f}, "
-                       f"Return: {final_metrics['total_return']*100:.1f}%, "
-                       f"Outperformance: {final_metrics['outperformance']*100:.1f}%"
+            description=f"Final {algorithm} model - Sharpe: {final_metrics['sharpe_ratio']:.2f}, Return: {final_metrics['total_return']*100:.1f}%"
         )
         artifact.add_file(final_model_path + ".zip")
         artifact.add_file(config_path)
@@ -674,25 +553,16 @@ def train_portfolio_agent(
             'final/total_steps': step,
             'final/episode_reward': episode_reward,
             'final/portfolio_value': final_metrics['final_portfolio_value'],
-            'final/benchmark_value': final_metrics['final_benchmark_value'],
             'final/total_return': final_metrics['total_return'],
-            'final/benchmark_return': final_metrics['benchmark_return'],
-            'final/outperformance': final_metrics['outperformance'],
             'final/sharpe_ratio': final_metrics['sharpe_ratio'],
-            'final/sortino_ratio': final_metrics.get('sortino_ratio', 0),
-            'final/calmar_ratio': final_metrics.get('calmar_ratio', 0),
             'final/max_drawdown': final_metrics['max_drawdown'],
-            'final/portfolio_volatility': final_metrics.get('portfolio_volatility', 0),
-            'final/diversification_ratio': final_metrics.get('diversification_ratio', 0),
-            'final/value_at_risk': final_metrics.get('value_at_risk', 0),
             'final/win_rate': final_metrics['win_rate'],
             'final/profit_factor': final_metrics['profit_factor'],
             'final/trades_executed': final_metrics['trades_executed'],
             'final/total_fees': final_metrics['total_fees_paid'],
         })
     
-    plot_advanced_results(portfolio_values, benchmark_values, actions_history, 
-                         risk_metrics_history, available_symbols, save_dir, use_wandb)
+    plot_results(portfolio_values, actions_history, available_symbols, save_dir, use_wandb)
     
     if use_wandb:
         wandb.finish()
@@ -700,69 +570,32 @@ def train_portfolio_agent(
     return model, final_metrics
 
 
-def plot_advanced_results(portfolio_values, benchmark_values, actions_history, 
-                         risk_metrics_history, symbols, save_dir, use_wandb=True):
-    fig, axes = plt.subplots(3, 2, figsize=(16, 12))
+def plot_results(portfolio_values, actions_history, symbols, save_dir, use_wandb=True):
+    fig, axes = plt.subplots(2, 1, figsize=(12, 8))
     
-    # Portfolio vs Benchmark
-    axes[0, 0].plot(portfolio_values, label='Portfolio', linewidth=2)
-    axes[0, 0].plot(benchmark_values, label='Benchmark', linewidth=2, linestyle='--')
-    axes[0, 0].set_title('Portfolio vs Benchmark Value')
-    axes[0, 0].set_xlabel('Step')
-    axes[0, 0].set_ylabel('Value ($)')
-    axes[0, 0].legend()
-    axes[0, 0].grid(True, alpha=0.3)
+    axes[0].plot(portfolio_values)
+    axes[0].set_title('Portfolio Value Over Time')
+    axes[0].set_xlabel('Step')
+    axes[0].set_ylabel('Portfolio Value ($)')
+    axes[0].grid(True, alpha=0.3)
     
-    # Asset allocation
     if len(actions_history) > 0:
         weights_array = np.array([[w[s] for s in symbols] for w in actions_history])
         for i, symbol in enumerate(symbols):
-            axes[0, 1].plot(weights_array[:, i], label=symbol, alpha=0.7)
-        axes[0, 1].set_title('Portfolio Weights Over Time')
-        axes[0, 1].set_xlabel('Step')
-        axes[0, 1].set_ylabel('Weight')
-        axes[0, 1].legend(loc='upper right')
-        axes[0, 1].grid(True, alpha=0.3)
-        axes[0, 1].set_ylim(0, 1)
-    
-    # Risk metrics
-    if len(risk_metrics_history) > 0:
-        volatilities = [rm['volatility'] for rm in risk_metrics_history]
-        diversifications = [rm['diversification'] for rm in risk_metrics_history]
-        vars = [rm['var'] for rm in risk_metrics_history]
-        outperformance = [rm['outperformance'] for rm in risk_metrics_history]
-        
-        axes[1, 0].plot(volatilities, color='red')
-        axes[1, 0].set_title('Portfolio Volatility')
-        axes[1, 0].set_xlabel('Step')
-        axes[1, 0].set_ylabel('Volatility')
-        axes[1, 0].grid(True, alpha=0.3)
-        
-        axes[1, 1].plot(diversifications, color='green')
-        axes[1, 1].set_title('Diversification Ratio')
-        axes[1, 1].set_xlabel('Step')
-        axes[1, 1].set_ylabel('Diversification')
-        axes[1, 1].grid(True, alpha=0.3)
-        
-        axes[2, 0].plot(vars, color='orange')
-        axes[2, 0].set_title('Value at Risk (95%)')
-        axes[2, 0].set_xlabel('Step')
-        axes[2, 0].set_ylabel('VaR')
-        axes[2, 0].grid(True, alpha=0.3)
-        
-        axes[2, 1].plot(outperformance, color='purple')
-        axes[2, 1].set_title('Benchmark Outperformance')
-        axes[2, 1].set_xlabel('Step')
-        axes[2, 1].set_ylabel('Outperformance')
-        axes[2, 1].grid(True, alpha=0.3)
+            axes[1].plot(weights_array[:, i], label=symbol, alpha=0.7)
+        axes[1].set_title('Portfolio Weights Over Time')
+        axes[1].set_xlabel('Step')
+        axes[1].set_ylabel('Weight')
+        axes[1].legend(loc='upper right')
+        axes[1].grid(True, alpha=0.3)
     
     plt.tight_layout()
-    plot_path = os.path.join(save_dir, 'advanced_evaluation_results.png')
+    plot_path = os.path.join(save_dir, 'evaluation_results.png')
     plt.savefig(plot_path, dpi=150)
-    print(f"\nAdvanced plot saved to: {plot_path}")
+    print(f"\nPlot saved to: {plot_path}")
     
     if use_wandb:
-        wandb.log({'final/advanced_evaluation_plot': wandb.Image(plot_path)})
+        wandb.log({'final/evaluation_plot': wandb.Image(plot_path)})
     
     plt.close()
 
@@ -786,15 +619,12 @@ if __name__ == "__main__":
         RISK_FREE_RATE = -0.04
         MAX_DRAWDOWN_PENALTY = 2.0
         NORMALIZE_OBS = True
-        REWARD_HORIZON = 1
-        BENCHMARK_WEIGHT = 1.0
-        FUTURE_PROFIT_WEIGHT = 0.5
-        FUTURE_WINDOW = 6
-        RISK_ADJUSTMENT = True
-        DYNAMIC_PENALTIES = True
-        USE_ATTENTION_WEIGHTS = False
-        VOLATILITY_SCALING = True
+        REWARD_RETURN_WEIGHT = 1.0
+        REWARD_SHARPE_WEIGHT = 0.5
+        REWARD_DRAWDOWN_WEIGHT = 0.3
+        REWARD_VOLATILITY_WEIGHT = 0.2
         NETWORK_SIZE = 'medium'
+        REWARD_HORIZON = 1
         LEARNING_RATE = 0.0003
         BATCH_SIZE = 64
         N_STEPS = 2048
@@ -815,17 +645,14 @@ if __name__ == "__main__":
         risk_free_rate=RISK_FREE_RATE,
         max_drawdown_penalty=MAX_DRAWDOWN_PENALTY,
         normalize_obs=NORMALIZE_OBS,
-        reward_horizon=REWARD_HORIZON,
-        benchmark_weight=BENCHMARK_WEIGHT,
-        future_profit_weight=FUTURE_PROFIT_WEIGHT,
-        future_window=FUTURE_WINDOW,
-        risk_adjustment=RISK_ADJUSTMENT,
-        dynamic_penalties=DYNAMIC_PENALTIES,
-        use_attention_weights=USE_ATTENTION_WEIGHTS,
-        volatility_scaling=VOLATILITY_SCALING,
-        network_size=NETWORK_SIZE
+        reward_return_weight=REWARD_RETURN_WEIGHT,
+        reward_sharpe_weight=REWARD_SHARPE_WEIGHT,
+        reward_drawdown_weight=REWARD_DRAWDOWN_WEIGHT,
+        reward_volatility_weight=REWARD_VOLATILITY_WEIGHT,
+        network_size=NETWORK_SIZE,
+        reward_horizon=REWARD_HORIZON
     )
     
-    print("\n" + "=" * 80)
+    print("\n" + "=" * 60)
     print("Training Complete!")
-    print("=" * 80)
+    print("=" * 60)
