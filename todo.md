@@ -1,7 +1,6 @@
-- [ ] log returns
-- [ ] preoritize sharpnes
-- [ ] more (freq) trades
-- [ ] bigger window
-- [ ] bigger model
-- [ ] check normalization try to remove it
-- [ ] add current portofolio holding to obs
+- [X] log returns
+- [X] preoritize sharpnes
+- [X] more (freq) trades
+- [X] bigger window
+- [X] bigger model
+- [X] add current portofolio holding to obs

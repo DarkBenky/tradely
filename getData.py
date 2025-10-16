@@ -42,7 +42,7 @@ def process_symbol_individually(symbol, interval, years=1, window_size=12*4, mul
     print(f"{'='*60}")
     
     df = fetch_historical_data(symbol, interval, years=years)
-    if df is None:
+    if df is None
         print(f"Skipping {symbol} due to fetch error")
         return None
     

@@ -337,7 +337,8 @@ def train_portfolio_agent(
         'small': dict(pi=[128, 64], vf=[128, 64]),
         'medium': dict(pi=[256, 128], vf=[256, 128]),
         'large': dict(pi=[512, 256, 128], vf=[512, 256, 128]),
-        'xlarge': dict(pi=[1024, 512, 256], vf=[1024, 512, 256])
+        'xlarge': dict(pi=[1024, 512, 256], vf=[1024, 512, 256]),
+        'xxlarge': dict(pi=[2048, 2048, 128, 2048], vf=[2048, 2048, 128, 2048])
     }
     
     if network_size not in network_configs:

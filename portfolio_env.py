@@ -80,9 +80,9 @@ class MultiCurrencyPortfolioEnv(gym.Env):
         
         # Observation space: features for all assets + portfolio state
         # Features: lookback_window * num_features * num_assets
-        # Portfolio state: current weights (num_assets) + cash ratio (1) + portfolio metrics (3)
+        # Portfolio state: current weights (num_assets) + cash ratio (1) + portfolio metrics (6)
         obs_dim = (self.lookback_window * self.num_features_per_asset * self.num_assets + 
-                   self.num_assets + 4)  # +4 for cash_ratio, total_value_norm, drawdown, volatility
+                   self.num_assets + 6)  # +6 for cash_ratio, total_value_norm, drawdown, volatility, sharpe_ratio, total_return
         
         self.observation_space = spaces.Box(
             low=-np.inf,
@@ -173,12 +173,18 @@ class MultiCurrencyPortfolioEnv(gym.Env):
         else:
             volatility = 0.0
         
+        # Additional metrics
+        sharpe_ratio = self._calculate_sharpe_ratio()
+        total_return = np.log(self.portfolio_value / self.starting_balance)
+        
         portfolio_state = np.array([
             *current_weights,
             cash_ratio,
             portfolio_value_norm,
             current_drawdown,
-            volatility
+            volatility,
+            sharpe_ratio,
+            total_return
         ], dtype=np.float32)
         
         # Concatenate all parts
@@ -296,7 +302,7 @@ class MultiCurrencyPortfolioEnv(gym.Env):
             # Immediate reward: compare to last step
             if len(self.portfolio_history) > 0:
                 prev_value = self.portfolio_history[-1]
-                period_return = (current_value - prev_value) / (prev_value + 1e-8)
+                period_return = np.log(current_value / (prev_value + 1e-8))
             else:
                 period_return = 0.0
         else:
@@ -304,12 +310,12 @@ class MultiCurrencyPortfolioEnv(gym.Env):
             if len(self.value_at_action) > self.reward_horizon:
                 # Reward for action taken reward_horizon steps ago
                 past_value = self.value_at_action[-self.reward_horizon - 1]
-                period_return = (current_value - past_value) / (past_value + 1e-8)
+                period_return = np.log(current_value / (past_value + 1e-8))
             else:
                 # Not enough history yet, use immediate return
                 if len(self.portfolio_history) > 0:
                     prev_value = self.portfolio_history[-1]
-                    period_return = (current_value - prev_value) / (prev_value + 1e-8)
+                    period_return = np.log(current_value / (prev_value + 1e-8))
                 else:
                     period_return = 0.0
         
@@ -403,7 +409,7 @@ class MultiCurrencyPortfolioEnv(gym.Env):
             'cash_balance': self.cash_balance,
             'holdings': dict(self.holdings),
             'weights': dict(self.weights),
-            'total_return': (current_value - self.starting_balance) / self.starting_balance,
+            'total_return': np.log(current_value / self.starting_balance),
             'max_drawdown': self.max_drawdown,
             'sharpe_ratio': self._calculate_sharpe_ratio(),
             'trades_executed': self.trades_executed,
@@ -473,11 +479,11 @@ class MultiCurrencyPortfolioEnv(gym.Env):
         """Render the environment state"""
         if mode == 'human':
             current_value = self._calculate_portfolio_value()
-            total_return = (current_value - self.starting_balance) / self.starting_balance
+            total_return = np.log(current_value / self.starting_balance)
             
             print(f"\n{'='*60}")
             print(f"Step: {self.current_step}/{self.max_steps}")
-            print(f"Portfolio Value: ${current_value:.2f} (Return: {total_return*100:.2f}%)")
+            print(f"Portfolio Value: ${current_value:.2f} (Return: {(np.exp(total_return)-1)*100:.2f}%)")
             print(f"Cash Balance: ${self.cash_balance:.2f}")
             print(f"\nHoldings:")
             for symbol in self.symbols:
@@ -496,7 +502,7 @@ class MultiCurrencyPortfolioEnv(gym.Env):
     def get_final_metrics(self) -> Dict:
         """Get final performance metrics for the episode"""
         current_value = self._calculate_portfolio_value()
-        total_return = (current_value - self.starting_balance) / self.starting_balance
+        total_return = np.log(current_value / self.starting_balance)
         
         # Calculate additional metrics
         if len(self.returns_history) > 0:
