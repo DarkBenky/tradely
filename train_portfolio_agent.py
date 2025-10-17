@@ -320,7 +320,7 @@ def train_portfolio_agent(
     dynamic_penalties=True,
     use_attention_weights=False,
     volatility_scaling=True,
-    network_size='medium'
+    network_size='large'  # Changed from 'xxlarge' to 'large'
 ):
     
     print("=" * 80)
@@ -431,8 +431,8 @@ def train_portfolio_agent(
     }
     
     if network_size not in network_configs:
-        print(f"Unknown network size '{network_size}', defaulting to 'medium'")
-        network_size = 'medium'
+        print(f"Unknown network size '{network_size}', defaulting to 'large'")
+        network_size = 'large'
     
     net_arch = network_configs[network_size]
     print(f"Network architecture: Policy={net_arch['pi']}, Value={net_arch['vf']}")
@@ -778,23 +778,23 @@ if __name__ == "__main__":
             'XRPUSDT', 'DOGEUSDT', 'MATICUSDT', 'DOTUSDT', 'AVAXUSDT'
         ]
         ALGORITHM = 'PPO'
-        TOTAL_TIMESTEPS = 100000
+        TOTAL_TIMESTEPS = 100_000
         STARTING_BALANCE = 10000
         FEE_RATE = 0.001
-        LOOKBACK_WINDOW = 50
-        REBALANCE_FREQUENCY = 1
+        LOOKBACK_WINDOW = 120
+        REBALANCE_FREQUENCY = 6
         RISK_FREE_RATE = -0.04
         MAX_DRAWDOWN_PENALTY = 2.0
         NORMALIZE_OBS = True
-        REWARD_HORIZON = 1
+        REWARD_HORIZON = 30
         BENCHMARK_WEIGHT = 1.0
         FUTURE_PROFIT_WEIGHT = 0.5
-        FUTURE_WINDOW = 6
+        FUTURE_WINDOW = 30
         RISK_ADJUSTMENT = True
         DYNAMIC_PENALTIES = True
         USE_ATTENTION_WEIGHTS = False
         VOLATILITY_SCALING = True
-        NETWORK_SIZE = 'medium'
+        NETWORK_SIZE = 'large'  # Changed from 'xxlarge' to 'large'
         LEARNING_RATE = 0.0003
         BATCH_SIZE = 64
         N_STEPS = 2048
