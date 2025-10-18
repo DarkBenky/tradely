@@ -2,10 +2,10 @@ import os
 import numpy as np
 import pandas as pd
 from stable_baselines3 import PPO, A2C, SAC
-from stable_baselines3.common.vec_env import DummyVecEnv, SubprocVecEnv
-from stable_baselines3.common.callbacks import BaseCallback, CheckpointCallback, EvalCallback
+from stable_baselines3.common.vec_env import DummyVecEnv
+from stable_baselines3.common.callbacks import BaseCallback, CheckpointCallback
 from stable_baselines3.common.monitor import Monitor
-from portfolio_env import MultiCurrencyPortfolioEnv
+from portfolio_env import AggressiveMultiCurrencyPortfolioEnv
 import torch
 import matplotlib.pyplot as plt
 from datetime import datetime
@@ -13,16 +13,16 @@ import wandb
 import json
 
 
-class PortfolioMetricsCallback(BaseCallback):
+class AggressivePortfolioMetricsCallback(BaseCallback):
     
     def __init__(self, eval_env, eval_freq=1000, verbose=1, use_wandb=True, symbols=None):
-        super(PortfolioMetricsCallback, self).__init__(verbose)
+        super(AggressivePortfolioMetricsCallback, self).__init__(verbose)
         self.eval_env = eval_env
         self.eval_freq = eval_freq
         self.episode_returns = []
         self.episode_sharpe_ratios = []
         self.episode_drawdowns = []
-        self.best_sharpe = -np.inf
+        self.best_outperformance = -np.inf
         self.use_wandb = use_wandb
         self.symbols = symbols if symbols else []
         
@@ -56,6 +56,16 @@ class PortfolioMetricsCallback(BaseCallback):
                         weight = weights.get(symbol, 0)
                         log_data[f'train/weight_{symbol}'] = weight
                 
+                # Log momentum and trend signals
+                momentum_signals = info.get('momentum_signals', {})
+                trend_signals = info.get('trend_signals', {})
+                if momentum_signals and self.symbols:
+                    for symbol in self.symbols:
+                        momentum = momentum_signals.get(symbol, 0)
+                        trend = trend_signals.get(symbol, 0)
+                        log_data[f'train/momentum_{symbol}'] = momentum
+                        log_data[f'train/trend_{symbol}'] = trend
+                
                 wandb.log(log_data)
         
         if self.n_calls % self.eval_freq == 0:
@@ -80,7 +90,8 @@ class PortfolioMetricsCallback(BaseCallback):
                 episode_risk_metrics.append({
                     'volatility': info.get('portfolio_volatility', 0),
                     'diversification': info.get('diversification_ratio', 0),
-                    'var': info.get('value_at_risk', 0)
+                    'var': info.get('value_at_risk', 0),
+                    'outperformance': info.get('benchmark_outperformance', 0)
                 })
                 step += 1
             
@@ -101,7 +112,7 @@ class PortfolioMetricsCallback(BaseCallback):
                     'eval/trades_executed': metrics.get('trades_executed', 0),
                     'eval/total_fees': metrics.get('total_fees_paid', 0),
                     'eval/final_portfolio_value': metrics['final_portfolio_value'],
-                    'eval/best_sharpe_so_far': self.best_sharpe,
+                    'eval/best_outperformance_so_far': self.best_outperformance,
                     'eval/benchmark_return': metrics.get('benchmark_return', 0),
                     'eval/outperformance': metrics.get('outperformance', 0),
                     'eval/sortino_ratio': metrics.get('sortino_ratio', 0),
@@ -141,27 +152,34 @@ class PortfolioMetricsCallback(BaseCallback):
                 
                 # Risk metrics chart
                 if len(episode_risk_metrics) > 0:
-                    plt.figure(figsize=(12, 8))
+                    plt.figure(figsize=(12, 10))
                     
-                    plt.subplot(3, 1, 1)
+                    plt.subplot(4, 1, 1)
                     volatilities = [rm['volatility'] for rm in episode_risk_metrics]
                     plt.plot(volatilities, color='red')
                     plt.title('Portfolio Volatility Over Time')
                     plt.ylabel('Volatility')
                     plt.grid(True, alpha=0.3)
                     
-                    plt.subplot(3, 1, 2)
+                    plt.subplot(4, 1, 2)
                     diversifications = [rm['diversification'] for rm in episode_risk_metrics]
                     plt.plot(diversifications, color='green')
                     plt.title('Diversification Ratio Over Time')
                     plt.ylabel('Diversification')
                     plt.grid(True, alpha=0.3)
                     
-                    plt.subplot(3, 1, 3)
+                    plt.subplot(4, 1, 3)
                     vars = [rm['var'] for rm in episode_risk_metrics]
                     plt.plot(vars, color='orange')
                     plt.title('Value at Risk (95%) Over Time')
                     plt.ylabel('VaR')
+                    plt.grid(True, alpha=0.3)
+                    
+                    plt.subplot(4, 1, 4)
+                    outperformance = [rm['outperformance'] for rm in episode_risk_metrics]
+                    plt.plot(outperformance, color='purple')
+                    plt.title('Benchmark Outperformance Over Time')
+                    plt.ylabel('Outperformance')
                     plt.xlabel('Step')
                     plt.grid(True, alpha=0.3)
                     
@@ -180,19 +198,8 @@ class PortfolioMetricsCallback(BaseCallback):
                     plt.ylabel('Weight')
                     plt.legend(loc='upper right')
                     plt.grid(True, alpha=0.3)
-                    plt.ylim(0, 1)
+                    plt.ylim(0.0, 1.0)  # No negative weights
                     log_dict['eval/allocation_chart'] = wandb.Image(plt)
-                    plt.close()
-                
-                # Cash balance chart
-                if episode_cash_balances and len(episode_cash_balances) > 0:
-                    plt.figure(figsize=(10, 4))
-                    plt.plot(episode_cash_balances, color='green')
-                    plt.title('Cash Balance Over Time')
-                    plt.xlabel('Step')
-                    plt.ylabel('Cash ($)')
-                    plt.grid(True, alpha=0.3)
-                    log_dict['eval/cash_chart'] = wandb.Image(plt)
                     plt.close()
                 
                 wandb.log(log_dict)
@@ -210,27 +217,29 @@ class PortfolioMetricsCallback(BaseCallback):
                 print(f"  Win Rate: {metrics['win_rate']*100:.1f}%")
                 print(f"{'='*80}\n")
             
-            if metrics['sharpe_ratio'] > self.best_sharpe and metrics['sharpe_ratio'] > 0:
-                self.best_sharpe = metrics['sharpe_ratio']
-                model_path = f"{self.model.logger.dir}/best_model_sharpe_{metrics['sharpe_ratio']:.3f}"
+            # Focus on outperformance as the main metric for aggressive strategy
+            current_outperformance = metrics.get('outperformance', 0)
+            if current_outperformance > self.best_outperformance and current_outperformance > 0:
+                self.best_outperformance = current_outperformance
+                model_path = f"{self.model.logger.dir}/best_model_outperformance_{current_outperformance:.3f}"
                 self.model.save(model_path)
                 
                 if self.use_wandb:
-                    wandb.log({'eval/new_best_sharpe': metrics['sharpe_ratio']})
+                    wandb.log({'eval/new_best_outperformance': current_outperformance})
                     
                     import os
                     zip_file = model_path + ".zip"
                     if os.path.exists(zip_file):
                         artifact = wandb.Artifact(
-                            name=f"model-best-sharpe",
+                            name=f"model-best-outperformance",
                             type="model",
-                            description=f"Best model with Sharpe ratio {metrics['sharpe_ratio']:.3f}"
+                            description=f"Best model with outperformance {current_outperformance:.3f}"
                         )
                         artifact.add_file(zip_file)
                         wandb.log_artifact(artifact)
                 
                 if self.verbose > 0:
-                    print(f"New best Sharpe ratio! Model saved.")
+                    print(f"New best outperformance! Model saved.")
         
         return True
 
@@ -261,13 +270,15 @@ def load_data(symbols, data_dir='data'):
     return dfs
 
 
-def create_env(dfs, symbols, starting_balance=10000, is_eval=False,
-               fee_rate=0.001, lookback_window=50, rebalance_frequency=1,
-               risk_free_rate=-0.04, max_drawdown_penalty=2.0, normalize_obs=True,
-               reward_horizon=1, benchmark_weight=1.0, future_profit_weight=0.5,
-               future_window=6, risk_adjustment=True, dynamic_penalties=True,
-               use_attention_weights=False, volatility_scaling=True):
-    env = MultiCurrencyPortfolioEnv(
+def create_aggressive_env(dfs, symbols, starting_balance=10000, is_eval=False,
+               fee_rate=0.001, lookback_window=50, rebalance_frequency=6,
+               risk_free_rate=0.02, max_drawdown_penalty=1.0, normalize_obs=True,
+               reward_horizon=1, benchmark_weight=3.0, future_profit_weight=2.0,
+               future_window=8, risk_adjustment=False, dynamic_penalties=False,
+               use_attention_weights=True, volatility_scaling=False,
+               momentum_lookback=10, concentration_limit=0.7, 
+               trend_following=True):  # Removed leverage_limit
+    env = AggressiveMultiCurrencyPortfolioEnv(
         dfs=dfs,
         symbols=symbols,
         starting_balance=starting_balance,
@@ -284,7 +295,11 @@ def create_env(dfs, symbols, starting_balance=10000, is_eval=False,
         risk_adjustment=risk_adjustment,
         dynamic_penalties=dynamic_penalties,
         use_attention_weights=use_attention_weights,
-        volatility_scaling=volatility_scaling
+        volatility_scaling=volatility_scaling,
+        momentum_lookback=momentum_lookback,
+        concentration_limit=concentration_limit,
+        trend_following=trend_following
+        # Removed leverage_limit
     )
     
     if not is_eval:
@@ -293,38 +308,42 @@ def create_env(dfs, symbols, starting_balance=10000, is_eval=False,
     return env
 
 
-def train_portfolio_agent(
+def train_aggressive_portfolio_agent(
     symbols,
     algorithm='PPO',
-    total_timesteps=100000,
+    total_timesteps=200000,
     learning_rate=0.0003,
     batch_size=64,
     n_steps=2048,
     starting_balance=10000,
-    save_dir='models/portfolio',
-    log_dir='logs/portfolio',
+    save_dir='models/aggressive_portfolio',
+    log_dir='logs/aggressive_portfolio',
     use_wandb=True,
-    wandb_project='crypto-portfolio-rl',
+    wandb_project='crypto-portfolio-rl-aggressive',
     wandb_run_name=None,
     fee_rate=0.001,
     lookback_window=50,
-    rebalance_frequency=1,
-    risk_free_rate=-0.04,
-    max_drawdown_penalty=2.0,
+    rebalance_frequency=6,
+    risk_free_rate=0.02,
+    max_drawdown_penalty=1.0,
     normalize_obs=True,
     reward_horizon=1,
-    benchmark_weight=1.0,
-    future_profit_weight=0.5,
-    future_window=6,
-    risk_adjustment=True,
-    dynamic_penalties=True,
-    use_attention_weights=False,
-    volatility_scaling=True,
-    network_size='large'  # Changed from 'xxlarge' to 'large'
+    benchmark_weight=3.0,
+    future_profit_weight=2.0,
+    future_window=8,
+    risk_adjustment=False,
+    dynamic_penalties=False,
+    use_attention_weights=True,
+    volatility_scaling=False,
+    network_size='large',
+    momentum_lookback=10,
+    concentration_limit=0.7,
+    trend_following=True
+    # Removed leverage_limit
 ):
     
     print("=" * 80)
-    print("Advanced Multi-Currency Portfolio RL Training")
+    print("AGGRESSIVE Multi-Currency Portfolio RL Training")
     print("=" * 80)
     
     os.makedirs(save_dir, exist_ok=True)
@@ -352,7 +371,7 @@ def train_portfolio_agent(
     
     if use_wandb:
         if wandb_run_name is None:
-            wandb_run_name = f"{algorithm}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+            wandb_run_name = f"{algorithm}_aggressive_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
         
         wandb.init(
             project=wandb_project,
@@ -383,14 +402,17 @@ def train_portfolio_agent(
                 'use_attention_weights': use_attention_weights,
                 'volatility_scaling': volatility_scaling,
                 'network_size': network_size,
+                'momentum_lookback': momentum_lookback,
+                'concentration_limit': concentration_limit,
+                'trend_following': trend_following,
             },
-            tags=[algorithm, 'portfolio', 'crypto', 'advanced', f'net_{network_size}'],
-            notes=f"Training {algorithm} agent on {len(available_symbols)} cryptocurrencies with advanced risk management"
+            tags=[algorithm, 'portfolio', 'crypto', 'aggressive', f'net_{network_size}'],
+            notes=f"Training {algorithm} agent on {len(available_symbols)} cryptocurrencies with AGGRESSIVE strategy"
         )
         print(f"\nWandB initialized: {wandb.run.url}")
     
-    print("\nCreating environments...")
-    train_env = create_env(
+    print("\nCreating aggressive environments...")
+    train_env = create_aggressive_env(
         train_dfs, available_symbols, starting_balance,
         fee_rate=fee_rate, lookback_window=lookback_window,
         rebalance_frequency=rebalance_frequency, risk_free_rate=risk_free_rate,
@@ -398,9 +420,11 @@ def train_portfolio_agent(
         reward_horizon=reward_horizon, benchmark_weight=benchmark_weight,
         future_profit_weight=future_profit_weight, future_window=future_window,
         risk_adjustment=risk_adjustment, dynamic_penalties=dynamic_penalties,
-        use_attention_weights=use_attention_weights, volatility_scaling=volatility_scaling
+        use_attention_weights=use_attention_weights, volatility_scaling=volatility_scaling,
+        momentum_lookback=momentum_lookback, concentration_limit=concentration_limit,
+        trend_following=trend_following
     )
-    eval_env = create_env(
+    eval_env = create_aggressive_env(
         val_dfs, available_symbols, starting_balance, is_eval=True,
         fee_rate=fee_rate, lookback_window=lookback_window,
         rebalance_frequency=rebalance_frequency, risk_free_rate=risk_free_rate,
@@ -408,16 +432,23 @@ def train_portfolio_agent(
         reward_horizon=reward_horizon, benchmark_weight=benchmark_weight,
         future_profit_weight=future_profit_weight, future_window=future_window,
         risk_adjustment=risk_adjustment, dynamic_penalties=dynamic_penalties,
-        use_attention_weights=use_attention_weights, volatility_scaling=volatility_scaling
+        use_attention_weights=use_attention_weights, volatility_scaling=volatility_scaling,
+        momentum_lookback=momentum_lookback, concentration_limit=concentration_limit,
+        trend_following=trend_following
     )
     
     print(f"Observation space: {train_env.observation_space.shape}")
     print(f"Action space: {train_env.action_space.shape}")
     
+    # Test observation creation to verify shape
+    test_obs, _ = train_env.reset()
+    print(f"Test observation shape: {test_obs.shape}")
+    
     if use_wandb:
         wandb.config.update({
             'observation_dim': train_env.observation_space.shape[0],
             'action_dim': train_env.action_space.shape[0],
+            'actual_observation_dim': test_obs.shape[0],
         })
     
     print(f"\nInitializing {algorithm} agent with {network_size} network...")
@@ -500,10 +531,10 @@ def train_portfolio_agent(
     checkpoint_callback = CheckpointCallback(
         save_freq=10000,
         save_path=save_dir,
-        name_prefix=f'{algorithm}_portfolio'
+        name_prefix=f'{algorithm}_aggressive_portfolio'
     )
     
-    metrics_callback = PortfolioMetricsCallback(
+    metrics_callback = AggressivePortfolioMetricsCallback(
         eval_env=eval_env,
         eval_freq=5000,
         verbose=1,
@@ -511,7 +542,7 @@ def train_portfolio_agent(
         symbols=available_symbols
     )
     
-    print(f"\nStarting training for {total_timesteps} timesteps...")
+    print(f"\nStarting AGGRESSIVE training for {total_timesteps} timesteps...")
     print("Monitor progress with: tensorboard --logdir=" + log_dir)
     if use_wandb:
         print(f"Monitor progress with W&B: {wandb.run.url}")
@@ -527,7 +558,7 @@ def train_portfolio_agent(
         print("\nTraining interrupted by user")
     
     print("\n" + "=" * 80)
-    print("Evaluating Final Model")
+    print("Evaluating Final Aggressive Model")
     print("=" * 80)
     
     obs = eval_env.reset()[0]
@@ -565,7 +596,7 @@ def train_portfolio_agent(
     final_metrics = eval_env.get_final_metrics()
     
     print("\n" + "=" * 80)
-    print("Final Evaluation Results")
+    print("Final Aggressive Evaluation Results")
     print("=" * 80)
     print(f"Total Steps: {step}")
     print(f"Episode Reward: {episode_reward:.2f}")
@@ -587,11 +618,11 @@ def train_portfolio_agent(
     print(f"Total Fees: ${final_metrics['total_fees_paid']:.2f}")
     
     timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-    sharpe_str = f"{final_metrics['sharpe_ratio']:.2f}".replace('.', '_')
-    return_str = f"{final_metrics['total_return']*100:.1f}".replace('.', '_').replace('-', 'neg')
     outperformance_str = f"{final_metrics['outperformance']*100:.1f}".replace('.', '_').replace('-', 'neg')
+    return_str = f"{final_metrics['total_return']*100:.1f}".replace('.', '_').replace('-', 'neg')
+    sharpe_str = f"{final_metrics['sharpe_ratio']:.2f}".replace('.', '_')
     
-    final_model_name = f"{algorithm}_sharpe{sharpe_str}_ret{return_str}pct_outperf{outperformance_str}pct_{timestamp}"
+    final_model_name = f"{algorithm}_aggressive_outperf{outperformance_str}pct_ret{return_str}pct_sharpe{sharpe_str}_{timestamp}"
     final_model_path = os.path.join(save_dir, final_model_name)
     model.save(final_model_path)
     
@@ -601,6 +632,7 @@ def train_portfolio_agent(
             'algorithm': algorithm,
             'timestamp': timestamp,
             'total_timesteps': total_timesteps,
+            'strategy': 'aggressive'
         },
         'performance': {
             'sharpe_ratio': float(final_metrics['sharpe_ratio']),
@@ -627,7 +659,7 @@ def train_portfolio_agent(
             'batch_size': batch_size,
             'n_steps': n_steps,
         },
-        'environment_config': {
+        'aggressive_environment_config': {
             'fee_rate': fee_rate,
             'lookback_window': lookback_window,
             'rebalance_frequency': rebalance_frequency,
@@ -642,6 +674,9 @@ def train_portfolio_agent(
             'dynamic_penalties': dynamic_penalties,
             'use_attention_weights': use_attention_weights,
             'volatility_scaling': volatility_scaling,
+            'momentum_lookback': momentum_lookback,
+            'concentration_limit': concentration_limit,
+            'trend_following': trend_following,
         },
         'network': {
             'size': network_size,
@@ -659,11 +694,11 @@ def train_portfolio_agent(
     
     if use_wandb:
         artifact = wandb.Artifact(
-            name=f"model-final-{timestamp}",
+            name=f"model-aggressive-final-{timestamp}",
             type="model",
-            description=f"Final {algorithm} model - Sharpe: {final_metrics['sharpe_ratio']:.2f}, "
+            description=f"Final aggressive {algorithm} model - Outperformance: {final_metrics['outperformance']*100:.1f}%, "
                        f"Return: {final_metrics['total_return']*100:.1f}%, "
-                       f"Outperformance: {final_metrics['outperformance']*100:.1f}%"
+                       f"Sharpe: {final_metrics['sharpe_ratio']:.2f}"
         )
         artifact.add_file(final_model_path + ".zip")
         artifact.add_file(config_path)
@@ -691,8 +726,8 @@ def train_portfolio_agent(
             'final/total_fees': final_metrics['total_fees_paid'],
         })
     
-    plot_advanced_results(portfolio_values, benchmark_values, actions_history, 
-                         risk_metrics_history, available_symbols, save_dir, use_wandb)
+    plot_aggressive_results(portfolio_values, benchmark_values, actions_history, 
+                           risk_metrics_history, available_symbols, save_dir, use_wandb)
     
     if use_wandb:
         wandb.finish()
@@ -700,8 +735,8 @@ def train_portfolio_agent(
     return model, final_metrics
 
 
-def plot_advanced_results(portfolio_values, benchmark_values, actions_history, 
-                         risk_metrics_history, symbols, save_dir, use_wandb=True):
+def plot_aggressive_results(portfolio_values, benchmark_values, actions_history, 
+                           risk_metrics_history, symbols, save_dir, use_wandb=True):
     fig, axes = plt.subplots(3, 2, figsize=(16, 12))
     
     # Portfolio vs Benchmark
@@ -723,7 +758,7 @@ def plot_advanced_results(portfolio_values, benchmark_values, actions_history,
         axes[0, 1].set_ylabel('Weight')
         axes[0, 1].legend(loc='upper right')
         axes[0, 1].grid(True, alpha=0.3)
-        axes[0, 1].set_ylim(0, 1)
+        axes[0, 1].set_ylim(0.0, 1.0)  # No negative weights
     
     # Risk metrics
     if len(risk_metrics_history) > 0:
@@ -757,12 +792,12 @@ def plot_advanced_results(portfolio_values, benchmark_values, actions_history,
         axes[2, 1].grid(True, alpha=0.3)
     
     plt.tight_layout()
-    plot_path = os.path.join(save_dir, 'advanced_evaluation_results.png')
+    plot_path = os.path.join(save_dir, 'aggressive_evaluation_results.png')
     plt.savefig(plot_path, dpi=150)
-    print(f"\nAdvanced plot saved to: {plot_path}")
+    print(f"\nAggressive plot saved to: {plot_path}")
     
     if use_wandb:
-        wandb.log({'final/advanced_evaluation_plot': wandb.Image(plot_path)})
+        wandb.log({'final/aggressive_evaluation_plot': wandb.Image(plot_path)})
     
     plt.close()
 
@@ -771,61 +806,100 @@ if __name__ == "__main__":
     try:
         from config import *
         print("Loaded configuration from config.py")
+        
+        # Override for aggressive strategy
+        AGGRESSIVE_CONFIG = {
+            'ALGORITHM': 'PPO',
+            'TOTAL_TIMESTEPS': 200_000,
+            'STARTING_BALANCE': 10000,
+            'FEE_RATE': 0.001,
+            'LOOKBACK_WINDOW': 50,
+            'REBALANCE_FREQUENCY': 6,
+            'RISK_FREE_RATE': 0.02,
+            'MAX_DRAWDOWN_PENALTY': 1.0,
+            'NORMALIZE_OBS': True,
+            'REWARD_HORIZON': 1,
+            'BENCHMARK_WEIGHT': 3.0,
+            'FUTURE_PROFIT_WEIGHT': 2.0,
+            'FUTURE_WINDOW': 8,
+            'RISK_ADJUSTMENT': False,
+            'DYNAMIC_PENALTIES': False,
+            'USE_ATTENTION_WEIGHTS': True,
+            'VOLATILITY_SCALING': False,
+            'NETWORK_SIZE': 'large',
+            'LEARNING_RATE': 0.0003,
+            'BATCH_SIZE': 64,
+            'N_STEPS': 2048,
+            'MOMENTUM_LOOKBACK': 10,
+            'CONCENTRATION_LIMIT': 0.7,
+            'TREND_FOLLOWING': True
+            # Removed LEVERAGE_LIMIT
+        }
+        
     except ImportError:
-        print("No config.py found, using default configuration")
+        print("No config.py found, using aggressive default configuration")
         SYMBOLS = [
             'BTCUSDT', 'ETHUSDT', 'BNBUSDT', 'SOLUSDT', 'ADAUSDT',
             'XRPUSDT', 'DOGEUSDT', 'MATICUSDT', 'DOTUSDT', 'AVAXUSDT'
         ]
-        ALGORITHM = 'PPO'
-        TOTAL_TIMESTEPS = 100_000
-        STARTING_BALANCE = 10000
-        FEE_RATE = 0.001
-        LOOKBACK_WINDOW = 120
-        REBALANCE_FREQUENCY = 6
-        RISK_FREE_RATE = -0.04
-        MAX_DRAWDOWN_PENALTY = 2.0
-        NORMALIZE_OBS = True
-        REWARD_HORIZON = 30
-        BENCHMARK_WEIGHT = 1.0
-        FUTURE_PROFIT_WEIGHT = 0.5
-        FUTURE_WINDOW = 30
-        RISK_ADJUSTMENT = True
-        DYNAMIC_PENALTIES = True
-        USE_ATTENTION_WEIGHTS = False
-        VOLATILITY_SCALING = True
-        NETWORK_SIZE = 'large'  # Changed from 'xxlarge' to 'large'
-        LEARNING_RATE = 0.0003
-        BATCH_SIZE = 64
-        N_STEPS = 2048
+        AGGRESSIVE_CONFIG = {
+            'ALGORITHM': 'PPO',
+            'TOTAL_TIMESTEPS': 200_000,
+            'STARTING_BALANCE': 10000,
+            'FEE_RATE': 0.001,
+            'LOOKBACK_WINDOW': 60,
+            'REBALANCE_FREQUENCY': 3,
+            'RISK_FREE_RATE': -0.04,
+            'MAX_DRAWDOWN_PENALTY': 1.0,
+            'NORMALIZE_OBS': True,
+            'REWARD_HORIZON': 1,
+            'BENCHMARK_WEIGHT': 3.0,
+            'FUTURE_PROFIT_WEIGHT': 5.0,
+            'FUTURE_WINDOW': 8,
+            'RISK_ADJUSTMENT': False,
+            'DYNAMIC_PENALTIES': False,
+            'USE_ATTENTION_WEIGHTS': True,
+            'VOLATILITY_SCALING': False,
+            'NETWORK_SIZE': 'large',
+            'LEARNING_RATE': 0.0003,
+            'BATCH_SIZE': 64,
+            'N_STEPS': 2048,
+            'MOMENTUM_LOOKBACK': 10,
+            'CONCENTRATION_LIMIT': 0.7,
+            'TREND_FOLLOWING': True
+            # Removed LEVERAGE_LIMIT
+        }
     
-    model, metrics = train_portfolio_agent(
+    model, metrics = train_aggressive_portfolio_agent(
         symbols=SYMBOLS,
-        algorithm=ALGORITHM,
-        total_timesteps=TOTAL_TIMESTEPS,
-        learning_rate=LEARNING_RATE,
-        batch_size=BATCH_SIZE,
-        n_steps=N_STEPS,
-        starting_balance=STARTING_BALANCE,
-        save_dir=f'models/portfolio_{ALGORITHM.lower()}',
-        log_dir=f'logs/portfolio_{ALGORITHM.lower()}',
-        fee_rate=FEE_RATE,
-        lookback_window=LOOKBACK_WINDOW,
-        rebalance_frequency=REBALANCE_FREQUENCY,
-        risk_free_rate=RISK_FREE_RATE,
-        max_drawdown_penalty=MAX_DRAWDOWN_PENALTY,
-        normalize_obs=NORMALIZE_OBS,
-        reward_horizon=REWARD_HORIZON,
-        benchmark_weight=BENCHMARK_WEIGHT,
-        future_profit_weight=FUTURE_PROFIT_WEIGHT,
-        future_window=FUTURE_WINDOW,
-        risk_adjustment=RISK_ADJUSTMENT,
-        dynamic_penalties=DYNAMIC_PENALTIES,
-        use_attention_weights=USE_ATTENTION_WEIGHTS,
-        volatility_scaling=VOLATILITY_SCALING,
-        network_size=NETWORK_SIZE
+        algorithm=AGGRESSIVE_CONFIG['ALGORITHM'],
+        total_timesteps=AGGRESSIVE_CONFIG['TOTAL_TIMESTEPS'],
+        learning_rate=AGGRESSIVE_CONFIG['LEARNING_RATE'],
+        batch_size=AGGRESSIVE_CONFIG['BATCH_SIZE'],
+        n_steps=AGGRESSIVE_CONFIG['N_STEPS'],
+        starting_balance=AGGRESSIVE_CONFIG['STARTING_BALANCE'],
+        save_dir=f'models/aggressive_portfolio_{AGGRESSIVE_CONFIG["ALGORITHM"].lower()}',
+        log_dir=f'logs/aggressive_portfolio_{AGGRESSIVE_CONFIG["ALGORITHM"].lower()}',
+        fee_rate=AGGRESSIVE_CONFIG['FEE_RATE'],
+        lookback_window=AGGRESSIVE_CONFIG['LOOKBACK_WINDOW'],
+        rebalance_frequency=AGGRESSIVE_CONFIG['REBALANCE_FREQUENCY'],
+        risk_free_rate=AGGRESSIVE_CONFIG['RISK_FREE_RATE'],
+        max_drawdown_penalty=AGGRESSIVE_CONFIG['MAX_DRAWDOWN_PENALTY'],
+        normalize_obs=AGGRESSIVE_CONFIG['NORMALIZE_OBS'],
+        reward_horizon=AGGRESSIVE_CONFIG['REWARD_HORIZON'],
+        benchmark_weight=AGGRESSIVE_CONFIG['BENCHMARK_WEIGHT'],
+        future_profit_weight=AGGRESSIVE_CONFIG['FUTURE_PROFIT_WEIGHT'],
+        future_window=AGGRESSIVE_CONFIG['FUTURE_WINDOW'],
+        risk_adjustment=AGGRESSIVE_CONFIG['RISK_ADJUSTMENT'],
+        dynamic_penalties=AGGRESSIVE_CONFIG['DYNAMIC_PENALTIES'],
+        use_attention_weights=AGGRESSIVE_CONFIG['USE_ATTENTION_WEIGHTS'],
+        volatility_scaling=AGGRESSIVE_CONFIG['VOLATILITY_SCALING'],
+        network_size=AGGRESSIVE_CONFIG['NETWORK_SIZE'],
+        momentum_lookback=AGGRESSIVE_CONFIG['MOMENTUM_LOOKBACK'],
+        concentration_limit=AGGRESSIVE_CONFIG['CONCENTRATION_LIMIT'],
+        trend_following=AGGRESSIVE_CONFIG['TREND_FOLLOWING']
     )
     
     print("\n" + "=" * 80)
-    print("Training Complete!")
+    print("Aggressive Training Complete!")
     print("=" * 80)

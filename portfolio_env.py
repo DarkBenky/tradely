@@ -8,10 +8,10 @@ from collections import deque
 warnings.filterwarnings('ignore')
 
 
-class MultiCurrencyPortfolioEnv(gym.Env):
+class AggressiveMultiCurrencyPortfolioEnv(gym.Env):
     """
-    Advanced Multi-Currency Portfolio Rebalancing Environment
-    with Dynamic Risk Management and Adaptive Rewards
+    Aggressive Multi-Currency Portfolio Environment
+    Designed specifically to outperform passive benchmarks through active strategies
     """
     
     metadata = {'render_modes': ['human']}
@@ -23,22 +23,26 @@ class MultiCurrencyPortfolioEnv(gym.Env):
         starting_balance: float = 10000.0,
         fee_rate: float = 0.001,
         lookback_window: int = 50,
-        rebalance_frequency: int = 12,
+        rebalance_frequency: int = 6,
         risk_free_rate: float = 0.02,
-        max_drawdown_penalty: float = 2.0,
+        max_drawdown_penalty: float = 1.0,
         normalize_obs: bool = True,
         reward_horizon: int = 1,
-        benchmark_weight: float = 1.0,
-        future_profit_weight: float = 0.5,
-        future_window: int = 6,
-        risk_adjustment: bool = True,
-        dynamic_penalties: bool = True,
-        use_attention_weights: bool = False,
-        volatility_scaling: bool = True,
-        periods_per_year: Optional[int] = None,  # NEW: configurable periods per year
-        clip_metrics: bool = True  # NEW: control metric clipping
+        benchmark_weight: float = 3.0,
+        future_profit_weight: float = 2.0,
+        future_window: int = 8,
+        risk_adjustment: bool = False,
+        dynamic_penalties: bool = False,
+        use_attention_weights: bool = True,
+        volatility_scaling: bool = False,
+        periods_per_year: Optional[int] = None,
+        clip_metrics: bool = False,
+        momentum_lookback: int = 10,
+        concentration_limit: float = 0.7,
+        trend_following: bool = True
+        # Removed leverage_limit parameter
     ):
-        super(MultiCurrencyPortfolioEnv, self).__init__()
+        super(AggressiveMultiCurrencyPortfolioEnv, self).__init__()
         
         self.dfs = dfs
         self.symbols = symbols
@@ -59,35 +63,47 @@ class MultiCurrencyPortfolioEnv(gym.Env):
         self.use_attention_weights = use_attention_weights
         self.volatility_scaling = volatility_scaling
         self.periods_per_year = periods_per_year
-        self.clip_metrics = clip_metrics  # NEW: store clipping preference
+        self.clip_metrics = clip_metrics
         
-        # Initialize RNG (safe default so sample_action() works before reset)
+        # Aggressive strategy parameters
+        self.momentum_lookback = momentum_lookback
+        self.concentration_limit = concentration_limit
+        self.trend_following = trend_following
+        
+        # Initialize RNG
         self.np_random = np.random.default_rng()
         
         self._align_dataframes()
         
         first_df = self.dfs[symbols[0]]
-        # More robust feature detection
         self.feature_columns = [col for col in first_df.columns 
                                if pd.api.types.is_numeric_dtype(first_df[col])]
         self.num_features_per_asset = len(self.feature_columns)
         
-        # Enhanced action space with risk controls
+        # Action space without short positions (no negative allocations)
         self.action_space = spaces.Box(
-            low=0.0,
-            high=1.0,
+            low=0.0,  # No short positions
+            high=1.0,  # Maximum 100% long
             shape=(self.num_assets,),
             dtype=np.float32
         )
         
-        # Calculate exact observation dimension
-        obs_dim = (self.lookback_window * self.num_features_per_asset * self.num_assets + 
-                  self.num_assets + 10)  # 10 portfolio metrics
+        # FIXED: Calculate observation dimension correctly
+        # Features: lookback_window * num_features_per_asset * num_assets
+        feature_dim = self.lookback_window * self.num_features_per_asset * self.num_assets
         
-        print(f"Calculated observation dimension: {obs_dim}")
-        print(f"Lookback window: {self.lookback_window}")
-        print(f"Features per asset: {self.num_features_per_asset}")
-        print(f"Number of assets: {self.num_assets}")
+        # Portfolio state: weights (num_assets) + 11 scalars + momentum_signals (num_assets) + trend_signals (num_assets)
+        # Removed gross_exposure and net_exposure (2 scalars)
+        portfolio_state_dim = self.num_assets + 11 + self.num_assets + self.num_assets
+        
+        obs_dim = feature_dim + portfolio_state_dim
+        
+        print(f"Aggressive Portfolio Environment")
+        print(f"Observation dimension: {obs_dim}")
+        print(f"  - Features: {feature_dim}")
+        print(f"  - Portfolio state: {portfolio_state_dim}")
+        print(f"Concentration limit: {self.concentration_limit}")
+        print(f"No leverage or short positions allowed")
 
         self.observation_space = spaces.Box(
             low=-np.inf,
@@ -99,30 +115,32 @@ class MultiCurrencyPortfolioEnv(gym.Env):
         # Initialize state variables
         self._initialize_state()
         
-        # Advanced risk management
-        self.volatility_lookback = 20
-        self.correlation_lookback = 50
+        # Risk management - looser limits but no leverage
+        self.volatility_lookback = 15
+        self.correlation_lookback = 30
         self.risk_limits = {
-            'max_single_asset': 0.4,
-            'max_drawdown': 0.3,
-            'target_volatility': 0.15
+            'max_single_asset': self.concentration_limit,
+            'max_drawdown': 0.4,
+            'target_volatility': 0.25
         }
         
-        # Adaptive reward parameters - SCALED DOWN SIGNIFICANTLY
+        # Aggressive reward parameters
         self.reward_components = {
-            'returns': 0.1,        # Reduced from 1.0
-            'sharpe': 0.03,        # Reduced from 0.3
-            'drawdown': 0.2,       # Reduced from 2.0
-            'benchmark': 0.1,      # Reduced from 1.0
-            'future': 0.05,        # Reduced from 0.5
-            'risk_adjusted': 0.02, # Reduced from 0.2
-            'diversification': 0.01 # Reduced from 0.1
+            'returns': 1.5,
+            'sharpe': 0.05,
+            'drawdown': 0.05,
+            'benchmark': 3.0,
+            'future': 2.0,
+            'risk_adjusted': 0.0,
+            'diversification': -0.1,
+            'momentum': 0.5,
+            'trend': 0.8
         }
         
         # Performance tracking
-        self.rolling_sharpe = deque(maxlen=100)
-        self.rolling_volatility = deque(maxlen=50)
-        self.rolling_max_drawdown = deque(maxlen=50)
+        self.rolling_sharpe = deque(maxlen=50)
+        self.rolling_volatility = deque(maxlen=30)
+        self.rolling_max_drawdown = deque(maxlen=30)
         
     def _initialize_state(self):
         """Initialize all state variables"""
@@ -133,7 +151,7 @@ class MultiCurrencyPortfolioEnv(gym.Env):
         self.weights = {symbol: 0.0 for symbol in self.symbols}
         
         # Enhanced performance tracking
-        self.portfolio_history = [self.starting_balance]  # Start with initial balance
+        self.portfolio_history = [self.starting_balance]
         self.returns_history = []
         self.weights_history = []
         self.peak_value = self.starting_balance
@@ -157,6 +175,10 @@ class MultiCurrencyPortfolioEnv(gym.Env):
         self.portfolio_beta = 0.0
         self.diversification_ratio = 0.0
         
+        # Aggressive strategy state
+        self.momentum_signals = {symbol: 0.0 for symbol in self.symbols}
+        self.trend_signals = {symbol: 0.0 for symbol in self.symbols}
+        
     def _initialize_benchmark_portfolio(self):
         """Initialize equal-weight benchmark portfolio"""
         self.benchmark_holdings = {}
@@ -168,7 +190,7 @@ class MultiCurrencyPortfolioEnv(gym.Env):
             self.benchmark_holdings[symbol] = units
     
     def _update_benchmark_value(self):
-        """Update benchmark portfolio value - FIXED: handle uninitialized case"""
+        """Update benchmark portfolio value"""
         if not self.benchmark_holdings:
             self.benchmark_value = self.starting_balance
             return
@@ -293,6 +315,58 @@ class MultiCurrencyPortfolioEnv(gym.Env):
             pass
         return 0.0
 
+    def _calculate_momentum_signals(self):
+        """Calculate momentum signals for aggressive positioning"""
+        for symbol in self.symbols:
+            if self.current_step < self.momentum_lookback:
+                self.momentum_signals[symbol] = 0.0
+                continue
+                
+            try:
+                current_price = self._get_current_price(symbol)
+                past_idx = self.current_step + self.lookback_window - self.momentum_lookback
+                if 0 <= past_idx < len(self.dfs[symbol]):
+                    past_price = float(self.dfs[symbol].iloc[int(past_idx)]['close'])
+                    # Simple price momentum
+                    momentum = (current_price - past_price) / (past_price + 1e-8)
+                    # Normalize momentum to [-1, 1] range
+                    self.momentum_signals[symbol] = np.tanh(momentum * 10)
+                else:
+                    self.momentum_signals[symbol] = 0.0
+            except (IndexError, KeyError, ValueError):
+                self.momentum_signals[symbol] = 0.0
+    
+    def _calculate_trend_signals(self):
+        """Calculate trend following signals"""
+        for symbol in self.symbols:
+            if self.current_step < 20:
+                self.trend_signals[symbol] = 0.0
+                continue
+                
+            try:
+                # Use multiple timeframes for trend confirmation
+                prices = []
+                for offset in [5, 10, 20]:
+                    idx = self.current_step + self.lookback_window - offset
+                    if 0 <= idx < len(self.dfs[symbol]):
+                        price = float(self.dfs[symbol].iloc[int(idx)]['close'])
+                        prices.append(price)
+                
+                if len(prices) >= 3:
+                    current_price = self._get_current_price(symbol)
+                    # Weighted trend score
+                    short_trend = (current_price - prices[0]) / (prices[0] + 1e-8)
+                    medium_trend = (current_price - prices[1]) / (prices[1] + 1e-8)
+                    long_trend = (current_price - prices[2]) / (prices[2] + 1e-8)
+                    
+                    # Combined trend signal with weights
+                    trend_score = (short_trend * 0.5 + medium_trend * 0.3 + long_trend * 0.2)
+                    self.trend_signals[symbol] = np.clip(trend_score * 5, -1, 1)
+                else:
+                    self.trend_signals[symbol] = 0.0
+            except (IndexError, KeyError, ValueError):
+                self.trend_signals[symbol] = 0.0
+
     def _adaptive_normalize_features(self, features: np.ndarray) -> np.ndarray:
         """Advanced adaptive normalization with outlier detection"""
         if not self.normalize_obs or len(features) == 0:
@@ -315,10 +389,10 @@ class MultiCurrencyPortfolioEnv(gym.Env):
         return normalized
 
     def _calculate_risk_metrics(self):
-        """Calculate advanced risk metrics - FIXED: use numpy arrays"""
+        """Calculate advanced risk metrics"""
         # Portfolio volatility
         if len(self.returns_history) >= 10:
-            recent_returns = np.array(self.returns_history[-min(20, len(self.returns_history)):])  # FIXED: convert to array
+            recent_returns = np.array(self.returns_history[-min(20, len(self.returns_history)):])
             self.portfolio_volatility = np.std(recent_returns, ddof=1) * np.sqrt(252) if recent_returns.size > 0 else 0.0
             self.rolling_volatility.append(self.portfolio_volatility)
         
@@ -362,62 +436,60 @@ class MultiCurrencyPortfolioEnv(gym.Env):
         return penalties
 
     def sample_action(self) -> np.ndarray:
-        """Sample action with risk-aware distribution"""
-        # Dirichlet distribution for portfolio weights
-        if self.use_attention_weights and len(self.rolling_volatility) > 0:
-            # Risk-aware sampling - lower concentration in high volatility
+        """Sample aggressive actions with momentum bias"""
+        if self.use_attention_weights and any(abs(s) > 0.1 for s in self.momentum_signals.values()):
+            # Momentum-biased sampling
             base_alpha = np.ones(self.num_assets)
-            if self.portfolio_volatility > 0.2:
-                base_alpha = base_alpha * 2  # More diversified in high vol
+            for i, symbol in enumerate(self.symbols):
+                # Bias sampling towards assets with strong momentum
+                momentum_strength = abs(self.momentum_signals[symbol])
+                base_alpha[i] = 1.0 + momentum_strength * 2
+            
             random_weights = self.np_random.dirichlet(base_alpha)
         else:
+            # Standard sampling without negative weights
             random_weights = self.np_random.dirichlet(np.ones(self.num_assets))
         
         return random_weights.astype(np.float32)
         
     def _align_dataframes(self):
-        """Align dataframes and calculate max steps - FIXED: handle small datasets"""
+        """Align dataframes and calculate max steps"""
         min_length = min(len(df) for df in self.dfs.values())
         
         for symbol in self.symbols:
             self.dfs[symbol] = self.dfs[symbol].iloc[:min_length].reset_index(drop=True)
         
-        # FIXED: Ensure max_steps is non-negative
         self.max_steps = max(0, min_length - self.lookback_window - 1)
     
-    def _get_observation(self) -> np.ndarray:
-        """Get enhanced observation with risk metrics - FIXED with padding"""
+    def _get_aggressive_observation(self) -> np.ndarray:
+        """Enhanced observation with momentum and trend signals"""
         obs_parts = []
         
+        # Price and volume data
         for symbol in self.symbols:
             df = self.dfs[symbol]
             start_idx = self.current_step
             end_idx = self.current_step + self.lookback_window
             
-            # Ensure we're using integer indices
             start_idx = int(start_idx)
             end_idx = int(end_idx)
             
-            # slice requested window
             window_data = df.iloc[start_idx:end_idx][self.feature_columns].values
             
-            # FIXED: Ensure window_data has exactly `lookback_window` rows by padding at the top with zeros
             if window_data.shape[0] < self.lookback_window:
                 rows_needed = self.lookback_window - window_data.shape[0]
                 if window_data.size == 0:
-                    # create zeros with shape (lookback_window, num_features)
                     window_data = np.zeros((self.lookback_window, len(self.feature_columns)), dtype=float)
                 else:
                     pad = np.zeros((rows_needed, window_data.shape[1]), dtype=float)
                     window_data = np.vstack([pad, window_data])
             
-            # Now window_data.shape[0] == lookback_window
             if self.normalize_obs and window_data.size > 0:
                 window_data = self._adaptive_normalize_features(window_data)
             
             obs_parts.append(window_data.flatten())
         
-        # Enhanced portfolio state - 10 metrics total
+        # Enhanced portfolio state without leverage metrics
         current_weights = np.array([self.weights[s] for s in self.symbols], dtype=np.float32)
         cash_ratio = self.cash_balance / (self.portfolio_value + 1e-8)
         portfolio_value_norm = self.portfolio_value / self.starting_balance
@@ -425,7 +497,7 @@ class MultiCurrencyPortfolioEnv(gym.Env):
         
         # Risk metrics
         if len(self.returns_history) > 1:
-            recent_returns = np.array(self.returns_history[-min(20, len(self.returns_history)):])  # FIXED: convert to array
+            recent_returns = np.array(self.returns_history[-min(15, len(self.returns_history)):])
             volatility = np.std(recent_returns, ddof=1) * np.sqrt(252) if recent_returns.size > 0 else 0.0
         else:
             volatility = 0.0
@@ -435,42 +507,58 @@ class MultiCurrencyPortfolioEnv(gym.Env):
         benchmark_outperformance = self._calculate_benchmark_outperformance()
         future_profit_potential = self._calculate_advanced_future_profit()
         
-        # Additional risk metrics
-        var_95 = self._calculate_value_at_risk(0.05) if len(self.returns_history) >= 20 else 0.0
-        diversification_benefit = self.diversification_ratio
+        # Aggressive strategy signals
+        momentum_signals = np.array([self.momentum_signals[s] for s in self.symbols])
+        trend_signals = np.array([self.trend_signals[s] for s in self.symbols])
         
+        # Concentration metrics
+        concentration = np.sum(current_weights)
+        top_holding_concentration = np.max(current_weights)
+        
+        # FIXED: Removed gross_exposure and net_exposure (2 scalars)
         portfolio_state = np.array([
-            *current_weights,  # self.num_assets elements
-            cash_ratio,
-            portfolio_value_norm,
-            current_drawdown,
-            volatility,
-            sharpe_ratio,
-            total_return,
-            benchmark_outperformance,
-            future_profit_potential,
-            var_95,
-            diversification_benefit
-            # Total: self.num_assets + 10 metrics
+            *current_weights,                    # num_assets elements
+            cash_ratio,                          # 1
+            portfolio_value_norm,                # 1  
+            current_drawdown,                    # 1
+            volatility,                          # 1
+            sharpe_ratio,                        # 1
+            total_return,                        # 1
+            benchmark_outperformance,            # 1
+            future_profit_potential,             # 1
+            concentration,                       # 1
+            top_holding_concentration,           # 1
+            # Removed gross_exposure and net_exposure
+            *momentum_signals,                   # num_assets elements
+            *trend_signals                       # num_assets elements
         ], dtype=np.float32)
         
         obs_parts.append(portfolio_state)
         observation = np.concatenate(obs_parts)
         
-        # Debug: print actual observation shape
-        if not hasattr(self, '_debug_printed'):
-            print(f"Actual observation shape: {observation.shape}")
-            self._debug_printed = True
+        # Debug: Verify observation shape matches expected dimension
+        expected_dim = (self.lookback_window * self.num_features_per_asset * self.num_assets + 
+                       self.num_assets + 11 + self.num_assets + self.num_assets)  # Fixed: 11 instead of 13
+        
+        if observation.shape[0] != expected_dim:
+            print(f"WARNING: Observation shape mismatch. Expected: {expected_dim}, Got: {observation.shape[0]}")
+            # If there's a mismatch, pad or truncate to expected dimension
+            if observation.shape[0] < expected_dim:
+                # Pad with zeros
+                padding = np.zeros(expected_dim - observation.shape[0], dtype=np.float32)
+                observation = np.concatenate([observation, padding])
+            else:
+                # Truncate
+                observation = observation[:expected_dim]
         
         return observation.astype(np.float32)
     
     def _calculate_value_at_risk(self, alpha: float = 0.05) -> float:
-        """Calculate Value at Risk - FIXED: return positive loss amount"""
+        """Calculate Value at Risk"""
         if len(self.returns_history) < 20:
             return 0.0
         
         returns = np.array(self.returns_history[-20:])
-        # FIXED: Return positive value representing the loss amount
         return -np.percentile(returns, alpha * 100) if len(returns) > 0 else 0.0
     
     def _calculate_portfolio_value(self) -> float:
@@ -484,21 +572,20 @@ class MultiCurrencyPortfolioEnv(gym.Env):
         
         return total_value
     
-    def _rebalance_portfolio(self, target_weights: np.ndarray):
-        """Enhanced rebalancing with risk checks"""
-        # Apply risk limits
-        target_weights = self._apply_risk_limits(target_weights)
+    def _rebalance_portfolio_aggressive(self, target_weights: np.ndarray):
+        """Aggressive rebalancing without short positions"""
+        # Apply aggressive risk limits
+        target_weights = self._apply_aggressive_risk_limits(target_weights)
         
-        target_weights = np.clip(target_weights, 0, 1)
+        # Normalize weights to sum to 1 (no leverage)
         weight_sum = np.sum(target_weights)
-        if weight_sum > 0:
-            target_weights = target_weights / weight_sum
-        else:
-            target_weights = np.ones(self.num_assets) / self.num_assets
+        if weight_sum > 1.0 or weight_sum < 0.99:  # Normalize if not approximately 1.0
+            target_weights = target_weights / (weight_sum + 1e-8)
         
         current_value = self._calculate_portfolio_value()
         fees_paid = 0.0
         
+        # Calculate target values - only positive values allowed
         target_values = {symbol: current_value * target_weights[i] 
                         for i, symbol in enumerate(self.symbols)}
         
@@ -506,7 +593,7 @@ class MultiCurrencyPortfolioEnv(gym.Env):
         current_values = {symbol: self.holdings[symbol] * current_prices[symbol]
                          for symbol in self.symbols}
         
-        # Calculate turnover for penalty
+        # Calculate turnover
         turnover = 0.0
         for symbol in self.symbols:
             current_weight = current_values[symbol] / (current_value + 1e-8)
@@ -515,18 +602,20 @@ class MultiCurrencyPortfolioEnv(gym.Env):
         
         self.turnover_history.append(turnover)
         
-        # Execute trades
+        # Execute trades - only long positions
         for symbol in self.symbols:
             current_val = current_values[symbol]
             target_val = target_values[symbol]
             
+            # Selling
             if current_val > target_val:
-                amount_to_sell = (current_val - target_val) / (current_prices[symbol] + 1e-8)
-                if amount_to_sell > 1e-6:  # Avoid tiny trades (more strict)
-                    sell_value = amount_to_sell * current_prices[symbol]
+                value_change = current_val - target_val
+                if abs(value_change) > 1e-6:
+                    units_to_sell = value_change / (current_prices[symbol] + 1e-8)
+                    sell_value = units_to_sell * current_prices[symbol]
                     fee = sell_value * self.fee_rate
                     self.cash_balance += sell_value - fee
-                    self.holdings[symbol] -= amount_to_sell
+                    self.holdings[symbol] -= units_to_sell
                     fees_paid += fee
                     self.trades_executed += 1
         
@@ -534,17 +623,20 @@ class MultiCurrencyPortfolioEnv(gym.Env):
             current_val = self.holdings[symbol] * current_prices[symbol]
             target_val = target_values[symbol]
             
+            # Buying
             if target_val > current_val:
-                amount_to_buy_value = target_val - current_val
-                fee = amount_to_buy_value * self.fee_rate
-                total_cost = amount_to_buy_value + fee
-                
-                if self.cash_balance >= total_cost:
-                    amount_to_buy = amount_to_buy_value / (current_prices[symbol] + 1e-8)
-                    self.cash_balance -= total_cost
-                    self.holdings[symbol] += amount_to_buy
-                    fees_paid += fee
-                    self.trades_executed += 1
+                value_change = target_val - current_val
+                if abs(value_change) > 1e-6:
+                    units_to_buy = value_change / (current_prices[symbol] + 1e-8)
+                    buy_value = units_to_buy * current_prices[symbol]
+                    fee = buy_value * self.fee_rate
+                    total_cost = buy_value + fee
+                    
+                    if self.cash_balance >= total_cost:
+                        self.cash_balance -= total_cost
+                        self.holdings[symbol] += units_to_buy
+                        fees_paid += fee
+                        self.trades_executed += 1
         
         # Update weights
         final_value = self._calculate_portfolio_value()
@@ -557,26 +649,31 @@ class MultiCurrencyPortfolioEnv(gym.Env):
         
         return fees_paid
     
-    def _apply_risk_limits(self, weights: np.ndarray) -> np.ndarray:
-        """Apply risk management limits to portfolio weights"""
-        # Validate risk limits and ensure they're within bounds
-        max_single_asset = max(0.01, min(1.0, self.risk_limits.get('max_single_asset', 0.4)))
-        weights = np.clip(weights, 0, max_single_asset)
+    def _apply_aggressive_risk_limits(self, weights: np.ndarray) -> np.ndarray:
+        """Apply aggressive risk management without leverage"""
+        # Ensure no negative weights
+        weights = np.maximum(weights, 0.0)
         
-        # Ensure diversification
-        if np.max(weights) > 0.5:  # If any asset > 50%
-            excess = np.max(weights) - 0.5
-            weights = weights * (1 - excess) / (np.sum(weights) + 1e-8)
+        # Apply concentration limit
+        max_single_asset = self.concentration_limit
+        weights = np.minimum(weights, max_single_asset)
+        
+        # Ensure some minimum diversification but allow high concentration
+        if np.max(weights) > 0.8:  # If any position > 80%
+            # Allow but ensure at least 2 assets have some exposure
+            non_zero_positions = np.sum(weights > 0.01)
+            if non_zero_positions < 2:
+                # Find second best opportunity
+                sorted_weights = np.argsort(weights)[::-1]
+                second_asset = sorted_weights[1]
+                weights[second_asset] = 0.05  # Minimum 5% allocation
         
         return weights
     
-    def _calculate_enhanced_reward(self) -> float:
-        """Advanced reward function with MUCH SMALLER multipliers"""
+    def _calculate_aggressive_reward(self) -> float:
+        """Highly aggressive reward function focused on outperformance"""
         current_value = self._calculate_portfolio_value()
         self.value_at_action.append(current_value)
-        
-        # Calculate period return - REMOVED: this is now done in step()
-        # We only update risk metrics and calculate reward components here
         
         # Update risk metrics
         self._calculate_risk_metrics()
@@ -588,87 +685,88 @@ class MultiCurrencyPortfolioEnv(gym.Env):
         drawdown = (self.peak_value - current_value) / (self.peak_value + 1e-8)
         self.max_drawdown = max(self.max_drawdown, drawdown)
         
-        # Get dynamic penalties
-        penalties = self._calculate_dynamic_penalties() if self.dynamic_penalties else {
-            'volatility_multiplier': 1.0, 'drawdown_multiplier': 1.0
-        }
-        
-        # Get the latest period return from history (added in step())
+        # Get the latest period return
         period_return = self.returns_history[-1] if self.returns_history else 0.0
         
-        # Calculate reward components with MUCH SMALLER multipliers
-        return_reward = period_return * 10 * self.reward_components['returns']  # Was 100
+        # Aggressive reward components
+        return_reward = period_return * 50 * self.reward_components['returns']
         
-        # Sharpe ratio component - use clipped version
+        # Sharpe ratio component - minimal weight
         sharpe_reward = 0.0
-        if len(self.returns_history) >= 10:
+        if len(self.returns_history) >= 5:
             sharpe_ratio = self._calculate_sharpe_ratio()
-            sharpe_reward = sharpe_ratio * 0.1 * self.reward_components['sharpe']  # Was 0.5
+            sharpe_reward = sharpe_ratio * 0.01 * self.reward_components['sharpe']
         
-        # Dynamic drawdown penalty
-        drawdown_penalty = (-self.max_drawdown_penalty * drawdown * 5 *  # Was 50
-                           penalties['drawdown_multiplier'] * self.reward_components['drawdown'])
+        # Minimal drawdown penalty
+        drawdown_penalty = (-self.max_drawdown_penalty * drawdown * 10 *
+                           self.reward_components['drawdown'])
         
-        # Benchmark outperformance reward
+        # Massive benchmark outperformance reward
         benchmark_reward = 0.0
         benchmark_outperformance = self._calculate_benchmark_outperformance()
-        benchmark_reward = (benchmark_outperformance * self.benchmark_weight * 20 *  # Was 200
+        benchmark_reward = (benchmark_outperformance * self.benchmark_weight * 100 *
                           self.reward_components['benchmark'])
         
-        # Future profit potential reward
+        # High future profit potential reward
         future_reward = 0.0
         future_profit_potential = self._calculate_advanced_future_profit()
-        future_reward = (future_profit_potential * self.future_profit_weight * 10 *  # Was 100
+        future_reward = (future_profit_potential * self.future_profit_weight * 50 *
                         self.reward_components['future'])
         
-        # Risk-adjusted return reward
-        risk_adjusted_reward = 0.0
-        if self.portfolio_volatility > 0:
-            risk_adjusted_return = period_return / (self.portfolio_volatility + 1e-8)
-            risk_adjusted_reward = risk_adjusted_return * 1 * self.reward_components['risk_adjusted']  # Was 10
+        # Momentum-based reward
+        momentum_reward = 0.0
+        for symbol in self.symbols:
+            if self.weights[symbol] > 0.01:
+                # Reward aligning with momentum
+                position_return = period_return * self.weights[symbol]
+                momentum_alignment = position_return * self.momentum_signals[symbol]
+                momentum_reward += momentum_alignment * self.reward_components['momentum']
         
-        # Diversification reward
-        diversification_reward = self.diversification_ratio * 2 * self.reward_components['diversification']  # Was 20
+        # Trend-following reward
+        trend_reward = 0.0
+        if self.trend_following:
+            for symbol in self.symbols:
+                if self.weights[symbol] > 0.01:
+                    # Reward trend-following behavior
+                    trend_alignment = self.weights[symbol] * self.trend_signals[symbol]
+                    trend_reward += trend_alignment * self.reward_components['trend']
         
-        # Turnover penalty
+        # Concentration reward (positive for aggressive strategy)
+        current_weights = np.array([self.weights[s] for s in self.symbols])
+        concentration = np.sum(current_weights)
+        concentration_reward = (concentration - 1.0) * 2 * self.reward_components['diversification']
+        
+        # Reduced turnover penalty
         turnover_penalty = 0.0
         if self.turnover_history:
-            avg_turnover = np.mean(self.turnover_history[-5:]) if len(self.turnover_history) >= 5 else 0.0
-            turnover_penalty = -avg_turnover * 5  # Was 50
+            avg_turnover = np.mean(self.turnover_history[-3:]) if len(self.turnover_history) >= 3 else 0.0
+            turnover_penalty = -avg_turnover * 0.5
         
         # Combine all reward components
         total_reward = (return_reward + sharpe_reward + drawdown_penalty + 
-                       benchmark_reward + future_reward + risk_adjusted_reward + 
-                       diversification_reward + turnover_penalty)
+                       benchmark_reward + future_reward + momentum_reward + 
+                       trend_reward + concentration_reward + turnover_penalty)
         
-        # Apply volatility scaling
-        if self.volatility_scaling and penalties['volatility_multiplier'] != 1.0:
-            total_reward = total_reward / (penalties['volatility_multiplier'] + 1e-8)
-        
-        # Additional scaling to keep rewards in reasonable range
-        total_reward = total_reward * 0.1  # Additional 10x scaling down
+        # Additional aggressive scaling
+        total_reward = total_reward * 2.0
         
         return total_reward
     
     def step(self, action: np.ndarray) -> Tuple[np.ndarray, float, bool, bool, Dict]:
-        """Execute environment step with enhanced tracking - FIXED ORDER"""
-        # FIXED: Validate and normalize action
+        """Execute aggressive environment step"""
         action = np.asarray(action, dtype=float).flatten()
         if action.size != self.num_assets:
             raise ValueError(f"Action must have length {self.num_assets}, got {action.size}")
         
-        # Clip negative values and normalize to sum 1
-        action = np.clip(action, 0, None)
-        if np.sum(action) > 0:
-            action = action / np.sum(action)
-        else:
-            action = np.ones(self.num_assets) / self.num_assets
+        # Calculate momentum and trend signals BEFORE rebalancing
+        self._calculate_momentum_signals()
+        self._calculate_trend_signals()
         
-        # Store previous portfolio value BEFORE any updates
+        # Store previous portfolio value
         prev_value = self._calculate_portfolio_value()
         
         if self.steps_since_rebalance >= self.rebalance_frequency:
-            fees = self._rebalance_portfolio(action)
+            fees = self._rebalance_portfolio_aggressive(action)
             self.steps_since_rebalance = 0
         else:
             fees = 0.0
@@ -680,16 +778,16 @@ class MultiCurrencyPortfolioEnv(gym.Env):
         current_value = self._calculate_portfolio_value()
         self.portfolio_value = current_value
         
-        # Calculate period return using previous value
+        # Calculate period return
         period_return = (current_value - prev_value) / (prev_value + 1e-8)
         self.returns_history.append(period_return)
         
-        # NOW update portfolio history with current value
+        # Update portfolio history
         self.portfolio_history.append(current_value)
         
         self._update_benchmark_value()
         
-        reward = self._calculate_enhanced_reward()
+        reward = self._calculate_aggressive_reward()
         
         terminated = False
         truncated = False
@@ -697,15 +795,15 @@ class MultiCurrencyPortfolioEnv(gym.Env):
         if self.current_step >= self.max_steps:
             truncated = True
         
-        # Adaptive termination based on risk metrics with SMALLER penalties
-        if current_value < self.starting_balance * 0.2:
+        # Tolerant termination conditions
+        if current_value < self.starting_balance * 0.1:
             terminated = True
-            reward -= 5  # Was 50
-        elif self.max_drawdown > 0.5:  # 50% drawdown
+            reward -= 2
+        elif self.max_drawdown > 0.7:
             terminated = True
-            reward -= 10  # Was 100
+            reward -= 5
         
-        observation = self._get_observation()
+        observation = self._get_aggressive_observation()
         
         info = {
             'portfolio_value': current_value,
@@ -723,13 +821,15 @@ class MultiCurrencyPortfolioEnv(gym.Env):
             'future_profit_potential': self._calculate_advanced_future_profit(),
             'portfolio_volatility': self.portfolio_volatility,
             'diversification_ratio': self.diversification_ratio,
-            'value_at_risk': self._calculate_value_at_risk(0.05)
+            'value_at_risk': self._calculate_value_at_risk(0.05),
+            'momentum_signals': dict(self.momentum_signals),
+            'trend_signals': dict(self.trend_signals)
         }
         
         return observation, reward, terminated, truncated, info
     
     def _calculate_sharpe_ratio(self) -> float:
-        """Calculate annualized Sharpe ratio - FIXED for robustness"""
+        """Calculate annualized Sharpe ratio"""
         if len(self.returns_history) < 2:
             return 0.0
 
@@ -742,7 +842,6 @@ class MultiCurrencyPortfolioEnv(gym.Env):
         period_rf = (self.risk_free_rate / ppy) if ppy > 0 else 0.0
         sharpe = (mean_return - period_rf) / std_return * np.sqrt(ppy)
         
-        # NEW: Only clip if enabled
         if self.clip_metrics:
             return float(np.clip(sharpe, -10.0, 10.0))
         else:
@@ -760,12 +859,12 @@ class MultiCurrencyPortfolioEnv(gym.Env):
         if options and 'start_step' in options:
             self.current_step = options['start_step']
         else:
-            max_start = max(0, self.max_steps - 100)  # FIXED: ensure non-negative
+            max_start = max(0, self.max_steps - 100)
             self.current_step = self.np_random.integers(0, max(1, max_start))
         
         self._initialize_benchmark_portfolio()
         
-        observation = self._get_observation()
+        observation = self._get_aggressive_observation()
         info = {
             'portfolio_value': self.starting_balance,
             'start_step': self.current_step,
@@ -856,7 +955,7 @@ class MultiCurrencyPortfolioEnv(gym.Env):
         }
     
     def _calculate_sortino_ratio(self) -> float:
-        """Calculate Sortino ratio (downside risk-adjusted return) - FIXED"""
+        """Calculate Sortino ratio (downside risk-adjusted return)"""
         if len(self.returns_history) < 2:
             return 0.0
 
@@ -865,7 +964,6 @@ class MultiCurrencyPortfolioEnv(gym.Env):
         mean_return = float(np.mean(rets))
         downside = rets[rets < 0.0]
         if downside.size == 0:
-            # no downside observed -> treat Sortino as undefined/zero to avoid numeric explosion
             return 0.0
         downside_std = float(np.std(downside, ddof=1))
         if downside_std < 1e-8:
@@ -873,7 +971,6 @@ class MultiCurrencyPortfolioEnv(gym.Env):
         period_rf = (self.risk_free_rate / ppy) if ppy > 0 else 0.0
         sortino = (mean_return - period_rf) / downside_std * np.sqrt(ppy)
         
-        # NEW: Only clip if enabled
         if self.clip_metrics:
             return float(np.clip(sortino, -10.0, 10.0))
         else:
