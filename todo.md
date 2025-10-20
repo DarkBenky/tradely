@@ -1,7 +1,0 @@
-- [ ] add reward based on diffrence average portfolio to manged porfolio
-- [X] log returns
-- [X] preoritize sharpnes
-- [X] more (freq) trades
-- [X] bigger window
-- [X] bigger model
-- [X] add current portofolio holding to obs
