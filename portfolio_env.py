@@ -42,6 +42,7 @@ class PortfolioEnv():
         self.step_count = random.randint(1000, len(self.df['BTCUSDT']) - 1000)
         self.candle_interval = '5m'
         self.high_timeframes = ['15m', '1h', '4h', '1d']
+        self.high_timeframes_count = [64, 48, 24, 3]
 
         self.lookback_window_size = 48
         self.lookforward_window_size = 30
@@ -80,7 +81,22 @@ class PortfolioEnv():
         pass
     
     def _get_current_price(self, symbol: str) -> float:
-        pass
+        obs = [[] for _ in range(len(self.df))]
+
+        for val, candles_count in zip(self.high_timeframes, self.high_timeframes_count):
+            _obs = [[] for _ in range(len(self.df))]
+            if val == "15m":
+                # Aggregate candles
+                pass
+            if val == "1h":
+                # Aggregate candles
+                pass
+            if val == "4h":
+                # Aggregate candles
+                pass
+            if val == "1d":
+                # Aggregate candles
+                pass
     
     def _calculate_future_profit(self) -> float:
         future_profits = {}
