@@ -56,13 +56,22 @@ class PortfolioEnv():
         self.lookback_window_size = 48
         self.cash_inflation_rate = 0.004
         self.fee_rate = 0.001
-
        
-    def _initialize_state(self):
-        pass
-    
+    def _portfolio_portfolio_value(self):
+        total_value = self.portfolio['cash']
+        for symbol in self.df.keys():
+            price = self.df[symbol]['close'].iloc[self.step_count]
+            total_value += self.portfolio[symbol] * price
+        self.portfolio_value = total_value
+        return total_value
+
     def _update_benchmark_value(self):
-        pass
+        total_value = 0.0
+        for symbol in self.df.keys():
+            price = self.df[symbol]['close'].iloc[self.step_count]
+            total_value += self.passive_portfolio[symbol] * price
+        self.passive_portfolio_value = total_value
+        return total_value
     
     def _calculate_benchmark_outperformance(self) -> float:
         pass
@@ -80,8 +89,7 @@ class PortfolioEnv():
     def get_observation(self) -> np.ndarray:
         pass
     
-    def _calculate_portfolio_value(self) -> float:
-        pass
+
     
     def _rebalance_portfolio(self):
         pass
