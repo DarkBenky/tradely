@@ -39,6 +39,7 @@ def load_and_align_data(data_dir='data'):
 class PortfolioEnv():
     def __init__(self, data_dir='data'):
         self.df = load_and_align_data(data_dir)
+        self.asset_names = list(self.df.keys())  # Add asset_names attribute
         self.step_count = random.randint(2000, len(self.df['BTCUSDT']) - 1000)
         self.candle_interval = '5m'
         self.high_timeframes = ['15m', '1h', '4h', '1d']
@@ -87,14 +88,13 @@ class PortfolioEnv():
         return price
     
     def sample(self):
-        action = {}
+        action = []
         for symbol in self.df.keys():
-            action[symbol] = random.uniform(0, 1)
+            action.append(random.uniform(0, 1))
         # Normalize to sum to <= 1
-        total = sum(action.values())
+        total = sum(action)
         if total > 1.0:
-            for symbol in action.keys():
-                action[symbol] /= total
+            action = [a / total for a in action]
         return action
         
     
@@ -325,7 +325,20 @@ class PortfolioEnv():
         for i in range(len(self.df)):
             obs[i].append(np.array(portfolio_state))
         
-        return obs
+        # Flatten and concatenate all observations into a single array
+        flattened_obs = []
+        for i in range(len(self.df)):
+            for obs_part in obs[i]:
+                if obs_part.size > 0:  # Only add non-empty arrays
+                    flattened_obs.append(obs_part.flatten())
+        
+        # Concatenate all parts into one flat array
+        if flattened_obs:
+            final_obs = np.concatenate(flattened_obs)
+        else:
+            final_obs = np.array([])
+        
+        return final_obs
     
     def _calculate_future_profit(self) -> float:
         future_profits = {}
@@ -346,8 +359,8 @@ class PortfolioEnv():
     def _rebalance_portfolio(self, action):
         """
         Rebalance portfolio based on action.
-        Action is a dictionary with target percentages for each symbol.
-        Example: {'BTCUSDT': 0.3, 'ETHUSDT': 0.2, ...}
+        Action is a list with target percentages for each symbol in order of self.asset_names.
+        Example: [0.3, 0.2, 0.1, ...] for ['BTCUSDT', 'ETHUSDT', 'BNBUSDT', ...]
         Remaining percentage goes to cash.
         """
         # Calculate current portfolio value
@@ -357,8 +370,8 @@ class PortfolioEnv():
         target_values = {}
         total_target_pct = 0
         
-        for symbol in self.df.keys():
-            target_pct = action.get(symbol, 0.0)
+        for i, symbol in enumerate(self.df.keys()):
+            target_pct = action[i] if i < len(action) else 0.0
             target_pct = np.clip(target_pct, 0.0, 1.0)  # Ensure 0-1 range
             total_target_pct += target_pct
             target_values[symbol] = current_value * target_pct
@@ -461,7 +474,7 @@ class PortfolioEnv():
     def step(self, action):
         """
         Execute one step in the environment.
-        Action: dict with target allocation percentages for each symbol
+        Action: list with target allocation percentages for each symbol in order of self.asset_names
         Returns: observation, reward, done, info
         """
         # Check if we've reached the end of data

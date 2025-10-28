@@ -95,7 +95,7 @@ if __name__ == "__main__":
     
     for i, symbol in enumerate(symbols, 1):
         print(f"\n[{i}/{len(symbols)}] {symbol}")
-        result = process_symbol_individually(symbol, interval, years=1, window_size=12*4, multiple_returns=5)
+        result = process_symbol_individually(symbol, interval, years=2, window_size=12*4, multiple_returns=5)
         
         if result:
             successful.append(result)
