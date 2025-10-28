@@ -85,6 +85,17 @@ class PortfolioEnv():
     def _get_current_priced(self, symbol) -> float:
         price = self.df[symbol]['close'].iloc[self.step_count]
         return price
+    
+    def sample(self):
+        action = {}
+        for symbol in self.df.keys():
+            action[symbol] = random.uniform(0, 1)
+        # Normalize to sum to <= 1
+        total = sum(action.values())
+        if total > 1.0:
+            for symbol in action.keys():
+                action[symbol] /= total
+        return action
         
     
     def get_observation(self):
