@@ -38,6 +38,8 @@ def load_and_align_data(data_dir='data'):
 
 class PortfolioEnv():
     def __init__(self, data_dir='data'):
+        self.initial_account_balance = 10000.0
+        self.reset_value = self.initial_account_balance // 2
         self.df = load_and_align_data(data_dir)
         self.asset_names = list(self.df.keys())  # Add asset_names attribute
         self.step_count = random.randint(2000, len(self.df['BTCUSDT']) - 1000)
@@ -48,7 +50,6 @@ class PortfolioEnv():
         self.lookback_window_size = 48
         self.lookforward_window_size = 30
         
-        self.initial_account_balance = 10000.0
         self.portfolio = {'cash': self.initial_account_balance}
         self.portfolio_value = self.initial_account_balance
         for symbol in self.df.keys():
@@ -510,6 +511,11 @@ class PortfolioEnv():
         if self.step_count >= len(self.df['BTCUSDT']) - self.lookforward_window_size - 1:
             done = True
             info['reason'] = 'end_of_data'
+
+        if self.portfolio_value <= self.reset_value:
+            done = True
+            info['reason'] = 'reset_threshold_reached'
+            reward -= 50  # Penalty for hitting reset threshold
         
         # Add info
         info['portfolio_value'] = current_value
