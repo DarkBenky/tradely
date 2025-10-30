@@ -3,6 +3,8 @@ import pandas as pd
 import os
 import random
 
+DEBUG = False
+
 def load_and_align_data(data_dir='data', max_records=None):
     data_files = {}
     for filename in os.listdir(data_dir):
@@ -58,6 +60,10 @@ class PortfolioEnv():
         self.portfolio_value = self.initial_account_balance
         for symbol in self.df.keys():
             self.portfolio[symbol] = 0.0
+        
+        # Initialize average prices tracking
+        self.average_prices = {}
+        
         self.passive_portfolio = {}
         for symbol in self.df.keys():
             price = self.df[symbol]['close'].iloc[self.step_count]
@@ -91,6 +97,15 @@ class PortfolioEnv():
     def _get_current_priced(self, symbol) -> float:
         price = self.df[symbol]['close'].iloc[self.step_count]
         return price
+    
+    def _calculate_average_price(self, symbol, current_quantity):
+        """
+        Calculate average purchase price for a symbol.
+        """
+        if current_quantity <= 0.000001:
+            return 0.0
+        
+        return self.average_prices.get(symbol, self._get_current_priced(symbol))
     
     def sample(self):
         action = []
@@ -366,6 +381,8 @@ class PortfolioEnv():
         Rebalance portfolio based on action.
         Action is a list with target percentages for each asset including cash.
         Example: [0.3, 0.2, 0.1, ..., 0.15] for ['BTCUSDT', 'ETHUSDT', ..., 'cash']
+        
+        Only rebalances when the allocation difference exceeds a threshold.
         """
         # Calculate current portfolio value
         current_value = self._portfolio_portfolio_value()
@@ -389,16 +406,30 @@ class PortfolioEnv():
             crypto_actions = [1.0 / len(self.asset_names)] * num_cryptos
             cash_action = 1.0 / len(self.asset_names)
         
-        # Calculate target values
+        # Calculate target values and current allocations
         target_values = {}
+        current_allocations = {}
+        
         for i, symbol in enumerate(self.df.keys()):
+            current_price = self._get_current_priced(symbol)
+            current_holdings = self.portfolio[symbol]
+            current_value_in_symbol = current_holdings * current_price
+            current_allocations[symbol] = current_value_in_symbol / current_value if current_value > 0 else 0
+            
             target_values[symbol] = current_value * crypto_actions[i]
         
         target_cash = current_value * cash_action
+        current_cash_allocation = self.portfolio['cash'] / current_value if current_value > 0 else 0
         
-        # Calculate trades needed
+        # Calculate trades needed with threshold check
         total_fees = 0.0
-        for symbol in self.df.keys():
+        rebalance_threshold = 0.025  # 2.5% threshold
+        
+        # FIXED: Track pending buy orders to ensure we don't exceed available cash
+        pending_buys = []
+        
+        # First pass: identify all trades and validate cash availability
+        for i, symbol in enumerate(self.df.keys()):
             current_price = self._get_current_priced(symbol)
             current_holdings = self.portfolio[symbol]
             current_value_in_symbol = current_holdings * current_price
@@ -406,23 +437,106 @@ class PortfolioEnv():
             target_value_in_symbol = target_values[symbol]
             value_diff = target_value_in_symbol - current_value_in_symbol
             
-            if abs(value_diff) > 0.01:  # Only trade if difference is significant
+            # Calculate allocation difference percentage
+            allocation_diff = abs(crypto_actions[i] - current_allocations[symbol])
+            
+            # Only trade if the allocation difference exceeds the threshold
+            if allocation_diff > rebalance_threshold and abs(value_diff) > 0.01:
                 trade_value = abs(value_diff)
                 fee = trade_value * self.fee_rate
+                
+                if value_diff > 0:  # Buy
+                    total_cost = trade_value + fee
+                    pending_buys.append((symbol, trade_value, fee, current_price, allocation_diff))
+                else:  # Sell
+                    # Selling adds to cash, so we can execute immediately
+                    sell_quantity = trade_value / current_price
+                    self.portfolio['cash'] += (trade_value - fee)
+                    self.portfolio[symbol] -= sell_quantity
+                    total_fees += fee
+                    
+                    # If we sold all, remove from average prices
+                    if self.portfolio[symbol] <= 0.000001:
+                        self.average_prices.pop(symbol, None)
+                    
+                    if DEBUG:
+                        print(f"SELL {symbol}: ${trade_value:.2f} (allocation diff: {allocation_diff:.3f})")
+        
+        # FIXED: Process buy orders in order of allocation difference (most important first)
+        # Sort by allocation difference (descending) to prioritize most important trades
+        pending_buys.sort(key=lambda x: x[4], reverse=True)
+        
+        available_cash = self.portfolio['cash']
+        
+        for symbol, trade_value, fee, current_price, allocation_diff in pending_buys:
+            total_cost = trade_value + fee
+            
+            # FIXED: Check if we have enough cash for this buy
+            if available_cash >= total_cost:
+                # Calculate quantity to buy
+                buy_quantity = trade_value / current_price
+                
+                # Update average price using weighted average
+                current_holdings = self.portfolio[symbol]
+                current_avg_price = self.average_prices.get(symbol, 0)
+                current_total_value = current_holdings * current_avg_price if current_holdings > 0 else 0
+                new_total_value = current_total_value + trade_value
+                new_quantity = current_holdings + buy_quantity
+                
+                if new_quantity > 0:
+                    self.average_prices[symbol] = new_total_value / new_quantity
+                else:
+                    self.average_prices[symbol] = current_price
+                
+                # Deduct from cash including fee
+                self.portfolio['cash'] -= total_cost
+                available_cash -= total_cost
+                self.portfolio[symbol] += buy_quantity
                 total_fees += fee
                 
-                # Update holdings
-                if value_diff > 0:  # Buy
-                    # Deduct from cash including fee
-                    self.portfolio['cash'] -= (trade_value + fee)
-                    self.portfolio[symbol] += trade_value / current_price
-                else:  # Sell
-                    # Add to cash minus fee
-                    self.portfolio['cash'] += (trade_value - fee)
-                    self.portfolio[symbol] -= trade_value / current_price
+                if DEBUG:
+                    print(f"BUY {symbol}: ${trade_value:.2f} (allocation diff: {allocation_diff:.3f})")
+            else:
+                # FIXED: If not enough cash, buy what we can afford
+                if available_cash > fee:  # Need at least enough for fee + minimal trade
+                    affordable_trade_value = (available_cash - fee) / (1 + self.fee_rate)
+                    if affordable_trade_value > 1.0:  # Only trade if meaningful amount
+                        affordable_fee = affordable_trade_value * self.fee_rate
+                        buy_quantity = affordable_trade_value / current_price
+                        
+                        # Update average price
+                        current_holdings = self.portfolio[symbol]
+                        current_avg_price = self.average_prices.get(symbol, 0)
+                        current_total_value = current_holdings * current_avg_price if current_holdings > 0 else 0
+                        new_total_value = current_total_value + affordable_trade_value
+                        new_quantity = current_holdings + buy_quantity
+                        
+                        if new_quantity > 0:
+                            self.average_prices[symbol] = new_total_value / new_quantity
+                        
+                        total_cost = affordable_trade_value + affordable_fee
+                        self.portfolio['cash'] -= total_cost
+                        available_cash -= total_cost
+                        self.portfolio[symbol] += buy_quantity
+                        total_fees += affordable_fee
+                        
+                        if DEBUG:
+                            print(f"PARTIAL BUY {symbol}: ${affordable_trade_value:.2f} (could afford ${trade_value:.2f})")
+        
+        # Also check cash rebalancing threshold
+        cash_allocation_diff = abs(cash_action - current_cash_allocation)
+        if cash_allocation_diff > rebalance_threshold:
+            if DEBUG:
+                print(f"CASH allocation diff: {cash_allocation_diff:.3f}")
         
         # Apply cash inflation (opportunity cost)
-        self.portfolio['cash'] *= (1 - self.cash_inflation_rate)
+        self.portfolio['cash'] *= (1 - self.cash_inflation_rate / (365 * (5/60)))  # 5-minute interval
+        
+        # FIXED: Ensure cash doesn't go negative due to rounding errors
+        if self.portfolio['cash'] < -0.01:  # Small negative due to rounding
+            if DEBUG:
+                print(f"WARNING: Cash is negative: ${self.portfolio['cash']:.2f}, resetting to 0")
+            self.portfolio['cash'] = 0.0
         
         return total_fees
     
@@ -557,9 +671,9 @@ class PortfolioEnv():
         benchmark_value = self._update_benchmark_value()
         outperformance = self._calculate_benchmark_outperformance()
         
-        print(f"\n{'='*66}")
+        print(f"\n{'='*90}")
         print(f"Step: {self.step_count}")
-        print(f"{'='*66}")
+        print(f"{'='*90}")
         print(f"Portfolio Value: ${portfolio_value:,.2f}")
         print(f"Benchmark Value: ${benchmark_value:,.2f}")
         print(f"Outperformance: {(outperformance - 1) * 100:+.2f}%")
@@ -567,18 +681,50 @@ class PortfolioEnv():
         print(f"Benchmark Return: {(benchmark_value / self.initial_account_balance - 1) * 100:+.2f}%")
         print(f"\nCash: ${self.portfolio['cash']:,.2f} ({self.portfolio['cash']/portfolio_value*100:.1f}%)")
         print(f"\nHoldings:")
-        print(f"{'Symbol':<12} {'Quantity':>12} {'Price':>12} {'Value':>14} {'% Portfolio':>12}")
-        print(f"{'-'*66}")
+        print(f"{'Symbol':<12} {'Quantity':>12} {'Avg Price':>12} {'Cur Price':>12} {'P/L %':>8} {'Value':>14} {'% Port':>10}")
+        print(f"{'-'*90}")
+        
+        # Track total P&L
+        total_pl = 0
         
         for symbol in sorted(self.df.keys()):
             quantity = self.portfolio[symbol]
             if quantity > 0.00001:  # Only show non-zero holdings
-                price = self._get_current_priced(symbol)
-                value = quantity * price
-                pct = (value / portfolio_value * 100) if portfolio_value > 0 else 0
-                print(f"{symbol:<12} {quantity:>12.6f} ${price:>11,.2f} ${value:>13,.2f} {pct:>11.2f}%")
+                current_price = self._get_current_priced(symbol)
+                value = quantity * current_price
+                
+                # Calculate average price
+                avg_price = self._calculate_average_price(symbol, quantity)
+                
+                if avg_price > 0:
+                    pl_percent = ((current_price - avg_price) / avg_price) * 100
+                    pl_value = (current_price - avg_price) * quantity
+                    total_pl += pl_value
+                else:
+                    pl_percent = 0.0
+                    pl_value = 0.0
+                
+                pct_portfolio = (value / portfolio_value * 100) if portfolio_value > 0 else 0
+                
+                # Color coding for P&L
+                pl_color = ""
+                pl_reset = ""
+                if pl_percent > 0:
+                    pl_color = "\033[92m"  # Green
+                    pl_reset = "\033[0m"
+                elif pl_percent < 0:
+                    pl_color = "\033[91m"  # Red
+                    pl_reset = "\033[0m"
+                
+                print(f"{symbol:<12} {quantity:>12.6f} ${avg_price:>11.2f} ${current_price:>11.2f} "
+                      f"{pl_color}{pl_percent:>7.1f}%{pl_reset} ${value:>13,.2f} {pct_portfolio:>9.1f}%")
         
-        print(f"{'='*66}\n")
+        # Print total P&L
+        print(f"{'-'*90}")
+        total_pl_color = "\033[92m" if total_pl >= 0 else "\033[91m"
+        total_pl_reset = "\033[0m"
+        print(f"{'Total P&L:':<12} {'':>12} {'':>12} {'':>12} {total_pl_color}${total_pl:>13,.2f}{total_pl_reset} {'':>10}")
+        print(f"{'='*90}\n")
 
     def reset(self):
         """
@@ -589,10 +735,17 @@ class PortfolioEnv():
         self.step_count = random.randint(2000, len(self.df['BTCUSDT']) - 1000)
         
         # Reset portfolio
-        self.portfolio = {'cash': self.initial_account_balance}
+        self.portfolio = {'cash': 2000.0}
         self.portfolio_value = self.initial_account_balance
         for symbol in self.df.keys():
-            self.portfolio[symbol] = 0.0
+            price = self.df[symbol]['close'].iloc[self.step_count]
+            self.portfolio[symbol] = (self.initial_account_balance - 2000) / len(self.df) / price
+        
+        # Reset average prices
+        self.average_prices = {}
+        for symbol in self.df.keys():
+            if self.portfolio[symbol] > 0:
+                self.average_prices[symbol] = self.df[symbol]['close'].iloc[self.step_count]
         
         # Reset benchmark portfolio (equal weight across all assets)
         self.passive_portfolio = {}
