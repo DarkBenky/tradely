@@ -375,7 +375,7 @@ if __name__ == "__main__":
         "dropout_rate": 0.2,
         "dense_hidden": 256,
         "embedding_dim": 2048,
-        "initial_lr": 0.00,
+        "initial_lr": 0.001,
         "pretrain_episodes": 10,
         "pretrain_epochs": 10,
         "pretrain_batch_size": 256,

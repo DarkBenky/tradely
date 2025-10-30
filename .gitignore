@@ -7,3 +7,4 @@ models
 logs
 trainData
 *.h5
+*.csv
