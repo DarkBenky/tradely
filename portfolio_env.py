@@ -3,12 +3,12 @@ import pandas as pd
 import os
 import random
 
-def load_and_align_data(data_dir='data'):
+def load_and_align_data(data_dir='data', max_records=None):
     data_files = {}
     for filename in os.listdir(data_dir):
         if filename.endswith('_combined_data.csv'):
             symbol = filename.replace('_combined_data.csv', '')
-            if symbol == 'MATICUSDT':  # Skip empty dataframes
+            if symbol == 'MATICUSDT':
                 continue
             filepath = os.path.join(data_dir, filename)
             df = pd.read_csv(filepath, parse_dates=['timestamp'])
@@ -17,7 +17,6 @@ def load_and_align_data(data_dir='data'):
     
     print(f"Loaded {len(data_files)} data files")
     
-    # Find common timestamps across all symbols
     common_timestamps = None
     for symbol, df in data_files.items():
         if common_timestamps is None:
@@ -26,9 +25,13 @@ def load_and_align_data(data_dir='data'):
             common_timestamps = common_timestamps.intersection(set(df.index))
     
     common_timestamps = sorted(list(common_timestamps))
+    
+    if max_records and len(common_timestamps) > max_records:
+        common_timestamps = common_timestamps[:max_records]
+        print(f"Limited to {max_records} records")
+    
     print(f"Found {len(common_timestamps)} common timestamps")
     
-    # Align each dataframe to common timestamps and remove timestamp index
     aligned_data = {}
     for symbol, df in data_files.items():
         aligned_df = df.loc[common_timestamps].reset_index(drop=True)
@@ -37,11 +40,11 @@ def load_and_align_data(data_dir='data'):
     return aligned_data
 
 class PortfolioEnv():
-    def __init__(self, data_dir='data'):
+    def __init__(self, data_dir='data', max_records=None):
         self.initial_account_balance = 10000.0
         self.reset_value = self.initial_account_balance // 2
-        self.df = load_and_align_data(data_dir)
-        self.asset_names = list(self.df.keys())  # Add asset_names attribute
+        self.df = load_and_align_data(data_dir, max_records)
+        self.asset_names = list(self.df.keys())
         self.step_count = random.randint(2000, len(self.df['BTCUSDT']) - 1000)
         self.candle_interval = '5m'
         self.high_timeframes = ['15m', '1h', '4h', '1d']
