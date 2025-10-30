@@ -44,8 +44,9 @@ class PortfolioEnv():
         self.initial_account_balance = 10000.0
         self.reset_value = self.initial_account_balance // 2
         self.df = load_and_align_data(data_dir, max_records)
-        self.asset_names = list(self.df.keys())
+        self.asset_names = list(self.df.keys()) + ['cash']
         self.step_count = random.randint(2000, len(self.df['BTCUSDT']) - 1000)
+        self.max_steps = len(self.df['BTCUSDT']) - self.step_count - 100
         self.candle_interval = '5m'
         self.high_timeframes = ['15m', '1h', '4h', '1d']
         self.high_timeframes_count = [64, 48, 24, 3]
@@ -93,12 +94,12 @@ class PortfolioEnv():
     
     def sample(self):
         action = []
-        for symbol in self.df.keys():
+        # FIXED: Generate action for all assets including cash
+        for _ in self.asset_names:
             action.append(random.uniform(0, 1))
-        # Normalize to sum to <= 1
+        # Normalize to sum to 1 (required for proper allocation)
         total = sum(action)
-        if total > 1.0:
-            action = [a / total for a in action]
+        action = [a / total for a in action]
         return action
         
     
@@ -363,28 +364,37 @@ class PortfolioEnv():
     def _rebalance_portfolio(self, action):
         """
         Rebalance portfolio based on action.
-        Action is a list with target percentages for each symbol in order of self.asset_names.
-        Example: [0.3, 0.2, 0.1, ...] for ['BTCUSDT', 'ETHUSDT', 'BNBUSDT', ...]
-        Remaining percentage goes to cash.
+        Action is a list with target percentages for each asset including cash.
+        Example: [0.3, 0.2, 0.1, ..., 0.15] for ['BTCUSDT', 'ETHUSDT', ..., 'cash']
         """
         # Calculate current portfolio value
         current_value = self._portfolio_portfolio_value()
         
-        # Calculate target holdings value for each symbol
+        # FIXED: Separate crypto and cash allocations
+        num_cryptos = len(self.df)
+        crypto_actions = action[:num_cryptos]
+        cash_action = action[num_cryptos] if len(action) > num_cryptos else 0.0
+        
+        # Ensure all values are in 0-1 range
+        crypto_actions = [np.clip(a, 0.0, 1.0) for a in crypto_actions]
+        cash_action = np.clip(cash_action, 0.0, 1.0)
+        
+        # Normalize to sum to 1.0
+        total_allocation = sum(crypto_actions) + cash_action
+        if total_allocation > 0:
+            crypto_actions = [a / total_allocation for a in crypto_actions]
+            cash_action = cash_action / total_allocation
+        else:
+            # If all zeros, default to equal allocation
+            crypto_actions = [1.0 / len(self.asset_names)] * num_cryptos
+            cash_action = 1.0 / len(self.asset_names)
+        
+        # Calculate target values
         target_values = {}
-        total_target_pct = 0
-        
         for i, symbol in enumerate(self.df.keys()):
-            target_pct = action[i] if i < len(action) else 0.0
-            target_pct = np.clip(target_pct, 0.0, 1.0)  # Ensure 0-1 range
-            total_target_pct += target_pct
-            target_values[symbol] = current_value * target_pct
+            target_values[symbol] = current_value * crypto_actions[i]
         
-        # Normalize if total exceeds 100%
-        if total_target_pct > 1.0:
-            for symbol in target_values.keys():
-                target_values[symbol] /= total_target_pct
-            total_target_pct = 1.0
+        target_cash = current_value * cash_action
         
         # Calculate trades needed
         total_fees = 0.0
@@ -422,6 +432,7 @@ class PortfolioEnv():
         1. Weighted future returns (farther future = more weight)
         2. Portfolio alignment with future profit potential
         3. Concentration penalty for risk management
+        4. FIXED: Reward for optimal cash usage
         """
         # Get future profit predictions (weighted toward farther future)
         future_profits = self._calculate_future_profit()
@@ -467,18 +478,24 @@ class PortfolioEnv():
         if concentration > 0.5:
             reward -= (concentration - 0.5) * 100
         
-        # Penalty for holding too much cash when there are good opportunities
+        # FIXED: Smart cash penalty - only penalize when missing good opportunities
         cash_weight = self.portfolio['cash'] / current_value if current_value > 0 else 1.0
         avg_future_profit = np.mean(list(future_profits.values()))
-        if avg_future_profit > 0.01 and cash_weight > 0.3:  # Good opportunities but holding >30% cash
+        max_future_profit = max(future_profits.values())
+        
+        # If there are strong positive opportunities and holding too much cash, penalize
+        if max_future_profit > 0.02 and cash_weight > 0.3:  
             reward -= cash_weight * 50
+        # If market looks bad (negative returns expected), reward holding cash
+        elif avg_future_profit < -0.01 and cash_weight > 0.3:
+            reward += cash_weight * 30
         
         return reward
     
     def step(self, action):
         """
         Execute one step in the environment.
-        Action: list with target allocation percentages for each symbol in order of self.asset_names
+        Action: list with target allocation percentages for each asset INCLUDING cash
         Returns: observation, reward, done, info
         """
         # Check if we've reached the end of data
@@ -526,6 +543,9 @@ class PortfolioEnv():
         info['outperformance'] = self._calculate_benchmark_outperformance()
         info['fees_paid'] = fees_paid
         info['step'] = self.step_count
+        info['cash_allocation'] = self.portfolio['cash'] / current_value if current_value > 0 else 1.0
+        info['portfolio_layout'] = {symbol: self.portfolio[symbol] for symbol in self.df.keys()}
+        info['portfolio_layout']['cash'] = self.portfolio['cash']
         
         return obs, reward, done, info
     
@@ -537,9 +557,9 @@ class PortfolioEnv():
         benchmark_value = self._update_benchmark_value()
         outperformance = self._calculate_benchmark_outperformance()
         
-        print(f"\n{'='*60}")
+        print(f"\n{'='*66}")
         print(f"Step: {self.step_count}")
-        print(f"{'='*60}")
+        print(f"{'='*66}")
         print(f"Portfolio Value: ${portfolio_value:,.2f}")
         print(f"Benchmark Value: ${benchmark_value:,.2f}")
         print(f"Outperformance: {(outperformance - 1) * 100:+.2f}%")
@@ -548,7 +568,7 @@ class PortfolioEnv():
         print(f"\nCash: ${self.portfolio['cash']:,.2f} ({self.portfolio['cash']/portfolio_value*100:.1f}%)")
         print(f"\nHoldings:")
         print(f"{'Symbol':<12} {'Quantity':>12} {'Price':>12} {'Value':>14} {'% Portfolio':>12}")
-        print(f"{'-'*60}")
+        print(f"{'-'*66}")
         
         for symbol in sorted(self.df.keys()):
             quantity = self.portfolio[symbol]
@@ -558,7 +578,7 @@ class PortfolioEnv():
                 pct = (value / portfolio_value * 100) if portfolio_value > 0 else 0
                 print(f"{symbol:<12} {quantity:>12.6f} ${price:>11,.2f} ${value:>13,.2f} {pct:>11.2f}%")
         
-        print(f"{'='*60}\n")
+        print(f"{'='*66}\n")
 
     def reset(self):
         """
