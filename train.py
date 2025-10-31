@@ -10,6 +10,7 @@ import wandb
 import time
 from collections import deque
 import pickle
+import gc
 
 DEBUG = False
 
@@ -74,7 +75,6 @@ def build_model(obs_shape, num_assets, config=None):
     return model
 
 def collect_batch_data(env, model, batch_size, gamma, current_step):
-    """Collect exactly one batch of data (batch_size steps)"""
     states, actions, rewards = [], [], []
     step_logs = []
     
@@ -89,21 +89,17 @@ def collect_batch_data(env, model, batch_size, gamma, current_step):
     print(f"  Collecting {batch_size} steps for batch...")
     
     while steps_collected < batch_size and not done:
-        # Get action from model
         state_tensor = tf.convert_to_tensor(state[np.newaxis, :], dtype=tf.float32)
         action_probs = model(state_tensor, training=False)
         action = action_probs[0].numpy()
         
-        # Take step
         next_state, reward, done, info = env.step(action)
         env.render()
 
-        # Store step data
         states.append(state)
         actions.append(action)
         rewards.append(reward)
         
-        # Log step details
         step_log = {
             'step_global': current_step + steps_collected,
             'step_batch': steps_collected,
@@ -136,29 +132,23 @@ def collect_batch_data(env, model, batch_size, gamma, current_step):
         state = next_state
         steps_collected += 1
         
-        # Safety limit
         if steps_collected >= 10000:
             print(f"  Warning: Episode exceeded 10000 steps, forcing termination")
             break
     
-    # Compute returns for the collected steps
     if steps_collected > 0:
         returns = []
         G = 0
-        # Compute returns in reverse to handle discounting properly
         for r in reversed(rewards):
             G = r + gamma * G
             returns.insert(0, G)
         
         returns = np.array(returns, dtype=np.float32)
-        # Normalize returns for this batch only
         returns = (returns - returns.mean()) / (returns.std() + 1e-8)
 
-    # At the end of collect_batch_data:
     if not os.path.exists("trainData"):
         os.makedirs("trainData")
 
-    # Append to single file
     with open("trainData/training_data.pkl", 'ab') as f:
         pickle.dump({'states': states, 'actions': actions, 'returns': returns}, f)
     
@@ -174,7 +164,6 @@ def collect_batch_data(env, model, batch_size, gamma, current_step):
     return states, actions, returns, batch_info, step_logs
 
 def train_on_batch(model, optimizer, batch_states, batch_actions, batch_returns, batch_num):
-    """Train model on a single batch with detailed logging"""
     states_batch = np.array(batch_states, dtype=np.float32)
     actions_batch = np.array(batch_actions, dtype=np.float32)
     returns_batch = np.array(batch_returns, dtype=np.float32)
@@ -189,7 +178,6 @@ def train_on_batch(model, optimizer, batch_states, batch_actions, batch_returns,
     grads = [tf.clip_by_norm(g, 1.0) for g in grads]
     optimizer.apply_gradients(zip(grads, model.trainable_variables))
     
-    # Detailed metrics
     action_probs_np = action_probs.numpy()
     metrics = {
         'batch/loss': loss.numpy(),
@@ -205,120 +193,215 @@ def train_on_batch(model, optimizer, batch_states, batch_actions, batch_returns,
     
     return metrics
 
-def offline_pretrain(env, model, optimizer, num_episodes=50, gamma=0.99, batch_size=256, epochs=20):
-    """Pretrain on saved data"""
-    print("\n=== OFFLINE PRETRAINING ===")
+def offline_pretrain(env, model, optimizer, num_episodes=50, gamma=0.99, batch_size=256, epochs=20, chunk_size=10000):
+    print("\n=== OFFLINE PRETRAINING (MEMORY OPTIMIZED) ===")
     
-    train_data_dir = 'trainData'
+    pkl_file = 'trainData/training_data.pkl'
     
-    if not os.path.exists(train_data_dir) or not os.path.isdir(train_data_dir):
-        print(f"trainData folder not found, skipping pretraining")
+    if not os.path.exists(pkl_file):
+        print(f"{pkl_file} not found, skipping pretraining")
         return
     
-    all_states = []
-    all_actions = []
-    all_returns = []
+    print(f"Loading data from {pkl_file} in chunks of {chunk_size} samples...")
     
-    data_files = [f for f in os.listdir(train_data_dir) if f.endswith(('.npz', '.npy', '.pkl'))]
-    
-    if not data_files:
-        print("No training data files found, skipping pretraining")
-        return
-    
-    print(f"Found {len(data_files)} data files")
-    
-    for data_file in data_files:
-        file_path = os.path.join(train_data_dir, data_file)
-        print(f"Loading {data_file}...")
-        
-        try:
-            if data_file.endswith('.npz'):
-                data = np.load(file_path, allow_pickle=True)
-                all_states.extend(list(data['states']))
-                all_actions.extend(list(data['actions']))
-                all_returns.extend(data['returns'])
-            elif data_file.endswith('.npy'):
-                data = np.load(file_path, allow_pickle=True)
-                
-                if 'states' in data_file.lower():
-                    all_states.extend(list(data))
-                elif 'actions' in data_file.lower():
-                    all_actions.extend(list(data))
-                elif 'returns' in data_file.lower():
-                    all_returns.extend(data)
-            elif data_file.endswith('.pkl'):
-                # Handle pickle files - they might contain multiple batches
-                with open(file_path, 'rb') as f:
-                    while True:
-                        try:
-                            batch_data = pickle.load(f)
-                            if isinstance(batch_data, dict):
-                                if 'states' in batch_data:
-                                    all_states.extend(batch_data['states'])
-                                if 'actions' in batch_data:
-                                    all_actions.extend(batch_data['actions'])
-                                if 'returns' in batch_data:
-                                    all_returns.extend(batch_data['returns'])
-                        except EOFError:
-                            break
-        except Exception as e:
-            print(f"Error loading {data_file}: {e}")
-            continue
-    
-    if len(all_states) == 0:
-        print("No valid data loaded, skipping pretraining")
-        return
-    
-    # Ensure we have matching lengths
-    min_length = min(len(all_states), len(all_actions), len(all_returns))
-    all_states = all_states[:min_length]
-    all_actions = all_actions[:min_length]
-    all_returns = all_returns[:min_length]
-    
-    print(f"Loaded {len(all_states)} samples from {len(data_files)} files")
-    
-    # Normalize returns
-    all_returns = np.array(all_returns, dtype=np.float32)
-    all_returns = (all_returns - all_returns.mean()) / (all_returns.std() + 1e-8)
-    
-    dataset_size = len(all_states)
-    print(f"\nTraining on {dataset_size} samples for {epochs} epochs...")
-    
-    start_time = time.time()
+    global_batch_num = 0
     
     for epoch in range(epochs):
+        print(f"\nEpoch {epoch+1}/{epochs}")
         epoch_start = time.time()
-        indices = np.random.permutation(dataset_size)
         epoch_losses = []
+        epoch_grad_norms = []
+        epoch_entropies = []
+        chunk_num = 0
+        total_samples = 0
         
-        for i in range(0, dataset_size, batch_size):
-            batch_indices = indices[i:i+batch_size]
-            batch_states = [all_states[idx] for idx in batch_indices]
-            batch_actions = [all_actions[idx] for idx in batch_indices]
-            batch_returns = all_returns[batch_indices]
+        with open(pkl_file, 'rb') as f:
+            chunk_states = []
+            chunk_actions = []
+            chunk_returns = []
             
-            # Simple training for pretraining
-            with tf.GradientTape() as tape:
-                action_probs = model(batch_states, training=True)
-                action_probs_clipped = tf.clip_by_value(action_probs, 1e-8, 1.0)
-                log_probs = tf.reduce_sum(batch_actions * tf.math.log(action_probs_clipped), axis=1)
-                loss = -tf.reduce_mean(log_probs * batch_returns)
+            while True:
+                try:
+                    batch_data = pickle.load(f)
+                    if isinstance(batch_data, dict):
+                        chunk_states.extend(batch_data.get('states', []))
+                        chunk_actions.extend(batch_data.get('actions', []))
+                        chunk_returns.extend(batch_data.get('returns', []))
+                    
+                    if len(chunk_states) >= chunk_size:
+                        chunk_num += 1
+                        chunk_start = time.time()
+                        min_len = min(len(chunk_states), len(chunk_actions), len(chunk_returns))
+                        chunk_states = chunk_states[:min_len]
+                        chunk_actions = chunk_actions[:min_len]
+                        chunk_returns = chunk_returns[:min_len]
+                        
+                        total_samples += len(chunk_states)
+                        print(f"  Chunk {chunk_num}: Training on {len(chunk_states)} samples...")
+                        
+                        chunk_returns_arr = np.array(chunk_returns, dtype=np.float32)
+                        returns_mean = chunk_returns_arr.mean()
+                        returns_std = chunk_returns_arr.std()
+                        chunk_returns_arr = (chunk_returns_arr - returns_mean) / (returns_std + 1e-8)
+                        
+                        chunk_losses = []
+                        chunk_grad_norms = []
+                        chunk_entropies = []
+                        
+                        indices = np.random.permutation(len(chunk_states))
+                        for i in range(0, len(chunk_states), batch_size):
+                            global_batch_num += 1
+                            batch_indices = indices[i:i+batch_size]
+                            batch_states = np.array([chunk_states[idx] for idx in batch_indices], dtype=np.float32)
+                            batch_actions = np.array([chunk_actions[idx] for idx in batch_indices], dtype=np.float32)
+                            batch_returns = chunk_returns_arr[batch_indices]
+                            
+                            with tf.GradientTape() as tape:
+                                action_probs = model(batch_states, training=True)
+                                action_probs_clipped = tf.clip_by_value(action_probs, 1e-8, 1.0)
+                                log_probs = tf.reduce_sum(batch_actions * tf.math.log(action_probs_clipped), axis=1)
+                                loss = -tf.reduce_mean(log_probs * batch_returns)
+                            
+                            grads = tape.gradient(loss, model.trainable_variables)
+                            grads = [tf.clip_by_norm(g, 1.0) for g in grads]
+                            grad_norm = tf.linalg.global_norm(grads).numpy()
+                            optimizer.apply_gradients(zip(grads, model.trainable_variables))
+                            
+                            action_probs_np = action_probs.numpy()
+                            entropy = -np.mean(np.sum(action_probs_np * np.log(action_probs_np + 1e-8), axis=1))
+                            
+                            chunk_losses.append(loss.numpy())
+                            chunk_grad_norms.append(grad_norm)
+                            chunk_entropies.append(entropy)
+                            epoch_losses.append(loss.numpy())
+                            epoch_grad_norms.append(grad_norm)
+                            epoch_entropies.append(entropy)
+                            
+                            del batch_states, batch_actions, batch_returns, action_probs, grads
+                            
+                            wandb.log({
+                                "pretrain/batch_num": global_batch_num,
+                                "pretrain/batch_loss": chunk_losses[-1],
+                                "pretrain/batch_grad_norm": grad_norm,
+                                "pretrain/batch_entropy": entropy,
+                            })
+                        
+                        chunk_time = time.time() - chunk_start
+                        wandb.log({
+                            "pretrain/chunk_num": chunk_num,
+                            "pretrain/chunk_epoch": epoch + 1,
+                            "pretrain/chunk_loss": np.mean(chunk_losses),
+                            "pretrain/chunk_grad_norm": np.mean(chunk_grad_norms),
+                            "pretrain/chunk_entropy": np.mean(chunk_entropies),
+                            "pretrain/chunk_samples": len(chunk_states),
+                            "pretrain/chunk_time": chunk_time,
+                            "pretrain/chunk_returns_mean": returns_mean,
+                            "pretrain/chunk_returns_std": returns_std,
+                        })
+                        
+                        del chunk_states, chunk_actions, chunk_returns, chunk_returns_arr
+                        chunk_states = []
+                        chunk_actions = []
+                        chunk_returns = []
+                        gc.collect()
+                        
+                except EOFError:
+                    break
             
-            grads = tape.gradient(loss, model.trainable_variables)
-            grads = [tf.clip_by_norm(g, 1.0) for g in grads]
-            optimizer.apply_gradients(zip(grads, model.trainable_variables))
-            epoch_losses.append(loss.numpy())
+            if len(chunk_states) > 0:
+                chunk_num += 1
+                chunk_start = time.time()
+                min_len = min(len(chunk_states), len(chunk_actions), len(chunk_returns))
+                chunk_states = chunk_states[:min_len]
+                chunk_actions = chunk_actions[:min_len]
+                chunk_returns = chunk_returns[:min_len]
+                
+                total_samples += len(chunk_states)
+                print(f"  Chunk {chunk_num} (final): Training on {len(chunk_states)} samples...")
+                
+                chunk_returns_arr = np.array(chunk_returns, dtype=np.float32)
+                returns_mean = chunk_returns_arr.mean()
+                returns_std = chunk_returns_arr.std()
+                chunk_returns_arr = (chunk_returns_arr - returns_mean) / (returns_std + 1e-8)
+                
+                chunk_losses = []
+                chunk_grad_norms = []
+                chunk_entropies = []
+                
+                indices = np.random.permutation(len(chunk_states))
+                for i in range(0, len(chunk_states), batch_size):
+                    global_batch_num += 1
+                    batch_indices = indices[i:i+batch_size]
+                    batch_states = np.array([chunk_states[idx] for idx in batch_indices], dtype=np.float32)
+                    batch_actions = np.array([chunk_actions[idx] for idx in batch_indices], dtype=np.float32)
+                    batch_returns = chunk_returns_arr[batch_indices]
+                    
+                    with tf.GradientTape() as tape:
+                        action_probs = model(batch_states, training=True)
+                        action_probs_clipped = tf.clip_by_value(action_probs, 1e-8, 1.0)
+                        log_probs = tf.reduce_sum(batch_actions * tf.math.log(action_probs_clipped), axis=1)
+                        loss = -tf.reduce_mean(log_probs * batch_returns)
+                    
+                    grads = tape.gradient(loss, model.trainable_variables)
+                    grads = [tf.clip_by_norm(g, 1.0) for g in grads]
+                    grad_norm = tf.linalg.global_norm(grads).numpy()
+                    optimizer.apply_gradients(zip(grads, model.trainable_variables))
+                    
+                    action_probs_np = action_probs.numpy()
+                    entropy = -np.mean(np.sum(action_probs_np * np.log(action_probs_np + 1e-8), axis=1))
+                    
+                    chunk_losses.append(loss.numpy())
+                    chunk_grad_norms.append(grad_norm)
+                    chunk_entropies.append(entropy)
+                    epoch_losses.append(loss.numpy())
+                    epoch_grad_norms.append(grad_norm)
+                    epoch_entropies.append(entropy)
+                    
+                    del batch_states, batch_actions, batch_returns, action_probs, grads
+                    
+                    if global_batch_num % 10 == 0:
+                        wandb.log({
+                            "pretrain/batch_num": global_batch_num,
+                            "pretrain/batch_loss": chunk_losses[-1],
+                            "pretrain/batch_grad_norm": grad_norm,
+                            "pretrain/batch_entropy": entropy,
+                        })
+                
+                chunk_time = time.time() - chunk_start
+                wandb.log({
+                    "pretrain/chunk_num": chunk_num,
+                    "pretrain/chunk_epoch": epoch + 1,
+                    "pretrain/chunk_loss": np.mean(chunk_losses),
+                    "pretrain/chunk_grad_norm": np.mean(chunk_grad_norms),
+                    "pretrain/chunk_entropy": np.mean(chunk_entropies),
+                    "pretrain/chunk_samples": len(chunk_states),
+                    "pretrain/chunk_time": chunk_time,
+                    "pretrain/chunk_returns_mean": returns_mean,
+                    "pretrain/chunk_returns_std": returns_std,
+                })
+                
+                del chunk_states, chunk_actions, chunk_returns, chunk_returns_arr
+                gc.collect()
         
         epoch_time = time.time() - epoch_start
-        avg_loss = np.mean(epoch_losses)
+        avg_loss = np.mean(epoch_losses) if epoch_losses else 0.0
+        avg_grad_norm = np.mean(epoch_grad_norms) if epoch_grad_norms else 0.0
+        avg_entropy = np.mean(epoch_entropies) if epoch_entropies else 0.0
         
         wandb.log({
             "pretrain/epoch": epoch + 1,
-            "pretrain/loss": avg_loss,
+            "pretrain/epoch_loss": avg_loss,
+            "pretrain/epoch_grad_norm": avg_grad_norm,
+            "pretrain/epoch_entropy": avg_entropy,
             "pretrain/epoch_time": epoch_time,
+            "pretrain/epoch_samples": total_samples,
+            "pretrain/epoch_chunks": chunk_num,
+            "pretrain/epoch_batches": global_batch_num,
         })
         
-        print(f"Epoch {epoch+1}/{epochs} - Loss: {avg_loss:.4f} - Time: {epoch_time:.1f}s")
+        print(f"Epoch {epoch+1}/{epochs} - Loss: {avg_loss:.4f} - Entropy: {avg_entropy:.4f} - Samples: {total_samples} - Time: {epoch_time:.1f}s")
+        
+        gc.collect()
     
     print("Offline pretraining complete!\n")
 
@@ -334,16 +417,17 @@ if __name__ == "__main__":
         "dropout_rate": 0.2,
         "dense_hidden": 256,
         "embedding_dim": 2048,
-        "initial_lr": 0.0001,
-        "pretrain_episodes": 3,
+        "initial_lr": 0.01,
+        "pretrain_episodes": 10,
         "pretrain_epochs": 3,
-        "pretrain_batch_size": 256,
-        "online_total_batches": 5000,  # Total batches to process
-        "online_batch_size": 256,  # Steps per batch
+        "pretrain_batch_size": 512,
+        "pretrain_chunk_size": 256 * 10,
+        "online_total_batches": 5000,
+        "online_batch_size": 256,
         "gamma": 0.99,
-        "lr_patience": 100,  # In batches
+        "lr_patience": 100,
         "lr_decay": 0.5,
-        "log_step_frequency": 1,  # Log every N steps within batch
+        "log_step_frequency": 1,
     }
     
     wandb.init(project="portfolio-trading-online-batch", config=config)
@@ -362,7 +446,6 @@ if __name__ == "__main__":
     
     optimizer = tf.keras.optimizers.Adam(learning_rate=config.initial_lr)
     
-    # Load pretrained model if exists
     pretrained_model_path = 'pretrained_model.weights.h5'
     best_model_path = 'best_model.weights.h5'
 
@@ -370,15 +453,14 @@ if __name__ == "__main__":
         print(f"\n=== LOADING BEST MODEL FROM {best_model_path} ===")
         model.load_weights(best_model_path)
         print("Best model loaded successfully!\n")
-        ENABLE_PRETRAINING = False
+        # ENABLE_PRETRAINING = False
     elif os.path.exists(pretrained_model_path):
         print(f"\n=== LOADING PRETRAINED MODEL FROM {pretrained_model_path} ===")
         model.load_weights(pretrained_model_path)
         print("Pretrained model loaded successfully!\n")
-        ENABLE_PRETRAINING = False
+        # ENABLE_PRETRAINING = False
 
-    # check if pretraining data exists
-    if (not os.path.exists('trainData') or not os.path.isdir('trainData')) and not os.path.exists('trainData/train_data.pkl'):
+    if (not os.path.exists('trainData') or not os.path.isdir('trainData')) and not os.path.exists('trainData/training_data.pkl'):
         print("No pretraining data found, skipping pretraining")
         ENABLE_PRETRAINING = False
     
@@ -387,8 +469,9 @@ if __name__ == "__main__":
                         num_episodes=config.pretrain_episodes, 
                         gamma=config.gamma,
                         batch_size=config.pretrain_batch_size,
-                        epochs=config.pretrain_epochs)
-        model.save_weights('pretrained_model.weights.h5')
+                        epochs=config.pretrain_epochs,
+                        chunk_size=config.pretrain_chunk_size)
+        model.save_weights('best_model.weights.h5')
     else:
         print("\n=== SKIPPING PRETRAINING ===")
     
@@ -402,8 +485,7 @@ if __name__ == "__main__":
     global_step = 0
     batch_count = 0
     
-    # Track recent performance
-    recent_rewards = deque(maxlen=50)  # Track last 50 batches
+    recent_rewards = deque(maxlen=50)
     
     print(f"\n{'='*80}")
     print("STARTING BATCH TRAINING LOOP")
@@ -415,21 +497,18 @@ if __name__ == "__main__":
         batch_count += 1
         print(f"\n--- Batch {batch_count}/{config.online_total_batches} ---")
         
-        # Collect exactly one batch of data
         collect_start = time.time()
         states, actions, returns, batch_info, step_logs = collect_batch_data(
             env, model, config.online_batch_size, config.gamma, global_step
         )
         collect_time = time.time() - collect_start
         
-        # Update global step counter
         steps_collected = len(states)
         global_step += steps_collected
         recent_rewards.append(batch_info['total_reward'])
         
-        # Log step-level details (sample some steps to avoid too much logging)
         for i, step_log in enumerate(step_logs):
-            if i % config.log_step_frequency == 0:  # Log every Nth step
+            if i % config.log_step_frequency == 0:
                 wandb.log({
                     "step/global": step_log['step_global'],
                     "step/batch": step_log['step_batch'],
@@ -442,19 +521,16 @@ if __name__ == "__main__":
                     "step/action_max": step_log['action_max'],
                 })
         
-        # Train on the collected batch
         train_start = time.time()
         if len(states) > 0:
             batch_metrics = train_on_batch(model, optimizer, states, actions, returns, batch_count)
             train_time = time.time() - train_start
         else:
-            batch_metrics = {'batch/loss': 0.0}  # No data collected
+            batch_metrics = {'batch/loss': 0.0}
             train_time = 0.0
         
-        # Calculate performance metrics
         avg_recent_reward = np.mean(recent_rewards) if recent_rewards else batch_info['total_reward']
         
-        # Log batch metrics
         batch_metrics.update({
             'batch/number': batch_count,
             'batch/global_step': global_step,
@@ -476,8 +552,10 @@ if __name__ == "__main__":
         print(f"Collected {steps_collected} steps in {collect_time:.2f}s")
         print(f"Trained in {train_time:.2f}s, Loss: {batch_metrics['batch/loss']:.4f}")
         print(f"Reward: {batch_info['total_reward']:.2f}, Recent avg: {avg_recent_reward:.2f}")
-        
-        # Track best model based on recent performance
+
+        wandb.log({'best/avg_recent_reward': avg_recent_reward})
+        wandb.log({'best/best_recent_reward': best_avg_reward})
+
         if avg_recent_reward > best_avg_reward:
             best_avg_reward = avg_recent_reward
             model.save_weights('best_model.weights.h5')
@@ -487,7 +565,6 @@ if __name__ == "__main__":
         else:
             no_improvement += 1
         
-        # Learning rate decay based on batches
         if no_improvement >= config.lr_patience:
             current_lr *= config.lr_decay
             if current_lr < 1e-6:
@@ -496,7 +573,6 @@ if __name__ == "__main__":
             print(f"\n>>> Learning rate reduced to {current_lr:.6f} <<<")
             no_improvement = 0
         
-        # Progress reporting
         progress = (batch_count / config.online_total_batches) * 100
         elapsed_time = time.time() - start_time
         batches_per_sec = batch_count / elapsed_time if elapsed_time > 0 else 0
@@ -506,13 +582,14 @@ if __name__ == "__main__":
         print(f"Time elapsed: {elapsed_time:.1f}s, Batches/sec: {batches_per_sec:.2f}, Steps/sec: {steps_per_sec:.2f}")
         print(f"Current LR: {current_lr:.6f}, Best avg reward: {best_avg_reward:.2f}")
         
-        # Save checkpoint every 100 batches
         if batch_count % 100 == 0:
             checkpoint_path = f'checkpoint_batch{batch_count}.weights.h5'
             model.save_weights(checkpoint_path)
             print(f"Saved checkpoint: {checkpoint_path}")
+        
+        del states, actions, returns
+        gc.collect()
     
-    # Final save
     model.save_weights('final_model.weights.h5')
     wandb.save('final_model.weights.h5')
     
@@ -527,5 +604,3 @@ if __name__ == "__main__":
     print(f"Final model saved!")
     
     wandb.finish()
-
-#TODO Add loading of the pickle file

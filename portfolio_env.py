@@ -324,6 +324,18 @@ class PortfolioEnv():
             holdings_value = holdings * price
             holdings_pct = holdings_value / total_portfolio_value if total_portfolio_value > 0 else 0
             portfolio_state.append(holdings_pct)
+            
+            # Add average price (normalized by current price)
+            avg_price = self.average_prices.get(symbol, price)
+            avg_price_normalized = avg_price / price if price > 0 else 1.0
+            portfolio_state.append(avg_price_normalized)
+            
+            # Add profit/loss percentage for the asset
+            if avg_price > 0 and holdings > 0.000001:
+                pl_percent = (price - avg_price) / avg_price
+            else:
+                pl_percent = 0.0
+            portfolio_state.append(pl_percent)
         
         # Add cash as percentage of total portfolio
         cash_pct = self.portfolio['cash'] / total_portfolio_value if total_portfolio_value > 0 else 0
