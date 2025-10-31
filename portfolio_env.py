@@ -540,69 +540,208 @@ class PortfolioEnv():
         
         return total_fees
     
+    # def _calculate_reward(self) -> float:
+    #     """
+    #     Calculate reward based on:
+    #     1. Weighted future returns (farther future = more weight)
+    #     2. Portfolio alignment with future profit potential
+    #     3. Concentration penalty for risk management
+    #     4. FIXED: Reward for optimal cash usage
+    #     """
+    #     # Get future profit predictions (weighted toward farther future)
+    #     future_profits = self._calculate_future_profit()
+        
+    #     # Update current portfolio value
+    #     current_value = self._portfolio_portfolio_value()
+        
+    #     # Calculate portfolio-weighted expected return
+    #     portfolio_weighted_return = 0.0
+    #     for symbol in self.df.keys():
+    #         price = self.df[symbol]['close'].iloc[self.step_count]
+    #         holdings_value = self.portfolio[symbol] * price
+    #         weight = holdings_value / current_value if current_value > 0 else 0
+            
+    #         # Weight by portfolio allocation and future profit
+    #         portfolio_weighted_return += weight * future_profits[symbol]
+        
+    #     # Base reward: portfolio's alignment with future returns
+    #     reward = portfolio_weighted_return * 1000  # Scale up for meaningful rewards
+        
+    #     # Calculate benchmark's weighted future return for comparison
+    #     benchmark_weighted_return = 0.0
+    #     benchmark_value = self._update_benchmark_value()
+    #     for symbol in self.df.keys():
+    #         price = self.df[symbol]['close'].iloc[self.step_count]
+    #         benchmark_holdings_value = self.passive_portfolio[symbol] * price
+    #         benchmark_weight = benchmark_holdings_value / benchmark_value if benchmark_value > 0 else 0
+    #         benchmark_weighted_return += benchmark_weight * future_profits[symbol]
+        
+    #     # Bonus for better positioning than benchmark
+    #     outperformance = portfolio_weighted_return - benchmark_weighted_return
+    #     reward += outperformance * 500
+        
+    #     # Calculate portfolio concentration (Herfindahl index) for risk penalty
+    #     concentration = 0
+    #     for symbol in self.df.keys():
+    #         price = self.df[symbol]['close'].iloc[self.step_count]
+    #         holdings_value = self.portfolio[symbol] * price
+    #         weight = holdings_value / current_value if current_value > 0 else 0
+    #         concentration += weight ** 2
+        
+    #     # Penalize over-concentration (>0.5 Herfindahl index)
+    #     if concentration > 0.5:
+    #         reward -= (concentration - 0.5) * 100
+        
+    #     # FIXED: Smart cash penalty - only penalize when missing good opportunities
+    #     cash_weight = self.portfolio['cash'] / current_value if current_value > 0 else 1.0
+    #     avg_future_profit = np.mean(list(future_profits.values()))
+    #     max_future_profit = max(future_profits.values())
+        
+    #     # If there are strong positive opportunities and holding too much cash, penalize
+    #     if max_future_profit > 0.02 and cash_weight > 0.3:  
+    #         reward -= cash_weight * 50
+    #     # If market looks bad (negative returns expected), reward holding cash
+    #     elif avg_future_profit < -0.01 and cash_weight > 0.3:
+    #         reward += cash_weight * 30
+        
+    #     return reward
+
     def _calculate_reward(self) -> float:
         """
-        Calculate reward based on:
-        1. Weighted future returns (farther future = more weight)
-        2. Portfolio alignment with future profit potential
-        3. Concentration penalty for risk management
-        4. FIXED: Reward for optimal cash usage
+        Enhanced reward function based on:
+        1. Sharpe-like ratio of future returns
+        2. Risk-adjusted portfolio alignment
+        3. Dynamic concentration management
+        4. Smart cash positioning
+        5. Trend momentum bonus
         """
-        # Get future profit predictions (weighted toward farther future)
+        # Get future profit predictions
         future_profits = self._calculate_future_profit()
         
         # Update current portfolio value
         current_value = self._portfolio_portfolio_value()
         
-        # Calculate portfolio-weighted expected return
+        # ===== 1. Calculate portfolio-weighted expected return =====
         portfolio_weighted_return = 0.0
+        portfolio_weights = {}
+        
         for symbol in self.df.keys():
             price = self.df[symbol]['close'].iloc[self.step_count]
             holdings_value = self.portfolio[symbol] * price
             weight = holdings_value / current_value if current_value > 0 else 0
-            
-            # Weight by portfolio allocation and future profit
+            portfolio_weights[symbol] = weight
             portfolio_weighted_return += weight * future_profits[symbol]
         
-        # Base reward: portfolio's alignment with future returns
-        reward = portfolio_weighted_return * 1000  # Scale up for meaningful rewards
+        # ===== 2. Calculate risk (volatility) of future returns =====
+        # Use standard deviation of future returns as risk measure
+        future_returns_list = list(future_profits.values())
+        returns_std = np.std(future_returns_list) if len(future_returns_list) > 1 else 0.001
         
-        # Calculate benchmark's weighted future return for comparison
+        # Calculate portfolio risk (weighted by holdings)
+        portfolio_risk = 0.0
+        for symbol in self.df.keys():
+            # Simple approximation: weight * individual asset volatility
+            portfolio_risk += portfolio_weights[symbol] * abs(future_profits[symbol])
+        portfolio_risk = max(portfolio_risk, 0.001)  # Avoid division by zero
+        
+        # ===== 3. Sharpe-like ratio reward (return/risk) =====
+        sharpe_reward = (portfolio_weighted_return / returns_std) * 100
+        
+        # ===== 4. Benchmark comparison with dynamic weighting =====
         benchmark_weighted_return = 0.0
         benchmark_value = self._update_benchmark_value()
+        
         for symbol in self.df.keys():
             price = self.df[symbol]['close'].iloc[self.step_count]
             benchmark_holdings_value = self.passive_portfolio[symbol] * price
             benchmark_weight = benchmark_holdings_value / benchmark_value if benchmark_value > 0 else 0
             benchmark_weighted_return += benchmark_weight * future_profits[symbol]
         
-        # Bonus for better positioning than benchmark
+        # Outperformance bonus (scaled by confidence)
         outperformance = portfolio_weighted_return - benchmark_weighted_return
-        reward += outperformance * 500
+        confidence_multiplier = 1.0 / (1.0 + returns_std * 10)  # Lower when returns are volatile
+        outperformance_reward = outperformance * 800 * confidence_multiplier
         
-        # Calculate portfolio concentration (Herfindahl index) for risk penalty
-        concentration = 0
-        for symbol in self.df.keys():
-            price = self.df[symbol]['close'].iloc[self.step_count]
-            holdings_value = self.portfolio[symbol] * price
-            weight = holdings_value / current_value if current_value > 0 else 0
-            concentration += weight ** 2
+        # ===== 5. Dynamic concentration management =====
+        # Calculate Herfindahl index
+        concentration = sum(w ** 2 for w in portfolio_weights.values())
         
-        # Penalize over-concentration (>0.5 Herfindahl index)
-        if concentration > 0.5:
-            reward -= (concentration - 0.5) * 100
+        # Get market conditions
+        avg_future_profit = np.mean(future_returns_list)
+        max_future_profit = max(future_returns_list)
+        profit_spread = max(future_returns_list) - min(future_returns_list)
         
-        # FIXED: Smart cash penalty - only penalize when missing good opportunities
+        # Dynamic concentration threshold based on market conditions
+        if profit_spread > 0.05:  # High dispersion = opportunity for concentration
+            optimal_concentration = 0.35  # Allow more concentration
+            concentration_tolerance = 0.25
+        else:  # Low dispersion = diversification safer
+            optimal_concentration = 0.20  # Encourage diversification
+            concentration_tolerance = 0.15
+        
+        # Penalty for deviation from optimal concentration
+        concentration_deviation = abs(concentration - optimal_concentration)
+        if concentration_deviation > concentration_tolerance:
+            concentration_penalty = (concentration_deviation - concentration_tolerance) * 200
+        else:
+            concentration_penalty = 0
+        
+        # ===== 6. Smart cash management =====
         cash_weight = self.portfolio['cash'] / current_value if current_value > 0 else 1.0
-        avg_future_profit = np.mean(list(future_profits.values()))
-        max_future_profit = max(future_profits.values())
         
-        # If there are strong positive opportunities and holding too much cash, penalize
-        if max_future_profit > 0.02 and cash_weight > 0.3:  
-            reward -= cash_weight * 50
-        # If market looks bad (negative returns expected), reward holding cash
-        elif avg_future_profit < -0.01 and cash_weight > 0.3:
-            reward += cash_weight * 30
+        # Identify strong opportunities and weak assets
+        strong_opportunities = [p for p in future_returns_list if p > 0.03]
+        weak_assets = [p for p in future_returns_list if p < -0.02]
+        
+        # Cash reward/penalty logic
+        if len(strong_opportunities) >= 2 and cash_weight > 0.3:
+            # Missing good opportunities - penalize excess cash
+            cash_adjustment = -(cash_weight - 0.2) * 100
+        elif avg_future_profit < -0.015 and cash_weight > 0.3:
+            # Market looks bad, reward holding cash
+            cash_adjustment = (cash_weight - 0.2) * 80
+        elif cash_weight < 0.05 and avg_future_profit < -0.01:
+            # No cash buffer in bad market - penalize
+            cash_adjustment = -(0.05 - cash_weight) * 60
+        elif cash_weight > 0.7:
+            # Too much cash (probably always bad)
+            cash_adjustment = -(cash_weight - 0.5) * 150
+        else:
+            # Reasonable cash position
+            cash_adjustment = 0
+        
+        # ===== 7. Momentum alignment bonus =====
+        # Reward for being positioned in assets with consistent positive trends
+        momentum_score = 0.0
+        for symbol in self.df.keys():
+            if portfolio_weights[symbol] > 0.05:  # Only for meaningful positions
+                # Check if future returns are consistently positive
+                if future_profits[symbol] > 0.02:
+                    momentum_score += portfolio_weights[symbol] * future_profits[symbol] * 200
+                elif future_profits[symbol] < -0.02:
+                    # Penalize being positioned in declining assets
+                    momentum_score -= portfolio_weights[symbol] * abs(future_profits[symbol]) * 150
+        
+        # ===== 8. Diversification bonus in uncertain markets =====
+        diversification_bonus = 0.0
+        if returns_std > 0.03:  # High uncertainty
+            # Count number of meaningful positions (>5%)
+            num_positions = sum(1 for w in portfolio_weights.values() if w > 0.05)
+            if num_positions >= 3:  # Well diversified
+                diversification_bonus = num_positions * 15
+        
+        # ===== 9. Combine all components =====
+        reward = (
+            sharpe_reward +              # Risk-adjusted return
+            outperformance_reward +       # Beat benchmark
+            momentum_score +              # Momentum alignment
+            diversification_bonus +       # Diversification in uncertain times
+            cash_adjustment -             # Smart cash positioning
+            concentration_penalty         # Concentration management
+        )
+        
+        # ===== 10. Clip reward to reasonable range =====
+        reward = np.clip(reward, -200, 200)
         
         return reward
     
