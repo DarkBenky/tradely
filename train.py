@@ -11,6 +11,7 @@ import time
 from collections import deque
 import pickle
 import gc
+import random
 
 DEBUG = False
 
@@ -74,11 +75,11 @@ def build_model(obs_shape, num_assets, config=None):
     model = Model(inputs=inputs, outputs=outputs)
     return model
 
-def collect_batch_data(env, model, batch_size, gamma, current_step):
+def collect_batch_data(env, model, batch_size, gamma, current_step, epsilon=0.1):
     states, actions, rewards = [], [], []
     step_logs = []
     
-    if current_step >= env.max_steps:
+    if current_step >= env.max_steps or random.random() < 0.05:
         state = env.reset()
     else:
         state = env.get_observation()
@@ -86,12 +87,24 @@ def collect_batch_data(env, model, batch_size, gamma, current_step):
     done = False
     steps_collected = 0
     
-    print(f"  Collecting {batch_size} steps for batch...")
+    print(f"  Collecting {batch_size} steps for batch (epsilon={epsilon:.4f})...")
     
     while steps_collected < batch_size and not done:
         state_tensor = tf.convert_to_tensor(state[np.newaxis, :], dtype=tf.float32)
         action_probs = model(state_tensor, training=False)
         action = action_probs[0].numpy()
+
+        # Epsilon-greedy exploration with noise
+        if random.random() < epsilon:
+            # Full random action
+            action = env.sample()
+        elif random.random() < epsilon * 2:
+            # Add Gaussian noise to model action for exploration
+            noise = np.random.normal(0, 0.1, size=action.shape)
+            action = action + noise
+            action = np.clip(action, 0, 1)
+            # Re-normalize to ensure sum = 1
+            action = action / action.sum()
         
         next_state, reward, done, info = env.step(action)
         env.render()
@@ -417,17 +430,20 @@ if __name__ == "__main__":
         "dropout_rate": 0.2,
         "dense_hidden": 256,
         "embedding_dim": 2048,
-        "initial_lr": 0.01,
+        "initial_lr": 0.001,
         "pretrain_episodes": 10,
-        "pretrain_epochs": 3,
+        "pretrain_epochs": 0,
         "pretrain_batch_size": 512,
         "pretrain_chunk_size": 256 * 10,
         "online_total_batches": 5000,
-        "online_batch_size": 256,
+        "online_batch_size": 512,
         "gamma": 0.99,
         "lr_patience": 100,
         "lr_decay": 0.5,
         "log_step_frequency": 1,
+        "epsilon_start": 0.125,
+        "epsilon_end": 0.02,
+        "epsilon_decay": 0.9995,
     }
     
     wandb.init(project="portfolio-trading-online-batch", config=config)
@@ -484,6 +500,7 @@ if __name__ == "__main__":
     current_lr = config.initial_lr
     global_step = 0
     batch_count = 0
+    epsilon = config.epsilon_start
     
     recent_rewards = deque(maxlen=50)
     
@@ -499,13 +516,16 @@ if __name__ == "__main__":
         
         collect_start = time.time()
         states, actions, returns, batch_info, step_logs = collect_batch_data(
-            env, model, config.online_batch_size, config.gamma, global_step
+            env, model, config.online_batch_size, config.gamma, global_step, epsilon
         )
         collect_time = time.time() - collect_start
         
         steps_collected = len(states)
         global_step += steps_collected
         recent_rewards.append(batch_info['total_reward'])
+        
+        # Decay epsilon
+        epsilon = max(config.epsilon_end, epsilon * config.epsilon_decay)
         
         for i, step_log in enumerate(step_logs):
             if i % config.log_step_frequency == 0:
@@ -545,6 +565,7 @@ if __name__ == "__main__":
             'batch/total_time': collect_time + train_time,
             'batch/steps_per_second': steps_collected / collect_time if collect_time > 0 else 0,
             'batch/learning_rate': current_lr,
+            'batch/epsilon': epsilon,
         })
         
         wandb.log(batch_metrics)
@@ -580,7 +601,7 @@ if __name__ == "__main__":
         
         print(f"\nProgress: {progress:.1f}% ({batch_count}/{config.online_total_batches} batches)")
         print(f"Time elapsed: {elapsed_time:.1f}s, Batches/sec: {batches_per_sec:.2f}, Steps/sec: {steps_per_sec:.2f}")
-        print(f"Current LR: {current_lr:.6f}, Best avg reward: {best_avg_reward:.2f}")
+        print(f"Current LR: {current_lr:.6f}, Epsilon: {epsilon:.4f}, Best avg reward: {best_avg_reward:.2f}")
         
         if batch_count % 100 == 0:
             checkpoint_path = f'checkpoint_batch{batch_count}.weights.h5'
