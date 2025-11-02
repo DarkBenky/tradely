@@ -657,6 +657,9 @@ class PortfolioEnv():
             portfolio_weights[symbol] = weight
             portfolio_weighted_return += weight * future_profits[symbol]
         
+        # Get future returns list for risk calculations
+        future_returns_list = list(future_profits.values())
+        
         # Reward alignment with future opportunities
         future_alignment_reward = portfolio_weighted_return * 300  # Reduced from 400
         
@@ -670,7 +673,6 @@ class PortfolioEnv():
                 future_alignment_reward -= (top_concentration - 0.5) * 100
         
         # ===== 4. RISK-ADJUSTED RETURNS (Sharpe-like) =====
-        future_returns_list = list(future_profits.values())
         returns_std = np.std(future_returns_list) if len(future_returns_list) > 1 else 0.001
         
         # Sharpe ratio component

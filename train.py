@@ -75,11 +75,11 @@ def build_model(obs_shape, num_assets, config=None):
     model = Model(inputs=inputs, outputs=outputs)
     return model
 
-def collect_batch_data(env, model, batch_size, gamma, current_step, epsilon=0.1):
+def collect_batch_data(env, model, batch_size, gamma, current_step, epsilon=0.1, env_reset_probability=0.05):
     states, actions, rewards = [], [], []
     step_logs = []
     
-    if current_step >= env.max_steps or random.random() < 0.05:
+    if current_step >= env.max_steps or random.random() < env_reset_probability:
         state = env.reset()
     else:
         state = env.get_observation()
@@ -436,7 +436,7 @@ if __name__ == "__main__":
         "pretrain_batch_size": 512,
         "pretrain_chunk_size": 256 * 10,
         "online_total_batches": 5000,
-        "online_batch_size": 512,
+        "online_batch_size": 256,
         "gamma": 0.99,
         "lr_patience": 100,
         "lr_decay": 0.5,
@@ -444,6 +444,7 @@ if __name__ == "__main__":
         "epsilon_start": 0.125,
         "epsilon_end": 0.02,
         "epsilon_decay": 0.9995,
+        "env_reset_probability": 0.75,
     }
     
     wandb.init(project="portfolio-trading-online-batch", config=config)
@@ -516,7 +517,7 @@ if __name__ == "__main__":
         
         collect_start = time.time()
         states, actions, returns, batch_info, step_logs = collect_batch_data(
-            env, model, config.online_batch_size, config.gamma, global_step, epsilon
+            env, model, config.online_batch_size, config.gamma, global_step, epsilon, config.env_reset_probability
         )
         collect_time = time.time() - collect_start
         

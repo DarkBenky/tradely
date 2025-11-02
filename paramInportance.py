@@ -8,7 +8,6 @@ from sklearn.ensemble import RandomForestClassifier
 import matplotlib.pyplot as plt
 
 def get_feature_names(env):
-    """Extract feature names from the environment observation"""
     feature_names = []
     
     exclude_cols = ['timestamp', 'close_time', 'ignore']
@@ -24,14 +23,18 @@ def get_feature_names(env):
         '1d': env.high_timeframes_count[3]
     }
     
-    for symbol in env.asset_names:
+    crypto_symbols = list(env.df.keys())
+    
+    for symbol in crypto_symbols:
         for timeframe, count in aggregation_info.items():
             for col in all_available_cols:
                 for step in range(count):
                     feature_names.append(f"{symbol}_{timeframe}_{col}_t{step}")
     
-    for symbol in env.asset_names:
+    for symbol in crypto_symbols:
         feature_names.append(f"portfolio_holdings_{symbol}")
+        feature_names.append(f"avg_price_ratio_{symbol}")
+        feature_names.append(f"pl_percent_{symbol}")
     
     feature_names.extend([
         'portfolio_cash_pct',
@@ -43,7 +46,6 @@ def get_feature_names(env):
     return feature_names
 
 def collect_data_samples(env, model, num_episodes=3, max_steps=50):
-    """Collect state-action samples quickly"""
     states = []
     actions = []
     
@@ -67,15 +69,13 @@ def collect_data_samples(env, model, num_episodes=3, max_steps=50):
             
             state = next_state
         
-        print(f"  Episode {episode+1}/{num_episodes}: {len(states)} total samples")
+        print(f"  Episode {episode+1}/{num_episodes}: collected {len(states)} samples")
     
     return np.array(states, dtype=np.float32), np.array(actions, dtype=np.float32)
 
 def fast_gradient_importance(model, states, actions, batch_size=32):
-    """Fast gradient-based importance using batching"""
     print("\nCalculating gradient-based importance...")
     
-    # Use fewer samples for speed
     num_samples = min(len(states), 150)
     indices = np.random.choice(len(states), num_samples, replace=False)
     states_sample = states[indices]
@@ -100,15 +100,13 @@ def fast_gradient_importance(model, states, actions, batch_size=32):
         all_gradients.append(np.abs(grads.numpy()))
         
         if (i // batch_size) % 2 == 0:
-            print(f"  Processed {end_idx}/{num_samples} samples...")
+            print(f"  Processed {end_idx}/{num_samples} samples")
     
-    # Average across all samples
     avg_gradients = np.mean(np.concatenate(all_gradients, axis=0), axis=0)
     
     return avg_gradients
 
 def fast_variance_importance(states, sample_size=500):
-    """Ultra-fast variance-based importance"""
     print("\nCalculating variance-based importance...")
     
     if len(states) > sample_size:
@@ -117,19 +115,15 @@ def fast_variance_importance(states, sample_size=500):
     else:
         states_sample = states
     
-    # Features with higher variance are potentially more informative
     variances = np.var(states_sample, axis=0)
     
     return variances
 
 def create_importance_table(feature_names, gradient_importance, variance_importance, top_n=100):
-    """Create a comprehensive importance table"""
     
-    # Normalize both metrics to 0-1 range
     grad_normalized = (gradient_importance - gradient_importance.min()) / (gradient_importance.max() - gradient_importance.min() + 1e-8)
     var_normalized = (variance_importance - variance_importance.min()) / (variance_importance.max() - variance_importance.min() + 1e-8)
     
-    # Combined score (weighted: 70% gradient, 30% variance)
     combined_importance = 0.7 * grad_normalized + 0.3 * var_normalized
     
     df = pd.DataFrame({
@@ -153,7 +147,6 @@ def create_importance_table(feature_names, gradient_importance, variance_importa
     return df
 
 def analyze_by_category(df):
-    """Group features by category and analyze"""
     print(f"\n{'='*80}")
     print("FEATURE IMPORTANCE BY CATEGORY")
     print(f"{'='*80}")
@@ -167,17 +160,13 @@ def analyze_by_category(df):
         'rsi': 'RSI',
         'macd': 'MACD',
         'ema': 'EMA',
-        'sma': 'SMA',
+        'ma_': 'MA',
         'bb': 'Bollinger Bands',
         'atr': 'ATR',
-        'stoch': 'Stochastic',
-        'adx': 'ADX',
-        'obv': 'OBV',
-        'mfi': 'MFI',
-        'cci': 'CCI',
-        'williams': 'Williams %R',
         'vwap': 'VWAP',
-        'portfolio': 'Portfolio State',
+        'portfolio_holdings': 'Portfolio Holdings',
+        'avg_price_ratio': 'Avg Price Ratio',
+        'pl_percent': 'P/L Percent',
         'benchmark': 'Benchmark',
         'outperformance': 'Outperformance'
     }
@@ -207,7 +196,6 @@ def analyze_by_category(df):
     return category_df
 
 def analyze_by_timeframe(df):
-    """Analyze importance by timeframe"""
     print(f"\n{'='*60}")
     print("FEATURE IMPORTANCE BY TIMEFRAME")
     print(f"{'='*60}")
@@ -236,16 +224,14 @@ def analyze_by_timeframe(df):
         
         return tf_df
     else:
-        print("No timeframe-specific features found")
+        print("No timeframe features found")
         return None
 
 def save_quick_visualizations(df, category_df, timeframe_df):
-    """Create simple but informative visualizations"""
     print("\nCreating visualizations...")
     
     fig, axes = plt.subplots(2, 2, figsize=(16, 10))
     
-    # Top 30 features
     top_features = df.head(30)
     axes[0, 0].barh(range(len(top_features)), top_features['Combined_Score'])
     axes[0, 0].set_yticks(range(len(top_features)))
@@ -254,7 +240,6 @@ def save_quick_visualizations(df, category_df, timeframe_df):
     axes[0, 0].set_title('Top 30 Most Important Features')
     axes[0, 0].invert_yaxis()
     
-    # Category importance
     if category_df is not None:
         axes[0, 1].bar(range(len(category_df)), category_df['avg_importance'])
         axes[0, 1].set_xticks(range(len(category_df)))
@@ -262,7 +247,6 @@ def save_quick_visualizations(df, category_df, timeframe_df):
         axes[0, 1].set_ylabel('Average Importance')
         axes[0, 1].set_title('Feature Importance by Category')
     
-    # Timeframe importance
     if timeframe_df is not None:
         axes[1, 0].bar(range(len(timeframe_df)), timeframe_df['avg_importance'], color='green')
         axes[1, 0].set_xticks(range(len(timeframe_df)))
@@ -270,7 +254,6 @@ def save_quick_visualizations(df, category_df, timeframe_df):
         axes[1, 0].set_ylabel('Average Importance')
         axes[1, 0].set_title('Feature Importance by Timeframe')
     
-    # Distribution of importance scores
     axes[1, 1].hist(df['Combined_Score'], bins=50, alpha=0.7, edgecolor='black')
     axes[1, 1].set_xlabel('Combined Importance Score')
     axes[1, 1].set_ylabel('Number of Features')
@@ -324,55 +307,38 @@ if __name__ == "__main__":
     
     print("\nExtracting feature names...")
     feature_names = get_feature_names(env)
-    print(f"Total features: {len(feature_names)}")
+    print(f"Expected features from naming: {len(feature_names)}")
     
-    # Quick data collection (fewer episodes, fewer steps)
     states, actions = collect_data_samples(env, model, num_episodes=3, max_steps=50)
     
     print(f"\nCollected {len(states)} samples")
-    print(f"State shape: {states.shape}")
+    print(f"Actual state shape: {states.shape}")
     
-    # Handle size mismatch between feature names and actual state
     actual_feature_count = states.shape[1]
     if len(feature_names) != actual_feature_count:
-        print(f"\nWarning: Feature name count ({len(feature_names)}) doesn't match state size ({actual_feature_count})")
-        print(f"Adjusting feature names...")
+        print(f"\nAdjusting feature names: {len(feature_names)} -> {actual_feature_count}")
         
         if len(feature_names) < actual_feature_count:
-            # Add generic names for extra features
             for i in range(len(feature_names), actual_feature_count):
                 feature_names.append(f"feature_{i}")
         else:
-            # Truncate feature names
             feature_names = feature_names[:actual_feature_count]
         
         print(f"Adjusted to {len(feature_names)} feature names")
     
-    # Fast gradient importance (batched)
     gradient_importance = fast_gradient_importance(model, states, actions, batch_size=32)
-    
-    # Fast variance importance (no model needed)
     variance_importance = fast_variance_importance(states, sample_size=500)
-    
-    # Verify all arrays have the same length
     assert len(feature_names) == len(gradient_importance) == len(variance_importance), \
         f"Length mismatch: features={len(feature_names)}, gradient={len(gradient_importance)}, variance={len(variance_importance)}"
     
-    # Create importance table
     importance_df = create_importance_table(feature_names, gradient_importance, variance_importance, top_n=100)
-    
-    # Category analysis
     category_df = analyze_by_category(importance_df)
-    
-    # Timeframe analysis
     timeframe_df = analyze_by_timeframe(importance_df)
     
-    # Save results
     print("\nSaving results to CSV...")
     importance_df.to_csv('feature_importance_fast.csv', index=False)
     print("Saved 'feature_importance_fast.csv'")
     
-    # Save only top 500 features for quick review
     importance_df.head(500).to_csv('feature_importance_top500.csv', index=False)
     print("Saved 'feature_importance_top500.csv'")
     
@@ -384,23 +350,8 @@ if __name__ == "__main__":
         timeframe_df.to_csv('feature_importance_by_timeframe.csv')
         print("Saved 'feature_importance_by_timeframe.csv'")
     
-    # Save visualizations
     save_quick_visualizations(importance_df, category_df, timeframe_df)
     
     print("\n" + "="*100)
     print("ANALYSIS COMPLETE")
     print("="*100)
-    print("\nKey optimizations applied:")
-    print("  ✓ Reduced episodes: 3 (was 10)")
-    print("  ✓ Reduced steps per episode: 50 (was 200)")
-    print("  ✓ Reduced gradient samples: 150 (was 100+)")
-    print("  ✓ Removed slow permutation importance")
-    print("  ✓ Added fast variance-based importance")
-    print("  ✓ Increased batch size for GPU efficiency")
-    print(f"  ✓ Analyzed all {len(feature_names)} features")
-    print("\nGenerated files:")
-    print("  - feature_importance_fast.csv (all features)")
-    print("  - feature_importance_top500.csv (top 500 for quick review)")
-    print("  - feature_importance_by_category.csv")
-    print("  - feature_importance_by_timeframe.csv")
-    print("  - feature_importance_fast.png")
