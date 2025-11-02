@@ -434,7 +434,7 @@ class PortfolioEnv():
         
         # Calculate trades needed with threshold check
         total_fees = 0.0
-        rebalance_threshold = 0.025  # 2.5% threshold
+        rebalance_threshold = 0.015  # Reduced from 0.025 to 1.5% for more active rebalancing
         
         # FIXED: Track pending buy orders to ensure we don't exceed available cash
         pending_buys = []
@@ -658,7 +658,16 @@ class PortfolioEnv():
             portfolio_weighted_return += weight * future_profits[symbol]
         
         # Reward alignment with future opportunities
-        future_alignment_reward = portfolio_weighted_return * 400
+        future_alignment_reward = portfolio_weighted_return * 300  # Reduced from 400
+        
+        # Penalize if too concentrated on one opportunity
+        max_future_return = max(future_returns_list) if future_returns_list else 0
+        if max_future_return > 0.02:
+            # Check if portfolio is overly concentrated on the top performer
+            top_symbols = [s for s in self.df.keys() if future_profits[s] > max_future_return * 0.8]
+            top_concentration = sum(portfolio_weights.get(s, 0) for s in top_symbols)
+            if top_concentration > 0.6:
+                future_alignment_reward -= (top_concentration - 0.5) * 100
         
         # ===== 4. RISK-ADJUSTED RETURNS (Sharpe-like) =====
         future_returns_list = list(future_profits.values())
@@ -720,10 +729,17 @@ class PortfolioEnv():
         
         # A. Concentration risk
         concentration = sum(w ** 2 for w in portfolio_weights.values())
-        if concentration > 0.6:  # Too concentrated
-            position_score -= (concentration - 0.5) * 100
-        elif concentration < 0.15:  # Too diversified (diluted)
-            position_score -= (0.15 - concentration) * 80
+        
+        # Stronger penalty for over-concentration
+        if concentration > 0.4:  # Too concentrated (lowered threshold)
+            position_score -= (concentration - 0.3) ** 2 * 300  # Quadratic penalty
+        elif concentration < 0.12:  # Too diversified (diluted)
+            position_score -= (0.12 - concentration) * 80
+        
+        # Additional check: penalize single-asset dominance
+        max_weight = max(portfolio_weights.values()) if portfolio_weights else 0
+        if max_weight > 0.5:  # Single asset >50%
+            position_score -= (max_weight - 0.4) * 200
         
         # B. Cash management
         cash_weight = self.portfolio['cash'] / current_value if current_value > 0 else 1.0
