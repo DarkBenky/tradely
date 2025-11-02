@@ -436,12 +436,12 @@ if __name__ == "__main__":
         "pretrain_batch_size": 512,
         "pretrain_chunk_size": 256 * 10,
         "online_total_batches": 5000,
-        "online_batch_size": 256,
+        "online_batch_size": 64,
         "gamma": 0.99,
         "lr_patience": 100,
         "lr_decay": 0.5,
         "log_step_frequency": 1,
-        "epsilon_start": 0.125,
+        "epsilon_start": 0.025,
         "epsilon_end": 0.02,
         "epsilon_decay": 0.9995,
         "env_reset_probability": 0.75,
@@ -504,6 +504,7 @@ if __name__ == "__main__":
     epsilon = config.epsilon_start
     
     recent_rewards = deque(maxlen=50)
+    recent_losses = deque(maxlen=50)
     
     print(f"\n{'='*80}")
     print("STARTING BATCH TRAINING LOOP")
@@ -546,11 +547,18 @@ if __name__ == "__main__":
         if len(states) > 0:
             batch_metrics = train_on_batch(model, optimizer, states, actions, returns, batch_count)
             train_time = time.time() - train_start
+            recent_losses.append(batch_metrics['batch/loss'])
         else:
             batch_metrics = {'batch/loss': 0.0}
             train_time = 0.0
         
         avg_recent_reward = np.mean(recent_rewards) if recent_rewards else batch_info['total_reward']
+        
+        if len(recent_losses) > 1:
+            weights = np.linspace(0.5, 1.0, len(recent_losses))
+            weighted_avg_loss = np.average(list(recent_losses), weights=weights)
+        else:
+            weighted_avg_loss = batch_metrics['batch/loss']
         
         batch_metrics.update({
             'batch/number': batch_count,
@@ -558,6 +566,7 @@ if __name__ == "__main__":
             'batch/steps_collected': steps_collected,
             'batch/total_reward': batch_info['total_reward'],
             'batch/avg_recent_reward': avg_recent_reward,
+            'batch/weighted_avg_loss': weighted_avg_loss,
             'batch/portfolio_value': batch_info['portfolio_value'],
             'batch/benchmark_value': batch_info['benchmark_value'],
             'batch/outperformance': (batch_info['outperformance'] - 1) * 100,
