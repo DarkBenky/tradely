@@ -76,7 +76,7 @@ def build_model(obs_shape, num_assets, config=None):
     return model
 
 def collect_batch_data(env, model, batch_size, gamma, current_step, epsilon=0.1, env_reset_probability=0.05):
-    states, actions, rewards = [], [], []
+    states, actions, rewards, is_random_flags = [], [], [], []
     step_logs = []
     
     if current_step >= env.max_steps or random.random() < env_reset_probability:
@@ -93,17 +93,16 @@ def collect_batch_data(env, model, batch_size, gamma, current_step, epsilon=0.1,
         state_tensor = tf.convert_to_tensor(state[np.newaxis, :], dtype=tf.float32)
         action_probs = model(state_tensor, training=False)
         action = action_probs[0].numpy()
-
-        # Epsilon-greedy exploration with noise
+        
+        is_random = False
+        
         if random.random() < epsilon:
-            # Full random action
             action = env.sample()
+            is_random = True
         elif random.random() < epsilon * 2:
-            # Add Gaussian noise to model action for exploration
             noise = np.random.normal(0, 0.1, size=action.shape)
             action = action + noise
             action = np.clip(action, 0, 1)
-            # Re-normalize to ensure sum = 1
             action = action / action.sum()
         
         next_state, reward, done, info = env.step(action)
@@ -112,6 +111,7 @@ def collect_batch_data(env, model, batch_size, gamma, current_step, epsilon=0.1,
         states.append(state)
         actions.append(action)
         rewards.append(reward)
+        is_random_flags.append(is_random)
         
         step_log = {
             'step_global': current_step + steps_collected,
@@ -159,11 +159,15 @@ def collect_batch_data(env, model, batch_size, gamma, current_step, epsilon=0.1,
         returns = np.array(returns, dtype=np.float32)
         returns = (returns - returns.mean()) / (returns.std() + 1e-8)
 
-    if not os.path.exists("trainData"):
-        os.makedirs("trainData")
+    train_data_dir = "/media/user/HDD 1TB/Data"
+    if not os.path.exists(train_data_dir):
+        os.makedirs(train_data_dir)
 
-    with open("trainData/training_data.pkl", 'ab') as f:
-        pickle.dump({'states': states, 'actions': actions, 'returns': returns}, f)
+    with open(os.path.join(train_data_dir, "training_data.pkl"), 'ab') as f:
+        pickle.dump({'states': states, 'actions': actions, 'returns': returns, 'is_random': is_random_flags}, f)
+    
+    random_count = sum(is_random_flags)
+    policy_count = len(is_random_flags) - random_count
     
     batch_info = {
         'steps_collected': steps_collected,
@@ -171,21 +175,27 @@ def collect_batch_data(env, model, batch_size, gamma, current_step, epsilon=0.1,
         'portfolio_value': info.get('portfolio_value', 0) if steps_collected > 0 else 0,
         'benchmark_value': info.get('benchmark_value', 0) if steps_collected > 0 else 0,
         'outperformance': info.get('outperformance', 0) if steps_collected > 0 else 0,
-        'done': done
+        'done': done,
+        'random_actions': random_count,
+        'policy_actions': policy_count
     }
     
-    return states, actions, returns, batch_info, step_logs
+    return states, actions, returns, is_random_flags, batch_info, step_logs
 
-def train_on_batch(model, optimizer, batch_states, batch_actions, batch_returns, batch_num):
+def train_on_batch(model, optimizer, batch_states, batch_actions, batch_returns, is_random_flags, batch_num):
     states_batch = np.array(batch_states, dtype=np.float32)
     actions_batch = np.array(batch_actions, dtype=np.float32)
     returns_batch = np.array(batch_returns, dtype=np.float32)
+    is_random_batch = np.array(is_random_flags, dtype=np.float32)
+    
+    importance_weights = np.where(is_random_batch == 1.0, 0.5, 1.0)
     
     with tf.GradientTape() as tape:
         action_probs = model(states_batch, training=True)
         action_probs_clipped = tf.clip_by_value(action_probs, 1e-8, 1.0)
         log_probs = tf.reduce_sum(actions_batch * tf.math.log(action_probs_clipped), axis=1)
-        loss = -tf.reduce_mean(log_probs * returns_batch)
+        weighted_log_probs = log_probs * importance_weights
+        loss = -tf.reduce_mean(weighted_log_probs * returns_batch)
     
     grads = tape.gradient(loss, model.trainable_variables)
     grads = [tf.clip_by_norm(g, 1.0) for g in grads]
@@ -202,6 +212,7 @@ def train_on_batch(model, optimizer, batch_states, batch_actions, batch_returns,
         'batch/mean_return': np.mean(batch_returns),
         'batch/std_return': np.std(batch_returns),
         'batch/grad_norm': tf.linalg.global_norm(grads).numpy() if grads[0] is not None else 0.0,
+        'batch/random_action_ratio': np.mean(is_random_batch),
     }
     
     return metrics
@@ -209,7 +220,8 @@ def train_on_batch(model, optimizer, batch_states, batch_actions, batch_returns,
 def offline_pretrain(env, model, optimizer, num_episodes=50, gamma=0.99, batch_size=256, epochs=20, chunk_size=10000):
     print("\n=== OFFLINE PRETRAINING (MEMORY OPTIMIZED) ===")
     
-    pkl_file = 'trainData/training_data.pkl'
+    # pkl_file = '/media/user/HDD 1TB/Data/training_data.pkl'
+    pkl_file = '/media/user/HDD 1TB/Data/synthetic_training_data.pkl'
     
     if not os.path.exists(pkl_file):
         print(f"{pkl_file} not found, skipping pretraining")
@@ -432,11 +444,11 @@ if __name__ == "__main__":
         "embedding_dim": 2048,
         "initial_lr": 0.001,
         "pretrain_episodes": 10,
-        "pretrain_epochs": 0,
-        "pretrain_batch_size": 512,
+        "pretrain_epochs": 20,
+        "pretrain_batch_size": 256,
         "pretrain_chunk_size": 256 * 10,
         "online_total_batches": 5000,
-        "online_batch_size": 64,
+        "online_batch_size": 512,
         "gamma": 0.99,
         "lr_patience": 100,
         "lr_decay": 0.5,
@@ -477,7 +489,7 @@ if __name__ == "__main__":
         print("Pretrained model loaded successfully!\n")
         # ENABLE_PRETRAINING = False
 
-    if (not os.path.exists('trainData') or not os.path.isdir('trainData')) and not os.path.exists('trainData/training_data.pkl'):
+    if not os.path.exists('/media/user/HDD 1TB/Data/training_data.pkl') or not os.path.exists('/media/user/HDD 1TB/Data/synthetic_training_data.pkl'):
         print("No pretraining data found, skipping pretraining")
         ENABLE_PRETRAINING = False
     
@@ -517,7 +529,7 @@ if __name__ == "__main__":
         print(f"\n--- Batch {batch_count}/{config.online_total_batches} ---")
         
         collect_start = time.time()
-        states, actions, returns, batch_info, step_logs = collect_batch_data(
+        states, actions, returns, is_random_flags, batch_info, step_logs = collect_batch_data(
             env, model, config.online_batch_size, config.gamma, global_step, epsilon, config.env_reset_probability
         )
         collect_time = time.time() - collect_start
@@ -545,7 +557,7 @@ if __name__ == "__main__":
         
         train_start = time.time()
         if len(states) > 0:
-            batch_metrics = train_on_batch(model, optimizer, states, actions, returns, batch_count)
+            batch_metrics = train_on_batch(model, optimizer, states, actions, returns, is_random_flags, batch_count)
             train_time = time.time() - train_start
             recent_losses.append(batch_metrics['batch/loss'])
         else:
