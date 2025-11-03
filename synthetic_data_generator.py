@@ -4,6 +4,51 @@ import pickle
 from portfolio_env import PortfolioEnv
 from scipy.optimize import minimize
 import os
+from multiprocessing import Pool, cpu_count
+import gc
+
+
+def _generate_batch_worker(params):
+    """
+    Worker function for parallel batch generation.
+    Creates its own environment to avoid pickling issues.
+    
+    Args:
+        params: Tuple of (batch_idx, num_batches, samples_per_batch, start_idx, method, gamma)
+    
+    Returns:
+        Generated batch dictionary
+    """
+    batch_idx, num_batches, samples_per_batch, start_idx, method, gamma = params
+    
+    print(f"\n=== Batch {batch_idx+1}/{num_batches} (Method: {method}) ===")
+    
+    try:
+        # Create environment for this worker
+        env = PortfolioEnv(max_records=100_000)
+        
+        # Create generator
+        generator = SyntheticDataGenerator(env, lookforward_steps=30)
+        
+        # Generate batch
+        batch = generator.generate_synthetic_batch(
+            num_samples=samples_per_batch,
+            start_idx=start_idx,
+            method=method,
+            gamma=gamma
+        )
+        
+        # Clean up to free memory
+        del env
+        del generator
+        gc.collect()
+        
+        return batch
+        
+    except Exception as e:
+        print(f"Error generating batch {batch_idx+1}: {e}")
+        return None
+
 
 class SyntheticDataGenerator:
     """
@@ -279,21 +324,22 @@ class SyntheticDataGenerator:
         
         return all_batches
     
-    def generate_diverse_batches(self, num_batches, samples_per_batch, gamma=0.99, save_path=None):
+    def generate_diverse_batches(self, num_batches, samples_per_batch, gamma=0.99, save_path=None, num_workers=None):
         """
         Generate batches using different optimization methods for diversity.
+        Uses multiprocessing for parallel batch generation.
         
         Args:
             num_batches: Number of batches to generate
             samples_per_batch: Number of samples per batch
             gamma: Discount factor
             save_path: Path to save the generated data
+            num_workers: Number of parallel workers (defaults to CPU count - 1)
         
         Returns:
             List of batch dictionaries
         """
         methods = ['sharpe', 'returns', 'kelly']
-        all_batches = []
         
         total_length = len(self.env.df[list(self.env.df.keys())[0]])
         max_start = total_length - self.lookforward_steps - samples_per_batch - 1
@@ -307,29 +353,39 @@ class SyntheticDataGenerator:
         if save_path:
             os.makedirs(os.path.dirname(save_path), exist_ok=True)
         
+        # Determine number of workers
+        if num_workers is None:
+            num_workers = max(1, cpu_count() - 1)
+        
+        # Ensure num_workers is an integer
+        num_workers = int(num_workers)
+        
+        print(f"Using {num_workers} worker processes for parallel generation")
+        
+        # Generate batch parameters
+        batch_params = []
         for batch_idx in range(num_batches):
             method = methods[batch_idx % len(methods)]
             start_idx = np.random.randint(0, max(1, max_start))
-            
-            print(f"\n=== Batch {batch_idx+1}/{num_batches} (Method: {method}) ===")
-            batch = self.generate_synthetic_batch(
-                num_samples=samples_per_batch,
-                start_idx=start_idx,
-                method=method,
-                gamma=gamma
-            )
-            all_batches.append(batch)
-            
-            # Save immediately after generating each batch (append mode)
-            if save_path:
-                with open(save_path, 'ab') as f:
-                    pickle.dump(batch, f)
-                print(f"Batch {batch_idx+1} saved to {save_path}")
+            batch_params.append((batch_idx, num_batches, samples_per_batch, start_idx, method, gamma))
+        
+        # Process batches in parallel
+        with Pool(processes=num_workers) as pool:
+            for batch_idx, batch in enumerate(pool.imap(_generate_batch_worker, batch_params)):
+                # Save immediately after generating each batch (append mode)
+                if save_path and batch is not None:
+                    with open(save_path, 'ab') as f:
+                        pickle.dump(batch, f)
+                    print(f"Batch {batch_idx+1}/{num_batches} saved to {save_path}")
+                
+                # Clear memory after each batch
+                gc.collect()
         
         if save_path:
             print(f"\nAll {num_batches} batches saved to {save_path}")
         
-        return all_batches
+        # Return empty list to save memory (data is already saved to disk)
+        return []
 
 
 if __name__ == "__main__":
@@ -346,28 +402,23 @@ if __name__ == "__main__":
     num_batches = 128
     samples_per_batch = 128
     save_path = "/media/user/HDD 1TB/Data/synthetic_training_data.pkl"
+    num_workers = max(1, int((cpu_count() - 1) / 4))  # Use all cores except one
     
     # Generate diverse batches using different optimization methods
     print(f"\nGenerating {num_batches} batches with {samples_per_batch} samples each...")
+    print(f"Using {num_workers} parallel workers")
     print("Using diverse optimization methods: Sharpe ratio, Returns, Kelly criterion\n")
     
     batches = generator.generate_diverse_batches(
         num_batches=num_batches,
         samples_per_batch=samples_per_batch,
         gamma=0.99,
-        save_path=save_path
+        save_path=save_path,
+        num_workers=num_workers
     )
-    
-    # Statistics
-    total_samples = sum(len(batch['states']) for batch in batches)
-    avg_rewards = [np.mean([r for r in batch['returns']]) for batch in batches]
     
     print(f"\n{'='*80}")
     print("GENERATION COMPLETE!")
     print(f"{'='*80}")
-    print(f"Total batches: {len(batches)}")
-    print(f"Total samples: {total_samples}")
-    print(f"Average batch size: {total_samples / len(batches):.1f}")
-    print(f"Mean normalized return: {np.mean(avg_rewards):.4f}")
-    print(f"Std normalized return: {np.std(avg_rewards):.4f}")
+    print(f"Total batches: {num_batches}")
     print(f"Data saved to: {save_path}")
