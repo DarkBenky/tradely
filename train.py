@@ -15,46 +15,77 @@ import random
 
 DEBUG = False
 
+try:
+    from feature_reducer import FeatureReducer
+    FEATURE_REDUCER = None
+    
+    # Try to load autoencoder-based feature reducer
+    base_path = 'feature_reducer'
+    if os.path.exists(f'{base_path}_encoder.h5'):
+        FEATURE_REDUCER = FeatureReducer.load('feature_reducer.h5')
+        print(f"Loaded feature reducer: {FEATURE_REDUCER.input_dim} → {FEATURE_REDUCER.target_dim} dims")
+except:
+    FEATURE_REDUCER = None
+    print("Feature reducer not found - using raw observations")
+
 class TransformerBlock(layers.Layer):
     def __init__(self, embed_dim, num_heads, ff_dim, rate=0.1):
         super().__init__()
         self.att = layers.MultiHeadAttention(num_heads=num_heads, key_dim=embed_dim)
         self.ffn = tf.keras.Sequential([
-            layers.Dense(ff_dim, activation='relu'),
+            layers.Dense(ff_dim, activation='gelu'),
+            layers.Dropout(rate),
             layers.Dense(embed_dim),
         ])
         self.layernorm1 = layers.LayerNormalization(epsilon=1e-6)
         self.layernorm2 = layers.LayerNormalization(epsilon=1e-6)
         self.dropout1 = layers.Dropout(rate)
-        self.dropout2 = layers.Dropout(rate)
 
     def call(self, inputs, training=False):
         attn_output = self.att(inputs, inputs)
         attn_output = self.dropout1(attn_output, training=training)
         out1 = self.layernorm1(inputs + attn_output)
         ffn_output = self.ffn(out1)
-        ffn_output = self.dropout2(ffn_output, training=training)
         return self.layernorm2(out1 + ffn_output)
+
+class FeatureExtractor(layers.Layer):
+    def __init__(self, output_dim, rate=0.1):
+        super().__init__()
+        self.dense1 = layers.Dense(output_dim * 2, activation='gelu')
+        self.bn1 = layers.BatchNormalization()
+        self.dropout1 = layers.Dropout(rate)
+        self.dense2 = layers.Dense(output_dim, activation='gelu')
+        self.bn2 = layers.BatchNormalization()
+        self.dropout2 = layers.Dropout(rate * 0.5)
+        
+    def call(self, inputs, training=False):
+        x = self.dense1(inputs)
+        x = self.bn1(x, training=training)
+        x = self.dropout1(x, training=training)
+        x = self.dense2(x)
+        x = self.bn2(x, training=training)
+        x = self.dropout2(x, training=training)
+        return x
 
 def build_model(obs_shape, num_assets, config=None):
     if config is None:
         config = {
-            "num_transformer_blocks": 3,
-            "embed_dim": 128,
-            "num_heads": 8,
-            "ff_dim": 512,
-            "dropout_rate": 0.2,
-            "dense_hidden": 256,
-            "embedding_dim": 512
+            "num_transformer_blocks": 4,
+            "embed_dim": 192,
+            "num_heads": 12,
+            "ff_dim": 768,
+            "dropout_rate": 0.15,
+            "feature_extractor_dim": 384,
+            "num_attention_blocks": 2,
         }
     
     inputs = layers.Input(shape=obs_shape)
     
-    x = layers.Dense(config["embedding_dim"], activation='relu')(inputs)
-    x = layers.BatchNormalization()(x)
-    x = layers.Dropout(config["dropout_rate"])(x)
+    # Feature extraction (works with any input size)
+    x = FeatureExtractor(config["feature_extractor_dim"], config["dropout_rate"])(inputs)
     
-    seq_len = config["embedding_dim"] // config["embed_dim"]
+    # Self-attention on compressed features
+    seq_len = config["feature_extractor_dim"] // config["embed_dim"]
     x = layers.Reshape((seq_len, config["embed_dim"]))(x)
     
     for _ in range(config["num_transformer_blocks"]):
@@ -65,12 +96,29 @@ def build_model(obs_shape, num_assets, config=None):
             rate=config["dropout_rate"]
         )(x)
     
-    x = layers.GlobalAveragePooling1D()(x)
-    x = layers.Dense(config["dense_hidden"], activation='relu')(x)
-    x = layers.Dropout(config["dropout_rate"] * 1.5)(x)
-    x = layers.Dense(128, activation='relu')(x)
+    # Multi-head pooling
+    avg_pool = layers.GlobalAveragePooling1D()(x)
+    max_pool = layers.GlobalMaxPooling1D()(x)
+    x = layers.Concatenate()([avg_pool, max_pool])
     
-    outputs = layers.Dense(num_assets, activation='softmax')(x)
+    # Additional attention block
+    x = layers.Dense(config["embed_dim"] * 2, activation='gelu')(x)
+    x = layers.LayerNormalization()(x)
+    x = layers.Dropout(config["dropout_rate"])(x)
+    
+    for _ in range(config["num_attention_blocks"]):
+        residual = x
+        x = layers.Dense(config["embed_dim"] * 2, activation='gelu')(x)
+        x = layers.Dropout(config["dropout_rate"] * 0.5)(x)
+        x = layers.Dense(config["embed_dim"] * 2)(x)
+        x = layers.Add()([x, residual])
+        x = layers.LayerNormalization()(x)
+    
+    # Output head with uncertainty
+    x = layers.Dense(config["embed_dim"], activation='gelu')(x)
+    x = layers.Dropout(config["dropout_rate"])(x)
+    
+    outputs = layers.Dense(num_assets, activation='softmax', name='portfolio_allocation')(x)
     
     model = Model(inputs=inputs, outputs=outputs)
     return model
@@ -83,6 +131,10 @@ def collect_batch_data(env, model, batch_size, gamma, current_step, epsilon=0.1,
         state = env.reset()
     else:
         state = env.get_observation()
+    
+    # Apply feature reduction if available
+    if FEATURE_REDUCER is not None:
+        state = FEATURE_REDUCER.transform(state.reshape(1, -1))[0]
     
     done = False
     steps_collected = 0
@@ -107,6 +159,10 @@ def collect_batch_data(env, model, batch_size, gamma, current_step, epsilon=0.1,
         
         next_state, reward, done, info = env.step(action)
         env.render()
+        
+        # Apply feature reduction to next state
+        if FEATURE_REDUCER is not None:
+            next_state = FEATURE_REDUCER.transform(next_state.reshape(1, -1))[0]
 
         states.append(state)
         actions.append(action)
@@ -220,12 +276,27 @@ def train_on_batch(model, optimizer, batch_states, batch_actions, batch_returns,
 def offline_pretrain(env, model, optimizer, num_episodes=50, gamma=0.99, batch_size=256, epochs=20, chunk_size=10000):
     print("\n=== OFFLINE PRETRAINING (MEMORY OPTIMIZED) ===")
     
-    # pkl_file = '/media/user/HDD 1TB/Data/training_data.pkl'
-    pkl_file = '/media/user/HDD 1TB/Data/synthetic_training_data.pkl'
+    # Try compressed data first, fallback to raw
+    pkl_files = [
+        '/media/user/HDD 1TB/Data/synthetic_training_data_compressed.pkl',
+        '/media/user/HDD 1TB/Data/synthetic_training_data.pkl'
+    ]
     
-    if not os.path.exists(pkl_file):
-        print(f"{pkl_file} not found, skipping pretraining")
+    pkl_file = None
+    for f in pkl_files:
+        if os.path.exists(f):
+            pkl_file = f
+            break
+    
+    if pkl_file is None:
+        print("No pretraining data found, skipping pretraining")
         return
+    
+    is_compressed = 'compressed' in pkl_file
+    print(f"Loading data from {pkl_file} ({'compressed' if is_compressed else 'raw'})...")
+    
+    if not is_compressed and FEATURE_REDUCER is None:
+        print("Warning: Using raw data but no feature reducer available!")
     
     print(f"Loading data from {pkl_file} in chunks of {chunk_size} samples...")
     
@@ -249,7 +320,14 @@ def offline_pretrain(env, model, optimizer, num_episodes=50, gamma=0.99, batch_s
                 try:
                     batch_data = pickle.load(f)
                     if isinstance(batch_data, dict):
-                        chunk_states.extend(batch_data.get('states', []))
+                        states_to_add = batch_data.get('states', [])
+                        
+                        # Apply feature reduction if using raw data
+                        if not is_compressed and FEATURE_REDUCER is not None:
+                            states_to_add = [FEATURE_REDUCER.transform(np.array(s).reshape(1, -1))[0].tolist() 
+                                           for s in states_to_add]
+                        
+                        chunk_states.extend(states_to_add)
                         chunk_actions.extend(batch_data.get('actions', []))
                         chunk_returns.extend(batch_data.get('returns', []))
                     
@@ -434,26 +512,26 @@ if __name__ == "__main__":
     ENABLE_PRETRAINING = True
     
     config = {
-        "architecture": "transformer",
-        "num_transformer_blocks": 5,
-        "embed_dim": 256,
-        "num_heads": 8,
-        "ff_dim": 512,
-        "dropout_rate": 0.2,
-        "dense_hidden": 256,
-        "embedding_dim": 2048,
-        "initial_lr": 0.001,
+        "architecture": "transformer_v2",
+        "num_transformer_blocks": 8,
+        "embed_dim": 192,
+        "num_heads": 12,
+        "ff_dim": 768,
+        "dropout_rate": 0.15,
+        "feature_extractor_dim": 384,
+        "num_attention_blocks": 2,
+        "initial_lr": 0.0005,
         "pretrain_episodes": 10,
-        "pretrain_epochs": 20,
-        "pretrain_batch_size": 256,
-        "pretrain_chunk_size": 256 * 10,
+        "pretrain_epochs": 10,
+        "pretrain_batch_size": 512,
+        "pretrain_chunk_size": 512 * 10,
         "online_total_batches": 5000,
         "online_batch_size": 512,
         "gamma": 0.99,
         "lr_patience": 100,
         "lr_decay": 0.5,
         "log_step_frequency": 1,
-        "epsilon_start": 0.025,
+        "epsilon_start": 0.125,
         "epsilon_end": 0.02,
         "epsilon_decay": 0.9995,
         "env_reset_probability": 0.75,
@@ -465,6 +543,11 @@ if __name__ == "__main__":
     print("Initializing environment...")
     env = PortfolioEnv(max_records=100_000)
     observation = env.reset()
+    
+    # Apply feature reduction if available
+    if FEATURE_REDUCER is not None:
+        observation = FEATURE_REDUCER.transform(observation.reshape(1, -1))[0]
+        print(f"Using feature reducer: {FEATURE_REDUCER.input_dim} → {len(observation)} dims")
     
     obs_shape = observation.shape
     num_assets = len(env.asset_names)
@@ -489,7 +572,10 @@ if __name__ == "__main__":
         print("Pretrained model loaded successfully!\n")
         # ENABLE_PRETRAINING = False
 
-    if not os.path.exists('/media/user/HDD 1TB/Data/training_data.pkl') or not os.path.exists('/media/user/HDD 1TB/Data/synthetic_training_data.pkl'):
+    if not os.path.exists('/media/user/HDD 1TB/Data/training_data.pkl') and \
+       not os.path.exists('/media/user/HDD 1TB/Data/training_data_compressed.pkl') and \
+       not os.path.exists('/media/user/HDD 1TB/Data/synthetic_training_data.pkl') and \
+       not os.path.exists('/media/user/HDD 1TB/Data/synthetic_training_data_compressed.pkl'):
         print("No pretraining data found, skipping pretraining")
         ENABLE_PRETRAINING = False
     

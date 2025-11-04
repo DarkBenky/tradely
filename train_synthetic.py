@@ -10,8 +10,17 @@ import gc
 from portfolio_env import PortfolioEnv
 from train import build_model, train_on_batch
 
-def load_synthetic_data(file_path):
-    """Load all synthetic batches from pickle file"""
+def load_synthetic_data_chunked(file_path, max_batches=None):
+    """
+    Load synthetic batches from pickle file in a memory-efficient way.
+    
+    Args:
+        file_path: Path to the pickle file
+        max_batches: Maximum number of batches to load (None for all)
+    
+    Returns:
+        List of batch dictionaries
+    """
     batches = []
     
     if not os.path.exists(file_path):
@@ -20,11 +29,18 @@ def load_synthetic_data(file_path):
     
     print(f"Loading synthetic data from {file_path}...")
     
+    batch_count = 0
     with open(file_path, 'rb') as f:
         while True:
             try:
                 batch = pickle.load(f)
                 batches.append(batch)
+                batch_count += 1
+                
+                if max_batches and batch_count >= max_batches:
+                    print(f"Reached max_batches limit ({max_batches}), stopping load")
+                    break
+                    
             except EOFError:
                 break
     
@@ -33,9 +49,10 @@ def load_synthetic_data(file_path):
     
     return batches
 
-def train_on_synthetic_data(model, optimizer, batches, epochs=10, batch_size=64):
+def train_on_synthetic_data(model, optimizer, batches, epochs=10, batch_size=64, max_samples=None):
     """
     Train model on synthetic data with optimal actions.
+    Memory-efficient: processes data in chunks without loading all at once.
     
     Args:
         model: The neural network model
@@ -43,6 +60,7 @@ def train_on_synthetic_data(model, optimizer, batches, epochs=10, batch_size=64)
         batches: List of batch dictionaries from synthetic generator
         epochs: Number of training epochs
         batch_size: Mini-batch size for training
+        max_samples: Maximum number of samples to use (None for all)
     
     Returns:
         Training metrics
@@ -56,11 +74,24 @@ def train_on_synthetic_data(model, optimizer, batches, epochs=10, batch_size=64)
     all_returns = []
     all_is_random = []
     
+    sample_count = 0
     for batch in batches:
+        batch_samples = len(batch['states'])
+        
+        if max_samples and sample_count + batch_samples > max_samples:
+            # Take only partial batch to reach max_samples
+            remaining = max_samples - sample_count
+            all_states.extend(batch['states'][:remaining])
+            all_actions.extend(batch['actions'][:remaining])
+            all_returns.extend(batch['returns'][:remaining])
+            all_is_random.extend(batch['is_random'][:remaining])
+            break
+        
         all_states.extend(batch['states'])
         all_actions.extend(batch['actions'])
         all_returns.extend(batch['returns'])
         all_is_random.extend(batch['is_random'])
+        sample_count += batch_samples
     
     all_states = np.array(all_states, dtype=np.float32)
     all_actions = np.array(all_actions, dtype=np.float32)
@@ -144,7 +175,7 @@ def train_on_synthetic_data(model, optimizer, batches, epochs=10, batch_size=64)
         'final_entropy': avg_entropy
     }
 
-def iterative_synthetic_training(model, optimizer, synthetic_path, cycles=5, epochs_per_cycle=10):
+def iterative_synthetic_training(model, optimizer, synthetic_path, cycles=5, epochs_per_cycle=10, max_batches=None, max_samples=None):
     """
     Repeatedly train on synthetic data for multiple cycles.
     This allows the model to see the optimal actions many times.
@@ -155,6 +186,8 @@ def iterative_synthetic_training(model, optimizer, synthetic_path, cycles=5, epo
         synthetic_path: Path to synthetic data file
         cycles: Number of training cycles
         epochs_per_cycle: Epochs per cycle
+        max_batches: Maximum number of batches to load (None for all)
+        max_samples: Maximum number of samples to use per cycle (None for all)
     
     Returns:
         Training history
@@ -166,7 +199,7 @@ def iterative_synthetic_training(model, optimizer, synthetic_path, cycles=5, epo
     print(f"Epochs per cycle: {epochs_per_cycle}")
     
     # Load synthetic data once
-    batches = load_synthetic_data(synthetic_path)
+    batches = load_synthetic_data_chunked(synthetic_path, max_batches=max_batches)
     
     if len(batches) == 0:
         print("No synthetic data found!")
@@ -185,7 +218,8 @@ def iterative_synthetic_training(model, optimizer, synthetic_path, cycles=5, epo
         metrics = train_on_synthetic_data(
             model, optimizer, batches, 
             epochs=epochs_per_cycle, 
-            batch_size=64
+            batch_size=64,
+            max_samples=max_samples
         )
         
         cycle_time = time.time() - cycle_start
@@ -213,18 +247,20 @@ def iterative_synthetic_training(model, optimizer, synthetic_path, cycles=5, epo
 
 if __name__ == "__main__":
     config = {
-        "architecture": "transformer",
-        "num_transformer_blocks": 5,
-        "embed_dim": 256,
-        "num_heads": 8,
-        "ff_dim": 512,
-        "dropout_rate": 0.2,
-        "dense_hidden": 256,
-        "embedding_dim": 2048,
-        "learning_rate": 0.0005,
+        "architecture": "transformer_v2",
+        "num_transformer_blocks": 4,
+        "embed_dim": 192,
+        "num_heads": 12,
+        "ff_dim": 768,
+        "dropout_rate": 0.15,
+        "feature_extractor_dim": 512,
+        "num_attention_blocks": 2,
+        "learning_rate": 0.0003,
         "training_cycles": 10,
         "epochs_per_cycle": 5,
         "batch_size": 64,
+        "max_batches": 10,
+        "max_samples": None,
     }
     
     wandb.init(project="portfolio-trading-synthetic", config=config)
@@ -250,10 +286,10 @@ if __name__ == "__main__":
     optimizer = tf.keras.optimizers.Adam(learning_rate=config.learning_rate)
     
     # Load existing model if available
-    best_model_path = 'best_model.weights.h5'
-    if os.path.exists(best_model_path):
-        print(f"\nLoading existing model from {best_model_path}...")
-        model.load_weights(best_model_path)
+    pretrained_model_path = 'best_model.weights.h5'
+    if os.path.exists(pretrained_model_path):
+        print(f"\nLoading existing model from {pretrained_model_path}...")
+        model.load_weights(pretrained_model_path)
         print("Model loaded successfully!")
     
     # Path to synthetic data
@@ -263,12 +299,14 @@ if __name__ == "__main__":
     history = iterative_synthetic_training(
         model, optimizer, synthetic_data_path,
         cycles=config.training_cycles,
-        epochs_per_cycle=config.epochs_per_cycle
+        epochs_per_cycle=config.epochs_per_cycle,
+        max_batches=config.max_batches,
+        max_samples=config.max_samples
     )
     
     if history:
-        # Save final model
-        final_model_path = 'best_model.weights.h5'
+        # Save final model as synthetic_trained_model.weights.h5
+        final_model_path = 'synthetic_trained_model.weights.h5'
         model.save_weights(final_model_path)
         wandb.save(final_model_path)
         
@@ -278,10 +316,6 @@ if __name__ == "__main__":
         print(f"Total cycles: {len(history)}")
         print(f"Final loss: {history[-1]['final_loss']:.4f}")
         print(f"Model saved to: {final_model_path}")
-        
-        # Copy to best_model.weights.h5 to use in main training
-        import shutil
-        shutil.copy(final_model_path, best_model_path)
-        print(f"Copied to {best_model_path} for use in online training")
+        print(f"\nNote: To use this model, copy it to best_model.weights.h5")
     
     wandb.finish()

@@ -8,3 +8,4 @@ logs
 trainData
 *.h5
 *.csv
+*.pkl
