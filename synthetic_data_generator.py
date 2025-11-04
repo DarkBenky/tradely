@@ -402,7 +402,7 @@ if __name__ == "__main__":
     num_batches = 1024
     samples_per_batch = 128
     save_path = "/media/user/HDD 1TB/Data/synthetic_training_data.pkl"
-    num_workers = max(1, int(cpu_count() / 2.25))  # Use all cores except one
+    num_workers = max(1, int(cpu_count() / 4))  # Use all cores except one
     
     # Generate diverse batches using different optimization methods
     print(f"\nGenerating {num_batches} batches with {samples_per_batch} samples each...")
