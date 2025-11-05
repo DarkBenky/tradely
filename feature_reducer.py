@@ -95,7 +95,7 @@ class FeatureReducer:
         print(f"  Decoder: {self.target_dim} → 512 → 1024 → {input_dim}")
         print(f"  Compression ratio: {input_dim / self.target_dim:.2f}x")
         
-    def fit(self, data_samples, epochs=100, batch_size=64, validation_split=0.1, use_wandb=True):
+    def fit(self, data_samples, epochs=100, batch_size=64, validation_split=0.1, use_wandb=True, incremental=False):
         """
         Train autoencoder on sample data to learn compression.
         
@@ -105,17 +105,20 @@ class FeatureReducer:
             batch_size: Batch size for training
             validation_split: Fraction of data for validation
             use_wandb: Whether to log to wandb
+            incremental: If True, continues training from existing weights
         """
-        print(f"\n{'='*80}")
-        print(f"TRAINING AUTOENCODER FEATURE REDUCER")
-        print(f"{'='*80}\n")
+        if not incremental:
+            print(f"\n{'='*80}")
+            print(f"TRAINING AUTOENCODER FEATURE REDUCER")
+            print(f"{'='*80}\n")
+        
         print(f"Training on {len(data_samples)} samples...")
         
         data_array = np.array(data_samples, dtype=np.float32)
         print(f"Original dimension: {data_array.shape[1]}")
         
-        # Initialize wandb
-        if use_wandb:
+        # Initialize wandb (only on first call, not incremental)
+        if use_wandb and not incremental:
             try:
                 import wandb
                 wandb.init(
@@ -128,7 +131,8 @@ class FeatureReducer:
                         "epochs": epochs,
                         "batch_size": batch_size,
                         "validation_split": validation_split,
-                        "samples": len(data_samples)
+                        "samples": len(data_samples),
+                        "incremental": True
                     }
                 )
                 print("Wandb logging enabled")
@@ -136,13 +140,20 @@ class FeatureReducer:
                 print("Wandb not available, skipping logging")
                 use_wandb = False
         
-        # Standardize
-        print("Standardizing data...")
-        data_scaled = self.scaler.fit_transform(data_array)
+        # Standardize - fit scaler only on first batch, transform on subsequent
+        if not self.is_fitted or not incremental:
+            print("Fitting scaler on data...")
+            data_scaled = self.scaler.fit_transform(data_array)
+        else:
+            print("Transforming data with existing scaler...")
+            data_scaled = self.scaler.transform(data_array)
         
-        # Build autoencoder
-        print("Building autoencoder...")
-        self._build_autoencoder(data_array.shape[1])
+        # Build autoencoder only if not already built
+        if self.autoencoder is None:
+            print("Building autoencoder...")
+            self._build_autoencoder(data_array.shape[1])
+        else:
+            print("Using existing autoencoder architecture...")
         
         # Train
         print(f"\nTraining for {epochs} epochs...")
@@ -340,6 +351,170 @@ class FeatureReducer:
         return reducer
 
 
+def train_reducer_incrementally(input_path, reducer_path='feature_reducer.h5', 
+                                 samples_per_batch=2048, epochs_per_batch=10, 
+                                 max_batches=None, use_wandb=True):
+    """
+    Train feature reducer incrementally by loading batches from file.
+    Memory-efficient: doesn't load entire dataset at once.
+    
+    Args:
+        input_path: Path to raw training data
+        reducer_path: Path to save feature reducer
+        samples_per_batch: Number of samples to load and train on at once
+        epochs_per_batch: Epochs to train on each batch
+        max_batches: Maximum number of batches to process (None = all)
+        use_wandb: Whether to log to wandb
+    """
+    print(f"\n{'='*80}")
+    print("INCREMENTAL FEATURE REDUCER TRAINING")
+    print(f"{'='*80}\n")
+    print(f"Input: {input_path}")
+    print(f"Samples per batch: {samples_per_batch}")
+    print(f"Epochs per batch: {epochs_per_batch}")
+    
+    # Initialize wandb
+    if use_wandb:
+        try:
+            import wandb
+            wandb.init(
+                project="tradely-feature-reducer-incremental",
+                config={
+                    "architecture": "autoencoder",
+                    "target_dim": 256,
+                    "samples_per_batch": samples_per_batch,
+                    "epochs_per_batch": epochs_per_batch,
+                    "training_mode": "incremental"
+                }
+            )
+            print("Wandb logging enabled\n")
+        except:
+            print("Wandb not available, skipping logging\n")
+            use_wandb = False
+    
+    reducer = None
+    batch_num = 0
+    total_samples = 0
+    
+    with open(input_path, 'rb') as f:
+        sample_buffer = []
+        
+        while True:
+            try:
+                batch = pickle.load(f)
+                
+                if isinstance(batch, dict) and 'states' in batch:
+                    sample_buffer.extend(batch['states'])
+                    
+                    # When buffer has enough samples, train
+                    while len(sample_buffer) >= samples_per_batch:
+                        batch_num += 1
+                        
+                        # Check max_batches limit
+                        if max_batches is not None and batch_num > max_batches:
+                            print(f"\nReached max_batches limit ({max_batches})")
+                            break
+                        
+                        # Take samples_per_batch samples
+                        training_samples = sample_buffer[:samples_per_batch]
+                        sample_buffer = sample_buffer[samples_per_batch:]
+                        
+                        print(f"\n{'='*60}")
+                        print(f"BATCH {batch_num} - Training on {len(training_samples)} samples")
+                        print(f"{'='*60}")
+                        
+                        # First batch: create and fit reducer
+                        if reducer is None:
+                            print("Creating new feature reducer...")
+                            reducer = FeatureReducer(target_dim=256)
+                            reducer.fit(training_samples, 
+                                       epochs=epochs_per_batch, 
+                                       batch_size=64,
+                                       validation_split=0.1,
+                                       use_wandb=use_wandb,
+                                       incremental=False)
+                        else:
+                            # Subsequent batches: incremental training
+                            print("Continuing incremental training...")
+                            reducer.fit(training_samples,
+                                       epochs=epochs_per_batch,
+                                       batch_size=64,
+                                       validation_split=0.1,
+                                       use_wandb=False,  # Don't reinit wandb
+                                       incremental=True)
+                        
+                        total_samples += len(training_samples)
+                        
+                        # Log batch metrics
+                        if use_wandb:
+                            try:
+                                import wandb
+                                wandb.log({
+                                    "batch/number": batch_num,
+                                    "batch/samples": len(training_samples),
+                                    "batch/total_samples": total_samples,
+                                })
+                            except:
+                                pass
+                        
+                        print(f"Total samples processed: {total_samples:,}")
+                        
+                        # Save checkpoint every 5 batches
+                        if batch_num % 5 == 0:
+                            checkpoint_path = reducer_path.replace('.h5', f'_checkpoint_batch{batch_num}.h5')
+                            reducer.save(checkpoint_path)
+                            print(f"Checkpoint saved: {checkpoint_path}")
+                        
+                        del training_samples
+                        
+                    if max_batches is not None and batch_num >= max_batches:
+                        break
+                        
+            except EOFError:
+                # Train on remaining samples if any
+                if len(sample_buffer) > 0 and reducer is not None:
+                    batch_num += 1
+                    print(f"\n{'='*60}")
+                    print(f"FINAL BATCH {batch_num} - Training on {len(sample_buffer)} samples")
+                    print(f"{'='*60}")
+                    
+                    reducer.fit(sample_buffer,
+                               epochs=epochs_per_batch,
+                               batch_size=64,
+                               validation_split=0.1,
+                               use_wandb=False,
+                               incremental=True)
+                    
+                    total_samples += len(sample_buffer)
+                break
+    
+    if reducer is None:
+        raise ValueError("No training data found in file!")
+    
+    # Save final model
+    reducer.save(reducer_path)
+    
+    print(f"\n{'='*80}")
+    print("INCREMENTAL TRAINING COMPLETE!")
+    print(f"{'='*80}")
+    print(f"Total batches: {batch_num}")
+    print(f"Total samples: {total_samples:,}")
+    print(f"Final model saved: {reducer_path}")
+    
+    if use_wandb:
+        try:
+            import wandb
+            wandb.log({
+                "final/total_batches": batch_num,
+                "final/total_samples": total_samples,
+            })
+            wandb.finish()
+        except:
+            pass
+    
+    return reducer
+
+
 def preprocess_training_data(input_path, output_path, reducer_path='feature_reducer.h5', batch_size=1024):
     """
     Preprocess training data in streaming mode: train autoencoder (if needed) and transform all data.
@@ -532,8 +707,39 @@ if __name__ == "__main__":
     
     reducer_path = "feature_reducer.pkl"
     
-    print("Feature Reducer - Training Data Preprocessor")
+    print("Feature Reducer - Incremental Training")
     print("=" * 80)
+    
+    # Check if old models exist and ask to remove
+    base_path = reducer_path.replace('.h5', '').replace('.pkl', '')
+    old_files = [
+        f"{base_path}_encoder.h5",
+        f"{base_path}_decoder.h5",
+        f"{base_path}_scaler.pkl"
+    ]
+    
+    existing_old_files = [f for f in old_files if os.path.exists(f)]
+    
+    if existing_old_files:
+        print("\n WARNING: Old model files found:")
+        for f in existing_old_files:
+            print(f"  - {f}")
+        
+        response = input("\nDo you want to DELETE old models and train from scratch? (yes/no): ").lower().strip()
+        
+        if response in ['yes', 'y']:
+            print("\n Deleting old model files...")
+            for f in existing_old_files:
+                try:
+                    os.remove(f)
+                    print(f"  ✓ Deleted: {f}")
+                except Exception as e:
+                    print(f"  ✗ Could not delete {f}: {e}")
+            print()
+        else:
+            print("\n Keeping old models. Exiting to prevent conflicts.")
+            print("   Either delete them manually or rename them before training.")
+            sys.exit(0)
     
     # Check which files exist
     has_synthetic = os.path.exists(synthetic_raw)
@@ -543,23 +749,56 @@ if __name__ == "__main__":
         print("No training data found!")
         sys.exit(1)
     
-    # Process synthetic data first (if exists) to fit reducer
+    # Choose training mode
+    print("\nTraining mode: INCREMENTAL (memory-efficient)")
+    print("  - Loads 2048 samples at a time")
+    print("  - Trains for 10 epochs per batch")
+    print("  - Continues training across batches\n")
+    
+    # Train incrementally on synthetic data (prioritize synthetic for diversity)
+    training_source = None
     if has_synthetic:
-        print("\n[1/2] Processing synthetic data...")
-        preprocess_training_data(synthetic_raw, synthetic_compressed, reducer_path)
+        print("Using synthetic data for training (more diverse)")
+        training_source = synthetic_raw
+    elif has_recorded:
+        print("Using recorded data for training")
+        training_source = recorded_raw
     
-    # Process recorded data with already-fitted reducer
-    if has_recorded:
-        print("\n[2/2] Processing recorded data...")
-        preprocess_training_data(recorded_raw, recorded_compressed, reducer_path)
-    
-    print(f"\n{'='*80}")
-    print("PREPROCESSING COMPLETE!")
-    print(f"{'='*80}")
-    print(f"\nFeature reducer saved to: {reducer_path}")
-    print("Use this reducer for all future data - no retraining needed!")
-    
-    if has_synthetic:
-        print(f"\nSynthetic data compressed: {synthetic_compressed}")
-    if has_recorded:
-        print(f"Recorded data compressed: {recorded_compressed}")
+    if training_source:
+        print(f"\nTraining feature reducer on {os.path.basename(training_source)}...")
+        reducer = train_reducer_incrementally(
+            input_path=training_source,
+            reducer_path=reducer_path,
+            samples_per_batch=2048,
+            epochs_per_batch=10,
+            max_batches=None,  # Train on all data
+            use_wandb=True
+        )
+        
+        print(f"\n{'='*80}")
+        print("REDUCER TRAINING COMPLETE!")
+        print(f"{'='*80}")
+        print(f"Feature reducer saved to: {reducer_path}")
+        
+        # Now compress both datasets using trained reducer
+        print("\n\nCompressing datasets with trained reducer...")
+        
+        if has_synthetic:
+            print("\n[1/2] Compressing synthetic data...")
+            preprocess_training_data(synthetic_raw, synthetic_compressed, reducer_path)
+        
+        if has_recorded:
+            print("\n[2/2] Compressing recorded data...")
+            preprocess_training_data(recorded_raw, recorded_compressed, reducer_path)
+        
+        print(f"\n{'='*80}")
+        print("ALL PREPROCESSING COMPLETE!")
+        print(f"{'='*80}")
+        print("Use this reducer for all future data - no retraining needed!")
+        
+        if has_synthetic:
+            print(f"\nSynthetic data compressed: {synthetic_compressed}")
+        if has_recorded:
+            print(f"Recorded data compressed: {recorded_compressed}")
+    else:
+        print("No training data available!")
