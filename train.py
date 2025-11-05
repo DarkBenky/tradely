@@ -594,6 +594,9 @@ if __name__ == "__main__":
     print(f"Batch size: {config.online_batch_size}")
     print(f"Total target batches: {config.online_total_batches}")
     
+    # Warmup window: ignore first N batches for best model tracking (avoid early spikes)
+    WARMUP_BATCHES = 20
+    
     best_avg_reward = float('-inf')
     no_improvement = 0
     current_lr = config.initial_lr
@@ -685,7 +688,13 @@ if __name__ == "__main__":
         wandb.log({'best/avg_recent_reward': avg_recent_reward})
         wandb.log({'best/best_recent_reward': best_avg_reward})
 
-        if avg_recent_reward > best_avg_reward:
+        # Only update best model after warmup period to avoid early spikes
+        if batch_count <= WARMUP_BATCHES:
+            print(f"[WARMUP {batch_count}/{WARMUP_BATCHES}] Ignoring early rewards for best model tracking")
+            # Still track best during warmup for later comparison
+            if avg_recent_reward > best_avg_reward:
+                best_avg_reward = avg_recent_reward
+        elif avg_recent_reward > best_avg_reward:
             best_avg_reward = avg_recent_reward
             model.save_weights('best_model.weights.h5')
             wandb.save('best_model.weights.h5')

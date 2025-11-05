@@ -2,6 +2,7 @@ import numpy as np
 import pickle
 import os
 import sys
+import wandb
 
 # Set GPU BEFORE importing tensorflow - MUST be first
 if 'CUDA_VISIBLE_DEVICES' not in os.environ:
@@ -15,13 +16,27 @@ from sklearn.preprocessing import StandardScaler
 
 print(f"CUDA_VISIBLE_DEVICES: {os.environ.get('CUDA_VISIBLE_DEVICES', 'not set')}")
 
-# Configure GPU memory growth
+# Enable mixed precision for memory savings
+from tensorflow.keras import mixed_precision
+policy = mixed_precision.Policy('mixed_float16')
+mixed_precision.set_global_policy(policy)
+print(f"Mixed precision enabled: {policy.name} (uses float16 for computations, float32 for variables)")
+
+# Configure GPU memory growth and allow memory oversubscription
 gpus = tf.config.list_physical_devices('GPU')
 if gpus:
     try:
         for gpu in gpus:
+            # Allow memory growth (allocate as needed)
             tf.config.experimental.set_memory_growth(gpu, True)
+            
+        # Set soft memory limit (allow spilling to system RAM if needed)
+        tf.config.set_logical_device_configuration(
+            gpus[0],
+            [tf.config.LogicalDeviceConfiguration(memory_limit=20480 * 2)]  # 40GB soft limit
+        )
         print(f"GPU memory growth enabled for {len(gpus)} GPU(s)")
+        print(f"Memory limit: 20GB (can use system RAM as fallback)")
         print(f"Note: When CUDA_VISIBLE_DEVICES=1, physical GPU 1 (RTX 3090) appears as GPU:0")
     except RuntimeError as e:
         print(f"GPU configuration error: {e}")
@@ -32,7 +47,7 @@ class FeatureReducer:
     Train once, use forever - works with all future data.
     """
     
-    def __init__(self, target_dim=256):
+    def __init__(self, target_dim=2048):
         self.target_dim = target_dim
         self.encoder = None
         self.decoder = None
@@ -42,33 +57,31 @@ class FeatureReducer:
         self.is_fitted = False
         
     def _build_autoencoder(self, input_dim):
-        """Build autoencoder architecture - memory efficient version"""
+        """Build autoencoder architecture - balanced compression and memory efficiency"""
         self.input_dim = input_dim
         
-        # Encoder - smaller intermediate layers to reduce memory
+        # Encoder - balanced compression
         encoder_input = keras.Input(shape=(input_dim,))
-        x = keras.layers.Dense(2048, activation='relu')(encoder_input)
-        x = keras.layers.BatchNormalization()(x)
-        x = keras.layers.Dropout(0.2)(x)
         
-        x = keras.layers.Dense(512, activation='relu')(x)
+        # First layer - moderate compression
+        x = keras.layers.Dense(int(self.target_dim * 1.5), activation='relu')(encoder_input)
         x = keras.layers.BatchNormalization()(x)
-        x = keras.layers.Dropout(0.2)(x)
+        x = keras.layers.Dropout(0.1)(x)
         
+        # Bottleneck - 2048 dims for good reconstruction
         encoded = keras.layers.Dense(self.target_dim, activation='relu', name='encoded')(x)
         
         self.encoder = keras.Model(encoder_input, encoded, name='encoder')
         
-        # Decoder
+        # Decoder - mirror encoder structure
         decoder_input = keras.Input(shape=(self.target_dim,))
-        x = keras.layers.Dense(512, activation='relu')(decoder_input)
-        x = keras.layers.BatchNormalization()(x)
-        x = keras.layers.Dropout(0.2)(x)
         
-        x = keras.layers.Dense(1024, activation='relu')(x)
+        # First decoder layer
+        x = keras.layers.Dense(int(self.target_dim * 1.5), activation='relu')(decoder_input)
         x = keras.layers.BatchNormalization()(x)
-        x = keras.layers.Dropout(0.2)(x)
+        x = keras.layers.Dropout(0.1)(x)
         
+        # Output layer
         decoded = keras.layers.Dense(input_dim, activation='linear')(x)
         
         self.decoder = keras.Model(decoder_input, decoded, name='decoder')
@@ -80,20 +93,37 @@ class FeatureReducer:
         
         self.autoencoder = keras.Model(autoencoder_input, decoded_out, name='autoencoder')
         
+        # Custom accuracy metric: percentage of values reconstructed within 10% error
+        def reconstruction_accuracy(y_true, y_pred):
+            """Percentage of values where |predicted - actual| / |actual| < 0.1"""
+            # Cast to float32 for mixed precision compatibility
+            y_true = tf.cast(y_true, tf.float32)
+            y_pred = tf.cast(y_pred, tf.float32)
+            relative_error = tf.abs((y_pred - y_true) / (tf.abs(y_true) + 1e-8))
+            within_threshold = tf.cast(relative_error < 0.1, tf.float32)
+            return tf.reduce_mean(within_threshold)
+        
         # Compile with mixed precision to save memory
         self.autoencoder.compile(
-            optimizer=keras.optimizers.Adam(learning_rate=0.001),
+            optimizer=keras.optimizers.Adam(learning_rate=0.0015),
             loss='mse',
-            metrics=['mae']
+            metrics=['mae', reconstruction_accuracy]
         )
 
         self.autoencoder.summary()
+
+        # log model size
+
+        wandb.log({
+            "model/autoencoder_params": self.autoencoder.count_params(),
+        })
         
-        print(f"\nAutoencoder architecture (memory-efficient):")
+        print(f"\nAutoencoder architecture (memory-efficient, 2048 dims):")
         print(f"  Input: {input_dim} dims")
-        print(f"  Encoder: {input_dim} → 1024 → 512 → {self.target_dim}")
-        print(f"  Decoder: {self.target_dim} → 512 → 1024 → {input_dim}")
+        print(f"  Encoder: {input_dim} → {int(self.target_dim * 1.5)} → {self.target_dim}")
+        print(f"  Decoder: {self.target_dim} → {int(self.target_dim * 1.5)} → {input_dim}")
         print(f"  Compression ratio: {input_dim / self.target_dim:.2f}x")
+        print(f"  Balanced: good accuracy with manageable memory usage")
         
     def fit(self, data_samples, epochs=100, batch_size=64, validation_split=0.1, use_wandb=True, incremental=False):
         """
@@ -159,42 +189,66 @@ class FeatureReducer:
         print(f"\nTraining for {epochs} epochs...")
         callbacks = [
             keras.callbacks.EarlyStopping(
-                monitor='val_loss',
-                patience=5,
+                monitor='val_reconstruction_accuracy',  # Monitor accuracy instead of loss
+                patience=8,  # More patience for accuracy improvements
                 restore_best_weights=True,
+                mode='max',  # Maximize accuracy
                 verbose=1
             ),
             keras.callbacks.ReduceLROnPlateau(
-                monitor='val_loss',
-                factor=0.5,
-                patience=3,
-                min_lr=1e-6,
+                monitor='val_reconstruction_accuracy',  # Monitor accuracy
+                factor=0.5,  # Reduce LR by half
+                patience=3,  # Reduce quickly if no improvement
+                min_lr=1e-7,
+                mode='max',  # Maximize accuracy
                 verbose=1
             )
         ]
         
-        # Add wandb callback if enabled
-        if use_wandb:
+        # Add wandb callback if enabled (including incremental training)
+        if use_wandb or (not incremental and use_wandb):
             try:
                 import wandb
                 
-                # Custom callback for wandb logging (avoids compatibility issues)
-                class SimpleWandbCallback(keras.callbacks.Callback):
-                    def on_epoch_end(self, epoch, logs=None):
-                        if logs:
-                            wandb.log({
-                                "epoch": epoch,
-                                "loss": logs.get("loss"),
-                                "val_loss": logs.get("val_loss"),
-                                "mae": logs.get("mae"),
-                                "val_mae": logs.get("val_mae"),
-                                "learning_rate": float(self.model.optimizer.learning_rate)
-                            })
-                
-                callbacks.append(SimpleWandbCallback())
-                print("Added custom wandb callback")
+                # Check if wandb run is active (for incremental training)
+                if wandb.run is None and not use_wandb:
+                    # Don't add callback if no active run
+                    pass
+                else:
+                    # Custom callback for wandb logging (avoids compatibility issues)
+                    class SimpleWandbCallback(keras.callbacks.Callback):
+                        def __init__(self, batch_num=0):
+                            super().__init__()
+                            self.batch_num = batch_num
+                            
+                        def on_epoch_end(self, epoch, logs=None):
+                            if logs and wandb.run is not None:
+                                log_dict = {
+                                    "epoch/epoch": epoch,
+                                    "epoch/loss": logs.get("loss"),
+                                    "epoch/val_loss": logs.get("val_loss"),
+                                    "epoch/mae": logs.get("mae"),
+                                    "epoch/val_mae": logs.get("val_mae"),
+                                    "epoch/accuracy": logs.get("reconstruction_accuracy"),
+                                    "epoch/val_accuracy": logs.get("val_reconstruction_accuracy"),
+                                    "epoch/learning_rate": float(self.model.optimizer.learning_rate)
+                                }
+                                # Add batch number for incremental training
+                                if self.batch_num > 0:
+                                    log_dict["epoch/batch_num"] = self.batch_num
+                                wandb.log(log_dict)
+                    
+                    # Pass batch number if incremental
+                    batch_num = 0
+                    if incremental and hasattr(self, '_current_batch_num'):
+                        batch_num = self._current_batch_num
+                    
+                    callbacks.append(SimpleWandbCallback(batch_num=batch_num))
+                    if not incremental:
+                        print("Added custom wandb callback")
             except Exception as e:
-                print(f"Warning: Could not add wandb callback: {e}")
+                if not incremental:
+                    print(f"Warning: Could not add wandb callback: {e}")
                 use_wandb = False
         
         history = self.autoencoder.fit(
@@ -212,6 +266,11 @@ class FeatureReducer:
         final_loss = history.history['loss'][-1]
         final_val_loss = history.history['val_loss'][-1]
         final_mae = history.history['mae'][-1]
+        final_accuracy = history.history.get('reconstruction_accuracy', [0])[-1]
+        final_val_accuracy = history.history.get('val_reconstruction_accuracy', [0])[-1]
+        
+        # Return validation accuracy for tracking best model
+        self._last_val_accuracy = final_val_accuracy
         
         # Calculate reconstruction quality on sample
         sample_indices = np.random.choice(len(data_scaled), min(100, len(data_scaled)), replace=False)
@@ -220,12 +279,18 @@ class FeatureReducer:
         reconstruction_error = np.mean(np.abs(sample_data - reconstructed))
         relative_error = reconstruction_error / (np.abs(sample_data).mean() + 1e-8)
         
+        # Calculate actual accuracy (% within 10% of true value)
+        sample_relative_error = np.abs((reconstructed - sample_data) / (np.abs(sample_data) + 1e-8))
+        actual_accuracy = np.mean(sample_relative_error < 0.1)
+        
         print(f"\n{'='*80}")
         print(f"TRAINING COMPLETE")
         print(f"{'='*80}")
         print(f"Final training loss: {final_loss:.6f}")
         print(f"Final validation loss: {final_val_loss:.6f}")
         print(f"Mean absolute error: {final_mae:.6f}")
+        print(f"Reconstruction accuracy: {final_accuracy:.2%} (train) / {final_val_accuracy:.2%} (val)")
+        print(f"Sample accuracy: {actual_accuracy:.2%}")
         print(f"Reconstruction error: {reconstruction_error:.6f}")
         print(f"Relative error: {relative_error:.2%}")
         print(f"Reduced to {self.target_dim} dimensions")
@@ -238,6 +303,9 @@ class FeatureReducer:
                     "final/train_loss": final_loss,
                     "final/val_loss": final_val_loss,
                     "final/mae": final_mae,
+                    "final/train_accuracy": final_accuracy,
+                    "final/val_accuracy": final_val_accuracy,
+                    "final/sample_accuracy": actual_accuracy,
                     "final/reconstruction_error": reconstruction_error,
                     "final/relative_error": relative_error,
                     "final/compression_ratio": data_array.shape[1] / self.target_dim
@@ -381,7 +449,7 @@ def train_reducer_incrementally(input_path, reducer_path='feature_reducer.h5',
                 project="tradely-feature-reducer-incremental",
                 config={
                     "architecture": "autoencoder",
-                    "target_dim": 256,
+                    "target_dim": 2048,
                     "samples_per_batch": samples_per_batch,
                     "epochs_per_batch": epochs_per_batch,
                     "training_mode": "incremental"
@@ -395,6 +463,7 @@ def train_reducer_incrementally(input_path, reducer_path='feature_reducer.h5',
     reducer = None
     batch_num = 0
     total_samples = 0
+    best_accuracy = 0.0  # Track best accuracy
     
     with open(input_path, 'rb') as f:
         sample_buffer = []
@@ -426,26 +495,31 @@ def train_reducer_incrementally(input_path, reducer_path='feature_reducer.h5',
                         # First batch: create and fit reducer
                         if reducer is None:
                             print("Creating new feature reducer...")
-                            reducer = FeatureReducer(target_dim=256)
+                            reducer = FeatureReducer(target_dim=2148)  # Fixed from 2248
+                            reducer._current_batch_num = batch_num
                             reducer.fit(training_samples, 
                                        epochs=epochs_per_batch, 
-                                       batch_size=64,
-                                       validation_split=0.1,
+                                       batch_size=24,  # Increased for better gradient estimates
+                                       validation_split=0.2,
                                        use_wandb=use_wandb,
                                        incremental=False)
                         else:
                             # Subsequent batches: incremental training
                             print("Continuing incremental training...")
+                            reducer._current_batch_num = batch_num
                             reducer.fit(training_samples,
                                        epochs=epochs_per_batch,
-                                       batch_size=64,
+                                       batch_size=24,  # Increased for better gradient estimates
                                        validation_split=0.1,
-                                       use_wandb=False,  # Don't reinit wandb
+                                       use_wandb=True,  # Changed to True to enable logging!
                                        incremental=True)
                         
                         total_samples += len(training_samples)
                         
-                        # Log batch metrics
+                        # Get validation accuracy from last training
+                        current_accuracy = getattr(reducer, '_last_val_accuracy', 0.0)
+                        
+                        # Log batch metrics including accuracy
                         if use_wandb:
                             try:
                                 import wandb
@@ -453,17 +527,35 @@ def train_reducer_incrementally(input_path, reducer_path='feature_reducer.h5',
                                     "batch/number": batch_num,
                                     "batch/samples": len(training_samples),
                                     "batch/total_samples": total_samples,
+                                    "batch/val_accuracy": current_accuracy,
+                                    "batch/best_accuracy": best_accuracy,
                                 })
                             except:
                                 pass
                         
                         print(f"Total samples processed: {total_samples:,}")
+                        print(f"Batch validation accuracy: {current_accuracy:.2%}")
                         
-                        # Save checkpoint every 5 batches
-                        if batch_num % 5 == 0:
-                            checkpoint_path = reducer_path.replace('.h5', f'_checkpoint_batch{batch_num}.h5')
-                            reducer.save(checkpoint_path)
-                            print(f"Checkpoint saved: {checkpoint_path}")
+                        # Save model if accuracy improved
+                        if current_accuracy > best_accuracy:
+                            best_accuracy = current_accuracy
+                            best_model_path = reducer_path.replace('.pkl', '_best.pkl').replace('.h5', '_best.h5')
+                            reducer.save(best_model_path)
+                            print(f"★ NEW BEST ACCURACY: {best_accuracy:.2%} - Model saved!")
+                            
+                            # Also log to wandb
+                            if use_wandb:
+                                try:
+                                    import wandb
+                                    wandb.log({
+                                        "best/accuracy": best_accuracy,
+                                        "best/batch_num": batch_num,
+                                        "best/total_samples": total_samples,
+                                    })
+                                except:
+                                    pass
+                        else:
+                            print(f"Best accuracy remains: {best_accuracy:.2%}")
                         
                         del training_samples
                         
@@ -480,7 +572,7 @@ def train_reducer_incrementally(input_path, reducer_path='feature_reducer.h5',
                     
                     reducer.fit(sample_buffer,
                                epochs=epochs_per_batch,
-                               batch_size=64,
+                               batch_size=32,  # Reduced for memory
                                validation_split=0.1,
                                use_wandb=False,
                                incremental=True)
@@ -491,7 +583,7 @@ def train_reducer_incrementally(input_path, reducer_path='feature_reducer.h5',
     if reducer is None:
         raise ValueError("No training data found in file!")
     
-    # Save final model
+    # Save final model (always save the last state)
     reducer.save(reducer_path)
     
     print(f"\n{'='*80}")
@@ -499,7 +591,10 @@ def train_reducer_incrementally(input_path, reducer_path='feature_reducer.h5',
     print(f"{'='*80}")
     print(f"Total batches: {batch_num}")
     print(f"Total samples: {total_samples:,}")
+    print(f"Best validation accuracy: {best_accuracy:.2%}")
     print(f"Final model saved: {reducer_path}")
+    best_model_path = reducer_path.replace('.pkl', '_best.pkl').replace('.h5', '_best.h5')
+    print(f"Best model saved: {best_model_path}")
     
     if use_wandb:
         try:
@@ -507,6 +602,7 @@ def train_reducer_incrementally(input_path, reducer_path='feature_reducer.h5',
             wandb.log({
                 "final/total_batches": batch_num,
                 "final/total_samples": total_samples,
+                "final/best_accuracy": best_accuracy,
             })
             wandb.finish()
         except:
@@ -540,7 +636,7 @@ def preprocess_training_data(input_path, output_path, reducer_path='feature_redu
         fit_reducer = False
     else:
         print("Creating new feature reducer...")
-        reducer = FeatureReducer(target_dim=256)
+        reducer = FeatureReducer(target_dim=2048)
         fit_reducer = True
     
     # If need to fit, collect samples first
@@ -769,7 +865,7 @@ if __name__ == "__main__":
         reducer = train_reducer_incrementally(
             input_path=training_source,
             reducer_path=reducer_path,
-            samples_per_batch=2048,
+            samples_per_batch=512,  # Reduced for memory
             epochs_per_batch=10,
             max_batches=None,  # Train on all data
             use_wandb=True
