@@ -27,8 +27,8 @@ def _generate_batch_worker(params):
         # Create environment for this worker
         env = PortfolioEnv(max_records=100_000)
         
-        # Create generator
-        generator = SyntheticDataGenerator(env, lookforward_steps=30)
+        # Create generator with 1-step lookforward (aligned with new reward function)
+        generator = SyntheticDataGenerator(env, lookforward_steps=1)
         
         # Generate batch
         batch = generator.generate_synthetic_batch(
@@ -54,9 +54,11 @@ class SyntheticDataGenerator:
     """
     Generate synthetic training data with optimal portfolio allocations
     calculated in advance using historical data.
+    
+    Now aligned with the new reward function that optimizes for 1-step ahead returns.
     """
     
-    def __init__(self, env, lookforward_steps=20):
+    def __init__(self, env, lookforward_steps=1):
         self.env = env
         self.lookforward_steps = lookforward_steps
         self.num_assets = len(env.asset_names)
@@ -395,8 +397,8 @@ if __name__ == "__main__":
     print("Initializing environment...")
     env = PortfolioEnv(max_records=100_000)
     
-    # Create generator
-    generator = SyntheticDataGenerator(env, lookforward_steps=30)
+    # Create generator with 1-step lookforward (aligned with new reward function)
+    generator = SyntheticDataGenerator(env, lookforward_steps=1)
     
     # Configuration
     num_batches = 1024

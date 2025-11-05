@@ -1,3 +1,23 @@
+"""
+Portfolio Trading Environment with Simplified Reward Function
+
+REWARD SYSTEM:
+--------------
+The agent is rewarded based on ACTUAL 1-step ahead portfolio returns.
+This encourages the model to learn short-term price prediction and optimal allocation.
+
+Reward = portfolio_weighted_next_step_return * 1000 + outperformance_bonus
+
+Key Points:
+1. Looks only 1 step ahead (not 30 steps) to avoid complex weighted averaging
+2. Directly rewards positions that will increase in the next step
+3. Naturally penalizes holding cash (0% return = opportunity cost)
+4. Includes bonus for beating the buy-and-hold benchmark
+5. Simple and interpretable - agent learns to maximize actual profit
+
+This design ensures the agent focuses on what matters: making money.
+"""
+
 import numpy as np
 import pandas as pd
 import os
@@ -54,7 +74,7 @@ class PortfolioEnv():
         self.high_timeframes_count = [64, 48, 24, 3]
 
         self.lookback_window_size = 48
-        self.lookforward_window_size = 30
+        # Note: lookforward_window_size removed - new reward function uses only 1-step ahead
         
         self.portfolio = {'cash': self.initial_account_balance}
         self.portfolio_value = self.initial_account_balance
@@ -371,19 +391,20 @@ class PortfolioEnv():
         
         return final_obs
     
-    def _calculate_future_profit(self) -> float:
+    def _calculate_future_profit(self) -> dict:
+        """
+        Calculate the ACTUAL future profit for each asset.
+        This looks ahead and is used ONLY for reward calculation (not available to agent).
+        Returns the actual percentage return that will happen in the next step.
+        """
         future_profits = {}
         for symbol, data in self.df.items():
             current_price = data['close'].iloc[self.step_count]
-            values, weights = [], []
-            for i in range(1, self.lookforward_window_size + 1):
-                future_price = data['close'].iloc[self.step_count + i]
-                ret = (future_price - current_price) / current_price
-                values.append(ret)
-                # Farther future gets more weight
-                weights.append(i / self.lookforward_window_size)
-            weighted_return = np.dot(values, weights) / sum(weights)
-            future_profits[symbol] = weighted_return
+            # Look at the NEXT step's price (what actually happens)
+            next_price = data['close'].iloc[self.step_count + 1]
+            # Calculate actual return
+            actual_return = (next_price - current_price) / current_price
+            future_profits[symbol] = actual_return
         return future_profits
 
     
@@ -551,261 +572,55 @@ class PortfolioEnv():
         
         return total_fees
     
-    # def _calculate_reward(self) -> float:
-    #     """
-    #     Calculate reward based on:
-    #     1. Weighted future returns (farther future = more weight)
-    #     2. Portfolio alignment with future profit potential
-    #     3. Concentration penalty for risk management
-    #     4. FIXED: Reward for optimal cash usage
-    #     """
-    #     # Get future profit predictions (weighted toward farther future)
-    #     future_profits = self._calculate_future_profit()
-        
-    #     # Update current portfolio value
-    #     current_value = self._portfolio_portfolio_value()
-        
-    #     # Calculate portfolio-weighted expected return
-    #     portfolio_weighted_return = 0.0
-    #     for symbol in self.df.keys():
-    #         price = self.df[symbol]['close'].iloc[self.step_count]
-    #         holdings_value = self.portfolio[symbol] * price
-    #         weight = holdings_value / current_value if current_value > 0 else 0
-            
-    #         # Weight by portfolio allocation and future profit
-    #         portfolio_weighted_return += weight * future_profits[symbol]
-        
-    #     # Base reward: portfolio's alignment with future returns
-    #     reward = portfolio_weighted_return * 1000  # Scale up for meaningful rewards
-        
-    #     # Calculate benchmark's weighted future return for comparison
-    #     benchmark_weighted_return = 0.0
-    #     benchmark_value = self._update_benchmark_value()
-    #     for symbol in self.df.keys():
-    #         price = self.df[symbol]['close'].iloc[self.step_count]
-    #         benchmark_holdings_value = self.passive_portfolio[symbol] * price
-    #         benchmark_weight = benchmark_holdings_value / benchmark_value if benchmark_value > 0 else 0
-    #         benchmark_weighted_return += benchmark_weight * future_profits[symbol]
-        
-    #     # Bonus for better positioning than benchmark
-    #     outperformance = portfolio_weighted_return - benchmark_weighted_return
-    #     reward += outperformance * 500
-        
-    #     # Calculate portfolio concentration (Herfindahl index) for risk penalty
-    #     concentration = 0
-    #     for symbol in self.df.keys():
-    #         price = self.df[symbol]['close'].iloc[self.step_count]
-    #         holdings_value = self.portfolio[symbol] * price
-    #         weight = holdings_value / current_value if current_value > 0 else 0
-    #         concentration += weight ** 2
-        
-    #     # Penalize over-concentration (>0.5 Herfindahl index)
-    #     if concentration > 0.5:
-    #         reward -= (concentration - 0.5) * 100
-        
-    #     # FIXED: Smart cash penalty - only penalize when missing good opportunities
-    #     cash_weight = self.portfolio['cash'] / current_value if current_value > 0 else 1.0
-    #     avg_future_profit = np.mean(list(future_profits.values()))
-    #     max_future_profit = max(future_profits.values())
-        
-    #     # If there are strong positive opportunities and holding too much cash, penalize
-    #     if max_future_profit > 0.02 and cash_weight > 0.3:  
-    #         reward -= cash_weight * 50
-    #     # If market looks bad (negative returns expected), reward holding cash
-    #     elif avg_future_profit < -0.01 and cash_weight > 0.3:
-    #         reward += cash_weight * 30
-        
-    #     return reward
-
     def _calculate_reward(self) -> float:
         """
-        Improved reward function with better balance and clearer signals:
-        1. Direct portfolio value change (primary signal)
-        2. Benchmark outperformance
-        3. Future profit alignment (predictive)
-        4. Risk-adjusted returns (Sharpe-like)
-        5. Unrealized P&L quality
-        6. Smart position management
+        Simple, focused reward: MAXIMIZE ACTUAL FUTURE PROFIT
+        
+        The agent should learn to hold positions that will go up in the NEXT step
+        and avoid/short positions that will go down.
+        
+        Reward = Portfolio-weighted actual return in next step
         """
-        # Get future profit predictions
+        # Get ACTUAL next-step returns for each asset
         future_profits = self._calculate_future_profit()
         
-        # Update current portfolio value
+        # Calculate current portfolio value and weights
         current_value = self._portfolio_portfolio_value()
-        benchmark_value = self._update_benchmark_value()
         
-        # ===== 1. PORTFOLIO VALUE CHANGE (Primary Signal) =====
-        # Direct reward for portfolio growth/decline
-        portfolio_return = (current_value / self.initial_account_balance) - 1.0
-        value_change_reward = portfolio_return * 500  # Strong signal for growth
-        
-        # ===== 2. BENCHMARK OUTPERFORMANCE =====
-        # Reward for beating buy-and-hold strategy
-        benchmark_return = (benchmark_value / self.initial_account_balance) - 1.0
-        outperformance = portfolio_return - benchmark_return
-        outperformance_reward = outperformance * 300
-        
-        # ===== 3. FUTURE PROFIT ALIGNMENT =====
-        # Calculate portfolio-weighted expected return and position weights
-        portfolio_weighted_return = 0.0
-        portfolio_weights = {}
+        # Calculate the actual profit the portfolio will make based on current holdings
+        portfolio_future_return = 0.0
         
         for symbol in self.df.keys():
             price = self.df[symbol]['close'].iloc[self.step_count]
             holdings_value = self.portfolio[symbol] * price
             weight = holdings_value / current_value if current_value > 0 else 0
-            portfolio_weights[symbol] = weight
-            portfolio_weighted_return += weight * future_profits[symbol]
-        
-        # Get future returns list for risk calculations
-        future_returns_list = list(future_profits.values())
-        
-        # Reward alignment with future opportunities
-        future_alignment_reward = portfolio_weighted_return * 300  # Reduced from 400
-        
-        # Penalize if too concentrated on one opportunity
-        max_future_return = max(future_returns_list) if future_returns_list else 0
-        if max_future_return > 0.02:
-            # Check if portfolio is overly concentrated on the top performer
-            top_symbols = [s for s in self.df.keys() if future_profits[s] > max_future_return * 0.8]
-            top_concentration = sum(portfolio_weights.get(s, 0) for s in top_symbols)
-            if top_concentration > 0.6:
-                future_alignment_reward -= (top_concentration - 0.5) * 100
-        
-        # ===== 4. RISK-ADJUSTED RETURNS (Sharpe-like) =====
-        returns_std = np.std(future_returns_list) if len(future_returns_list) > 1 else 0.001
-        
-        # Sharpe ratio component
-        if portfolio_weighted_return > 0:
-            sharpe_reward = (portfolio_weighted_return / max(returns_std, 0.001)) * 50
-        else:
-            sharpe_reward = portfolio_weighted_return * 30  # Penalty for negative expected returns
-        
-        # ===== 5. UNREALIZED P&L QUALITY =====
-        # Evaluate quality of current positions
-        pl_quality_score = 0.0
-        winning_positions = 0
-        losing_positions = 0
-        total_unrealized_pl = 0.0
-        
-        for symbol in self.df.keys():
-            holdings = self.portfolio[symbol]
-            if holdings > 0.000001:
-                current_price = self._get_current_priced(symbol)
-                avg_price = self.average_prices.get(symbol, current_price)
-                
-                if avg_price > 0:
-                    pl_percent = (current_price - avg_price) / avg_price
-                    position_value = holdings * current_price
-                    position_weight = position_value / current_value if current_value > 0 else 0
-                    pl_value = (current_price - avg_price) * holdings
-                    total_unrealized_pl += pl_value
-                    
-                    if pl_percent > 0:
-                        winning_positions += 1
-                        # Reward winners, but check if they still have upside
-                        future_upside = future_profits[symbol]
-                        if future_upside > 0.01:
-                            # Winner with more upside - excellent
-                            pl_quality_score += position_weight * pl_percent * 80
-                        else:
-                            # Winner but no more upside - should consider taking profit
-                            pl_quality_score += position_weight * pl_percent * 40
-                    else:
-                        losing_positions += 1
-                        # Penalize losers, especially if they'll keep dropping
-                        future_downside = future_profits[symbol]
-                        if future_downside < -0.01:
-                            # Loser that will keep losing - bad
-                            pl_quality_score += position_weight * pl_percent * 60
-                        else:
-                            # Loser but will recover - less bad
-                            pl_quality_score += position_weight * pl_percent * 30
-        
-        # Bonus for overall portfolio profitability
-        total_pl_percent = total_unrealized_pl / self.initial_account_balance
-        pl_quality_score += total_pl_percent * 50
-        
-        # ===== 6. POSITION MANAGEMENT =====
-        position_score = 0.0
-        
-        # A. Concentration risk
-        concentration = sum(w ** 2 for w in portfolio_weights.values())
-        
-        # Stronger penalty for over-concentration
-        if concentration > 0.4:  # Too concentrated (lowered threshold)
-            position_score -= (concentration - 0.3) ** 2 * 300  # Quadratic penalty
-        elif concentration < 0.12:  # Too diversified (diluted)
-            position_score -= (0.12 - concentration) * 80
-        
-        # Additional check: penalize single-asset dominance
-        max_weight = max(portfolio_weights.values()) if portfolio_weights else 0
-        if max_weight > 0.5:  # Single asset >50%
-            position_score -= (max_weight - 0.4) * 200
-        
-        # B. Cash management
-        cash_weight = self.portfolio['cash'] / current_value if current_value > 0 else 1.0
-        avg_future_profit = np.mean(future_returns_list)
-        max_future_profit = max(future_returns_list)
-        min_future_profit = min(future_returns_list)
-        
-        # Context-aware cash penalty/reward
-        if max_future_profit > 0.03:  # Strong opportunities available
-            if cash_weight > 0.4:
-                position_score -= (cash_weight - 0.3) * 120  # Heavy penalty for missing opportunities
-            elif cash_weight < 0.05:
-                position_score -= 10  # Small penalty for no cash buffer
-        elif avg_future_profit < -0.02:  # Market downturn expected
-            if cash_weight > 0.3:
-                position_score += (cash_weight - 0.2) * 100  # Reward defensive positioning
-            else:
-                position_score -= (0.3 - cash_weight) * 80  # Penalty for being too invested in downturn
-        else:  # Neutral market
-            if cash_weight > 0.5:
-                position_score -= (cash_weight - 0.4) * 60  # Moderate penalty for excess cash
-        
-        # C. Position sizing relative to future returns
-        for symbol in self.df.keys():
-            weight = portfolio_weights[symbol]
-            future_return = future_profits[symbol]
             
-            # Check if position size makes sense given future expectations
-            if weight > 0.15:  # Significant position
-                if future_return < -0.03:
-                    # Big position in asset that will drop - bad
-                    position_score -= weight * 150
-                elif future_return > 0.03:
-                    # Big position in asset that will rise - good
-                    position_score += weight * 100
-            
-            if weight > 0.01 and weight < 0.05:  # Small position
-                if future_return > 0.04:
-                    # Too small position in strong performer - missed opportunity
-                    position_score -= 15
+            # Weight the actual future return by portfolio allocation
+            portfolio_future_return += weight * future_profits[symbol]
         
-        # D. Win rate bonus
-        total_positions = winning_positions + losing_positions
-        if total_positions > 0:
-            win_rate = winning_positions / total_positions
-            if win_rate > 0.6:
-                position_score += (win_rate - 0.5) * 50  # Bonus for good stock picking
+        # Cash earns nothing (actually loses to inflation, but simplified)
+        # This naturally penalizes holding too much cash
         
-        # ===== 7. COMBINE ALL COMPONENTS =====
-        reward = (
-            value_change_reward * 0.8 +      # 80% weight: Direct portfolio performance
-            outperformance_reward * 0.6 +    # 60% weight: Beat benchmark
-            future_alignment_reward * 0.5 +   # 50% weight: Predictive positioning
-            sharpe_reward * 0.4 +             # 40% weight: Risk-adjusted returns
-            pl_quality_score * 0.5 +          # 50% weight: P&L quality
-            position_score * 0.3              # 30% weight: Position management
-        )
+        # Scale reward to make it meaningful for learning
+        # A 1% portfolio return gives reward of 10
+        reward = portfolio_future_return * 1000
         
-        # Normalize by total weight for consistency
-        total_weight = 0.8 + 0.6 + 0.5 + 0.4 + 0.5 + 0.3
-        reward = reward / total_weight
+        # Add benchmark comparison bonus
+        # Reward beating the passive buy-and-hold strategy
+        benchmark_future_return = 0.0
+        benchmark_value = self._update_benchmark_value()
+        for symbol in self.df.keys():
+            price = self.df[symbol]['close'].iloc[self.step_count]
+            benchmark_holdings_value = self.passive_portfolio[symbol] * price
+            benchmark_weight = benchmark_holdings_value / benchmark_value if benchmark_value > 0 else 0
+            benchmark_future_return += benchmark_weight * future_profits[symbol]
         
-        # ===== 8. CLIP AND RETURN =====
-        reward = np.clip(reward, -300, 300)
+        # Bonus for outperforming benchmark
+        outperformance = portfolio_future_return - benchmark_future_return
+        reward += outperformance * 500  # Extra reward for beating benchmark
+        
+        # Clip to prevent extreme values
+        reward = np.clip(reward, -100, 100)
         
         return reward
     
@@ -815,8 +630,8 @@ class PortfolioEnv():
         Action: list with target allocation percentages for each asset INCLUDING cash
         Returns: observation, reward, done, info
         """
-        # Check if we've reached the end of data
-        if self.step_count >= len(self.df['BTCUSDT']) - self.lookforward_window_size - 1:
+        # Check if we've reached the end of data (need at least 1 step ahead for reward)
+        if self.step_count >= len(self.df['BTCUSDT']) - 2:
             return self.get_observation(), 0, True, {'reason': 'end_of_data'}
         
         # Store previous values for reward calculation
@@ -829,7 +644,7 @@ class PortfolioEnv():
         # Move to next step
         self.step_count += 1
         
-        # Calculate reward
+        # Calculate reward (this looks 1 step ahead to see actual profit)
         reward = self._calculate_reward()
         
         # Get new observation
@@ -845,7 +660,7 @@ class PortfolioEnv():
             info['reason'] = 'bankruptcy'
             reward -= 100  # Large penalty
         
-        if self.step_count >= len(self.df['BTCUSDT']) - self.lookforward_window_size - 1:
+        if self.step_count >= len(self.df['BTCUSDT']) - 2:
             done = True
             info['reason'] = 'end_of_data'
 
