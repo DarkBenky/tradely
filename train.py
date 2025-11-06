@@ -133,10 +133,37 @@ def collect_batch_data(env, model, batch_size, gamma, current_step, epsilon=0.1,
     states, raw_states, actions, rewards, values, is_random_flags = [], [], [], [], [], []
     step_logs = []
     
-    if current_step >= env.max_steps or random.random() < env_reset_probability:
-        state = env.reset()
-    else:
-        state = env.get_observation()
+    # If we encounter NaN early, reset and try again
+    max_reset_attempts = 3
+    reset_attempt = 0
+    
+    while reset_attempt < max_reset_attempts:
+        if current_step >= env.max_steps or random.random() < env_reset_probability or reset_attempt > 0:
+            state = env.reset()
+        else:
+            state = env.get_observation()
+        
+        # Check if initial state is valid
+        if np.any(np.isnan(state)) or np.any(np.isinf(state)):
+            print(f"WARNING: Invalid state after reset (attempt {reset_attempt + 1}/{max_reset_attempts}), retrying...")
+            reset_attempt += 1
+            continue
+        else:
+            break
+    
+    if reset_attempt >= max_reset_attempts:
+        print("ERROR: Failed to get valid state after multiple resets, returning empty batch")
+        return [], [], [], np.array([]), np.array([]), [], [], {
+            'steps_collected': 0,
+            'total_reward': 0.0,
+            'mean_value': 0.0,
+            'portfolio_value': env._portfolio_portfolio_value(),
+            'benchmark_value': env._update_benchmark_value(),
+            'outperformance': 1.0,
+            'done': True,
+            'random_actions': 0,
+            'policy_actions': 0
+        }, []
     
     raw_state = state.copy()
     
@@ -150,22 +177,52 @@ def collect_batch_data(env, model, batch_size, gamma, current_step, epsilon=0.1,
     
     while steps_collected < batch_size and not done:
         state_tensor = tf.convert_to_tensor(state[np.newaxis, :], dtype=tf.float32)
+        
+        # Check for NaN in state
+        if np.any(np.isnan(state)) or np.any(np.isinf(state)):
+            print(f"WARNING: NaN/Inf detected in state at step {steps_collected}, resetting episode")
+            # Reset environment and try to continue
+            state = env.reset()
+            raw_state = state.copy()
+            if feature_reducer is not None:
+                state = feature_reducer.transform(state.reshape(1, -1))[0]
+            
+            # If still NaN after reset, we need to give up on this batch
+            if np.any(np.isnan(state)) or np.any(np.isinf(state)):
+                print(f"ERROR: State still invalid after reset, ending batch early")
+                done = True
+                break
+            continue
+        
         action_probs, value = model(state_tensor, training=False)
         action = action_probs[0].numpy()
         value = value[0, 0].numpy()
         
-        is_random = False
+        # Check for NaN in model outputs
+        if np.any(np.isnan(action)) or np.isnan(value):
+            print(f"WARNING: NaN in model output (action or value), using random action")
+            action = env.sample()
+            value = 0.0
+            is_random = True
+        else:
+            is_random = False
         
-        if random.random() < epsilon:
+        if random.random() < epsilon and not is_random:
             action = env.sample()
             is_random = True
-        elif random.random() < epsilon * 2:
+        elif random.random() < epsilon * 2 and not is_random:
             noise = np.random.normal(0, 0.1, size=action.shape)
             action = action + noise
             action = np.clip(action, 0, 1)
             action = action / action.sum()
         
         next_state, reward, done, info = env.step(action)
+        
+        # Check for NaN in reward
+        if np.isnan(reward) or np.isinf(reward):
+            print(f"WARNING: NaN/Inf reward detected, replacing with 0.0")
+            reward = 0.0
+        
         env.render()
         
         raw_next_state = next_state.copy()
@@ -219,52 +276,132 @@ def collect_batch_data(env, model, batch_size, gamma, current_step, epsilon=0.1,
             print(f"  Warning: Episode exceeded 10000 steps, forcing termination")
             break
     
+    # Initialize returns and advantages with empty arrays as fallback
+    returns = np.array([], dtype=np.float32)
+    advantages = np.array([], dtype=np.float32)
+    
     if steps_collected > 0:
+        # First, check all inputs for NaN
+        rewards_array = np.array(rewards, dtype=np.float32)
+        values_array = np.array(values, dtype=np.float32)
+        
+        if np.any(np.isnan(rewards_array)):
+            print(f"WARNING: NaN in rewards array, replacing with zeros")
+            rewards_array = np.nan_to_num(rewards_array, nan=0.0)
+            rewards = rewards_array.tolist()
+        
+        if np.any(np.isnan(values_array)):
+            print(f"WARNING: NaN in values array, replacing with zeros")
+            values_array = np.nan_to_num(values_array, nan=0.0)
+            values = values_array.tolist()
+        
         returns = []
         advantages = []
-        G = 0
-        A = 0
+        G = 0.0
+        A = 0.0
+        
         for i in reversed(range(len(rewards))):
             G = rewards[i] + gamma * G
+            
+            # Safety check for G
+            if np.isnan(G) or np.isinf(G):
+                print(f"WARNING: NaN/Inf in return calculation at step {i}, resetting to 0")
+                G = 0.0
+            
             returns.insert(0, G)
             
-            next_value = values[i+1] if i+1 < len(values) else 0
+            next_value = values[i+1] if i+1 < len(values) else 0.0
             td_error = rewards[i] + gamma * next_value - values[i]
+            
+            # Safety check for td_error
+            if np.isnan(td_error) or np.isinf(td_error):
+                print(f"WARNING: NaN/Inf in TD error at step {i}, resetting to 0")
+                td_error = 0.0
+            
             A = td_error + gamma * 0.95 * A
+            
+            # Safety check for A
+            if np.isnan(A) or np.isinf(A):
+                print(f"WARNING: NaN/Inf in advantage calculation at step {i}, resetting to 0")
+                A = 0.0
+            
             advantages.insert(0, A)
         
         returns = np.array(returns, dtype=np.float32)
         advantages = np.array(advantages, dtype=np.float32)
         
-        # Normalize advantages safely
-        adv_std = advantages.std()
-        if adv_std > 1e-8:
-            advantages = (advantages - advantages.mean()) / adv_std
+        # Check for NaN in raw advantages
+        if np.any(np.isnan(advantages)):
+            print("WARNING: NaN in raw advantages, replacing with zeros")
+            advantages = np.nan_to_num(advantages, nan=0.0)
+        
+        if np.any(np.isnan(returns)):
+            print("WARNING: NaN in returns, replacing with zeros")
+            returns = np.nan_to_num(returns, nan=0.0)
+        
+        # Normalize advantages safely with additional checks
+        if len(advantages) > 1:
+            adv_std = np.std(advantages)
+            adv_mean = np.mean(advantages)
+            
+            if np.isnan(adv_mean) or np.isnan(adv_std):
+                print("WARNING: NaN in advantage mean/std, resetting advantages to zero")
+                advantages = np.zeros_like(advantages)
+            elif adv_std > 1e-8:
+                advantages = (advantages - adv_mean) / (adv_std + 1e-8)  # Add epsilon for safety
+            else:
+                # If std is too small, just center around mean
+                if not np.isnan(adv_mean):
+                    advantages = advantages - adv_mean
+                else:
+                    advantages = np.zeros_like(advantages)
         else:
-            # If std is too small, just center around mean
-            advantages = advantages - advantages.mean()
+            # Single advantage, can't normalize
+            if np.isnan(advantages[0]) or np.isinf(advantages[0]):
+                advantages[0] = 0.0
+        
+        # Final safety check
+        if np.any(np.isnan(advantages)) or np.any(np.isinf(advantages)):
+            print("WARNING: NaN/Inf in normalized advantages, replacing with zeros")
+            advantages = np.nan_to_num(advantages, nan=0.0, posinf=0.0, neginf=0.0)
 
     train_data_dir = "/media/user/HDD 1TB/Data"
     if not os.path.exists(train_data_dir):
         os.makedirs(train_data_dir)
 
-    with open(os.path.join(train_data_dir, "training_data.pkl"), 'ab') as f:
-        pickle.dump({'states': states, 'actions': actions, 'returns': returns, 'advantages': advantages, 'is_random': is_random_flags}, f)
+    # Only save if we have valid data
+    if steps_collected > 0 and len(states) > 0:
+        with open(os.path.join(train_data_dir, "training_data.pkl"), 'ab') as f:
+            pickle.dump({'states': states, 'actions': actions, 'returns': returns, 'advantages': advantages, 'is_random': is_random_flags}, f)
     
     random_count = sum(is_random_flags)
     policy_count = len(is_random_flags) - random_count
     
-    batch_info = {
-        'steps_collected': steps_collected,
-        'total_reward': sum(rewards),
-        'mean_value': np.mean(values) if values else 0.0,
-        'portfolio_value': info.get('portfolio_value', 1.0) if steps_collected > 0 else 1.0,
-        'benchmark_value': info.get('benchmark_value', 1.0) if steps_collected > 0 else 1.0,
-        'outperformance': info.get('outperformance', 1.0) if steps_collected > 0 else 1.0,  # Default to 1.0 (no change)
-        'done': done,
-        'random_actions': random_count,
-        'policy_actions': policy_count
-    }
+    # Ensure we have valid info even if episode ended early
+    if steps_collected == 0:
+        batch_info = {
+            'steps_collected': 0,
+            'total_reward': 0.0,
+            'mean_value': 0.0,
+            'portfolio_value': env._portfolio_portfolio_value(),
+            'benchmark_value': env._update_benchmark_value(),
+            'outperformance': 1.0,
+            'done': done,
+            'random_actions': 0,
+            'policy_actions': 0
+        }
+    else:
+        batch_info = {
+            'steps_collected': steps_collected,
+            'total_reward': sum(rewards),
+            'mean_value': np.mean(values) if values else 0.0,
+            'portfolio_value': info.get('portfolio_value', 1.0) if steps_collected > 0 else 1.0,
+            'benchmark_value': info.get('benchmark_value', 1.0) if steps_collected > 0 else 1.0,
+            'outperformance': info.get('outperformance', 1.0) if steps_collected > 0 else 1.0,
+            'done': done,
+            'random_actions': random_count,
+            'policy_actions': policy_count
+        }
     
     return states, raw_states, actions, returns, advantages, values, is_random_flags, batch_info, step_logs
 
@@ -323,18 +460,45 @@ def train_on_batch(model, optimizer, batch_states, batch_raw_states, batch_actio
             total_encoder_loss = policy_loss
         
         policy_grads = tape.gradient(policy_loss, model.trainable_variables)
+        
+        # Check for NaN gradients
+        nan_grad_count = sum(1 for g in policy_grads if g is not None and tf.reduce_any(tf.math.is_nan(g)))
+        if nan_grad_count > 0:
+            print(f"WARNING: {nan_grad_count} policy gradients contain NaN, skipping update")
+            del tape
+            return {
+                'batch/loss': 0.0,
+                'batch/actor_loss': 0.0,
+                'batch/critic_loss': 0.0,
+                'batch/entropy': 0.0,
+                'batch/mean_action_prob': 0.0,
+                'batch/max_action_prob': 0.0,
+                'batch/min_action_prob': 0.0,
+                'batch/action_std': 0.0,
+                'batch/mean_return': 0.0,
+                'batch/std_return': 0.0,
+                'batch/mean_value': 0.0,
+                'batch/mean_advantage': 0.0,
+                'batch/grad_norm': 0.0,
+                'batch/random_action_ratio': 0.0,
+                'batch/clip_fraction': 0.0,
+                'batch/encoder_loss': 0.0,
+            }
+        
         policy_grads = [tf.clip_by_norm(g, 1.0) if g is not None else g for g in policy_grads]
         optimizer.apply_gradients(zip(policy_grads, model.trainable_variables))
         
-        encoder_grads = tape.gradient(total_encoder_loss, 
-                                      feature_reducer.encoder.trainable_variables + 
-                                      feature_reducer.decoder.trainable_variables)
+        # Only train encoder (not decoder) since we're not using reconstruction loss
+        encoder_grads = tape.gradient(total_encoder_loss, feature_reducer.encoder.trainable_variables)
         encoder_grads = [tf.clip_by_norm(g, 1.0) if g is not None else g for g in encoder_grads]
-        feature_reducer_optimizer.apply_gradients(
-            zip(encoder_grads, 
-                feature_reducer.encoder.trainable_variables + 
-                feature_reducer.decoder.trainable_variables)
-        )
+        
+        # Filter out None gradients
+        encoder_vars_and_grads = [(g, v) for g, v in zip(encoder_grads, feature_reducer.encoder.trainable_variables) if g is not None]
+        
+        if encoder_vars_and_grads:
+            feature_reducer_optimizer.apply_gradients(encoder_vars_and_grads)
+        else:
+            print("WARNING: No gradients for encoder")
         
         encoder_loss = total_encoder_loss.numpy()
         total_loss = policy_loss  # Set total_loss for metrics
@@ -361,6 +525,29 @@ def train_on_batch(model, optimizer, batch_states, batch_raw_states, batch_actio
             total_loss = actor_loss + 0.5 * value_loss - 0.01 * entropy
         
         grads = tape.gradient(total_loss, model.trainable_variables)
+        
+        # Check for NaN gradients before clipping
+        nan_grad_count = sum(1 for g in grads if g is not None and tf.reduce_any(tf.math.is_nan(g)))
+        if nan_grad_count > 0:
+            print(f"WARNING: {nan_grad_count} gradients contain NaN, skipping update")
+            return {
+                'batch/loss': 0.0,
+                'batch/actor_loss': 0.0,
+                'batch/critic_loss': 0.0,
+                'batch/entropy': 0.0,
+                'batch/mean_action_prob': 0.0,
+                'batch/max_action_prob': 0.0,
+                'batch/min_action_prob': 0.0,
+                'batch/action_std': 0.0,
+                'batch/mean_return': 0.0,
+                'batch/std_return': 0.0,
+                'batch/mean_value': 0.0,
+                'batch/mean_advantage': 0.0,
+                'batch/grad_norm': 0.0,
+                'batch/random_action_ratio': 0.0,
+                'batch/clip_fraction': 0.0,
+            }
+        
         grads = [tf.clip_by_norm(g, 1.0) for g in grads]
         optimizer.apply_gradients(zip(grads, model.trainable_variables))
     
@@ -665,7 +852,7 @@ if __name__ == "__main__":
         "dropout_rate": 0.15,
         "feature_extractor_dim": 384,
         "num_attention_blocks": 2,
-        "initial_lr": 0.0005,
+        "initial_lr": 0.0015,
         "pretrain_episodes": 10,
         "pretrain_epochs": 0,
         "pretrain_batch_size": 512,

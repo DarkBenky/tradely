@@ -389,6 +389,11 @@ class PortfolioEnv():
         else:
             final_obs = np.array([])
         
+        # Final safety check - replace any NaN/Inf values
+        if np.any(np.isnan(final_obs)) or np.any(np.isinf(final_obs)):
+            print(f"WARNING: NaN/Inf detected in observation, cleaning...")
+            final_obs = np.nan_to_num(final_obs, nan=0.0, posinf=1.0, neginf=0.0)
+        
         return final_obs
     
     def _calculate_future_profit(self) -> dict:
@@ -402,8 +407,21 @@ class PortfolioEnv():
             current_price = data['close'].iloc[self.step_count]
             # Look at the NEXT step's price (what actually happens)
             next_price = data['close'].iloc[self.step_count + 1]
+            
+            # Protect against division by zero or invalid prices
+            if current_price <= 0 or np.isnan(current_price) or np.isnan(next_price):
+                future_profits[symbol] = 0.0
+                continue
+            
             # Calculate actual return
             actual_return = (next_price - current_price) / current_price
+            
+            # Sanity check and clip extreme values
+            if np.isnan(actual_return) or np.isinf(actual_return):
+                actual_return = 0.0
+            else:
+                actual_return = np.clip(actual_return, -0.5, 0.5)  # Clip to ±50%
+            
             future_profits[symbol] = actual_return
         return future_profits
 
@@ -587,16 +605,29 @@ class PortfolioEnv():
         # Calculate current portfolio value and weights
         current_value = self._portfolio_portfolio_value()
         
+        # Safety check
+        if current_value <= 0 or np.isnan(current_value) or np.isinf(current_value):
+            return 0.0
+        
         # Calculate the actual profit the portfolio will make based on current holdings
         portfolio_future_return = 0.0
         
         for symbol in self.df.keys():
             price = self.df[symbol]['close'].iloc[self.step_count]
+            
+            # Skip if price is invalid
+            if price <= 0 or np.isnan(price):
+                continue
+            
             holdings_value = self.portfolio[symbol] * price
-            weight = holdings_value / current_value if current_value > 0 else 0
+            weight = holdings_value / current_value
             
             # Weight the actual future return by portfolio allocation
             portfolio_future_return += weight * future_profits[symbol]
+        
+        # Safety check for portfolio return
+        if np.isnan(portfolio_future_return) or np.isinf(portfolio_future_return):
+            portfolio_future_return = 0.0
         
         # Cash earns nothing (actually loses to inflation, but simplified)
         # This naturally penalizes holding too much cash
@@ -609,20 +640,31 @@ class PortfolioEnv():
         # Reward beating the passive buy-and-hold strategy
         benchmark_future_return = 0.0
         benchmark_value = self._update_benchmark_value()
-        for symbol in self.df.keys():
-            price = self.df[symbol]['close'].iloc[self.step_count]
-            benchmark_holdings_value = self.passive_portfolio[symbol] * price
-            benchmark_weight = benchmark_holdings_value / benchmark_value if benchmark_value > 0 else 0
-            benchmark_future_return += benchmark_weight * future_profits[symbol]
         
-        # Bonus for outperforming benchmark
-        outperformance = portfolio_future_return - benchmark_future_return
-        reward += outperformance * 500  # Extra reward for beating benchmark
+        if benchmark_value > 0 and not np.isnan(benchmark_value):
+            for symbol in self.df.keys():
+                price = self.df[symbol]['close'].iloc[self.step_count]
+                if price <= 0 or np.isnan(price):
+                    continue
+                    
+                benchmark_holdings_value = self.passive_portfolio[symbol] * price
+                benchmark_weight = benchmark_holdings_value / benchmark_value
+                benchmark_future_return += benchmark_weight * future_profits[symbol]
+            
+            # Safety check
+            if not np.isnan(benchmark_future_return) and not np.isinf(benchmark_future_return):
+                # Bonus for outperforming benchmark
+                outperformance = portfolio_future_return - benchmark_future_return
+                reward += outperformance * 500  # Extra reward for beating benchmark
+        
+        # Final safety checks
+        if np.isnan(reward) or np.isinf(reward):
+            reward = 0.0
         
         # Clip to prevent extreme values
         reward = np.clip(reward, -100, 100)
         
-        return reward
+        return float(reward)
     
     def step(self, action):
         """
