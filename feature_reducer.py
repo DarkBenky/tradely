@@ -104,8 +104,9 @@ class FeatureReducer:
             return tf.reduce_mean(within_threshold)
         
         # Compile with mixed precision to save memory
+        # Using Adafactor for reduced memory usage (no momentum/variance storage)
         self.autoencoder.compile(
-            optimizer=keras.optimizers.Adam(learning_rate=0.0015),
+            optimizer=keras.optimizers.Adafactor(learning_rate=0.0015),
             loss='mse',
             metrics=['mae', reconstruction_accuracy]
         )
@@ -499,7 +500,7 @@ def train_reducer_incrementally(input_path, reducer_path='feature_reducer.h5',
                             reducer._current_batch_num = batch_num
                             reducer.fit(training_samples, 
                                        epochs=epochs_per_batch, 
-                                       batch_size=24,  # Increased for better gradient estimates
+                                       batch_size=48,  # Increased for better gradient estimates
                                        validation_split=0.2,
                                        use_wandb=use_wandb,
                                        incremental=False)
@@ -509,7 +510,7 @@ def train_reducer_incrementally(input_path, reducer_path='feature_reducer.h5',
                             reducer._current_batch_num = batch_num
                             reducer.fit(training_samples,
                                        epochs=epochs_per_batch,
-                                       batch_size=24,  # Increased for better gradient estimates
+                                       batch_size=48,  # Increased for better gradient estimates
                                        validation_split=0.1,
                                        use_wandb=True,  # Changed to True to enable logging!
                                        incremental=True)
@@ -745,6 +746,23 @@ def preprocess_training_data(input_path, output_path, reducer_path='feature_redu
                         return_buffer = return_buffer[batch_size:]
                         is_random_buffer = is_random_buffer[batch_size:]
                         
+                        # Validate and filter states with correct dimensions
+                        valid_indices = []
+                        for i, state in enumerate(states_chunk):
+                            if isinstance(state, (list, np.ndarray)) and len(state) == reducer.input_dim:
+                                valid_indices.append(i)
+                        
+                        if len(valid_indices) == 0:
+                            print(f"  WARNING: Skipping batch - no valid states found (expected dim: {reducer.input_dim})")
+                            continue
+                        
+                        if len(valid_indices) < len(states_chunk):
+                            print(f"  WARNING: Filtered {len(states_chunk) - len(valid_indices)} states with incorrect dimensions")
+                            states_chunk = [states_chunk[i] for i in valid_indices]
+                            actions_chunk = [actions_chunk[i] for i in valid_indices]
+                            returns_chunk = [returns_chunk[i] for i in valid_indices]
+                            is_random_chunk = [is_random_chunk[i] for i in valid_indices]
+                        
                         # Transform states
                         states_array = np.array(states_chunk, dtype=np.float32)
                         transformed_states = reducer.transform(states_array)
@@ -769,6 +787,24 @@ def preprocess_training_data(input_path, output_path, reducer_path='feature_redu
                 # Process remaining samples in buffer
                 if len(sample_buffer) > 0:
                     print(f"\n  Processing final {len(sample_buffer)} samples...")
+                    
+                    # Validate and filter states with correct dimensions
+                    valid_indices = []
+                    for i, state in enumerate(sample_buffer):
+                        if isinstance(state, (list, np.ndarray)) and len(state) == reducer.input_dim:
+                            valid_indices.append(i)
+                    
+                    if len(valid_indices) == 0:
+                        print(f"  WARNING: No valid states in final batch")
+                        break
+                    
+                    if len(valid_indices) < len(sample_buffer):
+                        print(f"  WARNING: Filtered {len(sample_buffer) - len(valid_indices)} states with incorrect dimensions")
+                        sample_buffer = [sample_buffer[i] for i in valid_indices]
+                        action_buffer = [action_buffer[i] for i in valid_indices]
+                        return_buffer = [return_buffer[i] for i in valid_indices]
+                        is_random_buffer = [is_random_buffer[i] for i in valid_indices]
+                    
                     states_array = np.array(sample_buffer, dtype=np.float32)
                     transformed_states = reducer.transform(states_array)
                     
@@ -794,19 +830,19 @@ def preprocess_training_data(input_path, output_path, reducer_path='feature_redu
 if __name__ == "__main__":
     import sys
     
-    # Paths
+    os.makedirs('models', exist_ok=True)
+    
     synthetic_raw = "/media/user/HDD 1TB/Data/synthetic_training_data.pkl"
     synthetic_compressed = "/media/user/HDD 1TB/Data/synthetic_training_data_compressed.pkl"
     
     recorded_raw = "/media/user/HDD 1TB/Data/training_data.pkl"
     recorded_compressed = "/media/user/HDD 1TB/Data/training_data_compressed.pkl"
     
-    reducer_path = "feature_reducer.pkl"
+    reducer_path = "models/feature_reducer.pkl"
     
     print("Feature Reducer - Incremental Training")
     print("=" * 80)
     
-    # Check if old models exist and ask to remove
     base_path = reducer_path.replace('.h5', '').replace('.pkl', '')
     old_files = [
         f"{base_path}_encoder.h5",
@@ -837,7 +873,6 @@ if __name__ == "__main__":
             print("   Either delete them manually or rename them before training.")
             sys.exit(0)
     
-    # Check which files exist
     has_synthetic = os.path.exists(synthetic_raw)
     has_recorded = os.path.exists(recorded_raw)
     
@@ -845,13 +880,11 @@ if __name__ == "__main__":
         print("No training data found!")
         sys.exit(1)
     
-    # Choose training mode
     print("\nTraining mode: INCREMENTAL (memory-efficient)")
     print("  - Loads 2048 samples at a time")
     print("  - Trains for 10 epochs per batch")
     print("  - Continues training across batches\n")
     
-    # Train incrementally on synthetic data (prioritize synthetic for diversity)
     training_source = None
     if has_synthetic:
         print("Using synthetic data for training (more diverse)")
@@ -865,9 +898,9 @@ if __name__ == "__main__":
         reducer = train_reducer_incrementally(
             input_path=training_source,
             reducer_path=reducer_path,
-            samples_per_batch=512,  # Reduced for memory
+            samples_per_batch=512,
             epochs_per_batch=10,
-            max_batches=None,  # Train on all data
+            max_batches=None,
             use_wandb=True
         )
         
@@ -876,7 +909,6 @@ if __name__ == "__main__":
         print(f"{'='*80}")
         print(f"Feature reducer saved to: {reducer_path}")
         
-        # Now compress both datasets using trained reducer
         print("\n\nCompressing datasets with trained reducer...")
         
         if has_synthetic:
