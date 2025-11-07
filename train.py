@@ -18,23 +18,12 @@ DEBUG = False
 try:
     from feature_reducer import FeatureReducer
     FEATURE_REDUCER = None
-    TRAIN_FEATURE_REDUCER = True
-    
-    best_path = 'models/feature_reducer_best'
-    regular_path = 'models/feature_reducer'
-    
-    if os.path.exists(f'{best_path}_encoder.h5'):
-        FEATURE_REDUCER = FeatureReducer.load('models/feature_reducer_best.h5')
-        print(f"Loaded best feature reducer: {FEATURE_REDUCER.input_dim} -> {FEATURE_REDUCER.target_dim} dims")
-    elif os.path.exists(f'{regular_path}_encoder.h5'):
-        FEATURE_REDUCER = FeatureReducer.load('models/feature_reducer.h5')
-        print(f"Loaded feature reducer: {FEATURE_REDUCER.input_dim} -> {FEATURE_REDUCER.target_dim} dims")
-    else:
-        print("Feature reducer not found - will be trained during policy training")
+    TRAIN_FEATURE_REDUCER = False
+    print("Feature reduction will be handled by model's built-in compression layers")
 except Exception as e:
     FEATURE_REDUCER = None
     TRAIN_FEATURE_REDUCER = False
-    print(f"Feature reducer not available: {e}")
+    print(f"Using model's built-in feature compression")
 
 class TransformerBlock(layers.Layer):
     def __init__(self, embed_dim, num_heads, ff_dim, rate=0.1):
@@ -78,52 +67,70 @@ class FeatureExtractor(layers.Layer):
 def build_model(obs_shape, num_assets, config=None, feature_reducer=None):
     if config is None:
         config = {
-            "num_transformer_blocks": 4,
-            "embed_dim": 192,
-            "num_heads": 12,
-            "ff_dim": 768,
             "dropout_rate": 0.15,
-            "feature_extractor_dim": 384,
-            "num_attention_blocks": 2,
+            "compression_layers": [8192, 2048],
+            "compression_dropout": 0.1,
+            "shared_layers": [1024, 768, 512, 384, 256],
+            "residual_connections": [True, True, True, False],
+            "actor_layers": [192, 128],
+            "critic_layers": [192, 128],
         }
+    
+    compression_layers = config.get("compression_layers", [8192, 2048])
+    compression_dropout = config.get("compression_dropout", 0.1)
+    shared_layers = config.get("shared_layers", [1024, 768, 512, 384, 256])
+    residual_connections = config.get("residual_connections", [True, True, True, False])
+    actor_layers = config.get("actor_layers", [192, 128])
+    critic_layers = config.get("critic_layers", [192, 128])
+    dropout_rate = config.get("dropout_rate", 0.15)
     
     inputs = layers.Input(shape=obs_shape)
     
-    x = FeatureExtractor(config["feature_extractor_dim"], config["dropout_rate"])(inputs)
+    if obs_shape[0] > 10000 and compression_layers:
+        x = inputs
+        for i, units in enumerate(compression_layers):
+            x = layers.Dense(units, activation='relu', name=f'compression_layer_{i+1}')(x)
+            x = layers.BatchNormalization()(x)
+            x = layers.Dropout(compression_dropout)(x)
+    else:
+        x = inputs
     
-    seq_len = config["feature_extractor_dim"] // config["embed_dim"]
-    x = layers.Reshape((seq_len, config["embed_dim"]))(x)
+    while len(residual_connections) < len(shared_layers):
+        residual_connections.append(False)
     
-    for _ in range(config["num_transformer_blocks"]):
-        x = TransformerBlock(
-            embed_dim=config["embed_dim"],
-            num_heads=config["num_heads"],
-            ff_dim=config["ff_dim"],
-            rate=config["dropout_rate"]
-        )(x)
+    for i, units in enumerate(shared_layers):
+        use_residual = residual_connections[i] if i < len(residual_connections) else False
+        
+        if use_residual and i > 0:
+            residual = x
+            if x.shape[-1] != units:
+                residual = layers.Dense(units, activation='linear')(residual)
+            
+            x = layers.Dense(units, activation='relu')(x)
+            x = layers.BatchNormalization()(x)
+            x = layers.Dropout(dropout_rate)(x)
+            x = layers.Dense(units, activation='linear')(x)
+            x = layers.Add()([x, residual])
+            x = layers.Activation('relu')(x)
+        else:
+            x = layers.Dense(units, activation='relu')(x)
+            x = layers.BatchNormalization()(x)
+            x = layers.Dropout(dropout_rate)(x)
     
-    avg_pool = layers.GlobalAveragePooling1D()(x)
-    max_pool = layers.GlobalMaxPooling1D()(x)
-    x = layers.Concatenate()([avg_pool, max_pool])
-    
-    x = layers.Dense(config["embed_dim"] * 2, activation='gelu')(x)
-    x = layers.LayerNormalization()(x)
-    x = layers.Dropout(config["dropout_rate"])(x)
-    
-    for _ in range(config["num_attention_blocks"]):
-        residual = x
-        x = layers.Dense(config["embed_dim"] * 2, activation='gelu')(x)
-        x = layers.Dropout(config["dropout_rate"] * 0.5)(x)
-        x = layers.Dense(config["embed_dim"] * 2)(x)
-        x = layers.Add()([x, residual])
-        x = layers.LayerNormalization()(x)
-    
-    actor_x = layers.Dense(config["embed_dim"], activation='gelu', name='actor_dense')(x)
-    actor_x = layers.Dropout(config["dropout_rate"])(actor_x)
+    actor_x = x
+    for i, units in enumerate(actor_layers):
+        actor_x = layers.Dense(units, activation='relu', name=f'actor_dense_{i+1}')(actor_x)
+        if i < len(actor_layers) - 1:
+            actor_x = layers.BatchNormalization()(actor_x)
+        actor_x = layers.Dropout(dropout_rate)(actor_x)
     actor_output = layers.Dense(num_assets, activation='softmax', name='portfolio_allocation')(actor_x)
     
-    critic_x = layers.Dense(config["embed_dim"], activation='gelu', name='critic_dense')(x)
-    critic_x = layers.Dropout(config["dropout_rate"])(critic_x)
+    critic_x = x
+    for i, units in enumerate(critic_layers):
+        critic_x = layers.Dense(units, activation='relu', name=f'critic_dense_{i+1}')(critic_x)
+        if i < len(critic_layers) - 1:
+            critic_x = layers.BatchNormalization()(critic_x)
+        critic_x = layers.Dropout(dropout_rate)(critic_x)
     critic_output = layers.Dense(1, activation='linear', name='value')(critic_x)
     
     model = Model(inputs=inputs, outputs=[actor_output, critic_output])
@@ -133,7 +140,6 @@ def collect_batch_data(env, model, batch_size, gamma, current_step, epsilon=0.1,
     states, raw_states, actions, rewards, values, is_random_flags = [], [], [], [], [], []
     step_logs = []
     
-    # If we encounter NaN early, reset and try again
     max_reset_attempts = 3
     reset_attempt = 0
     
@@ -143,10 +149,10 @@ def collect_batch_data(env, model, batch_size, gamma, current_step, epsilon=0.1,
         else:
             state = env.get_observation()
         
-        # Check if initial state is valid
         if np.any(np.isnan(state)) or np.any(np.isinf(state)):
             print(f"WARNING: Invalid state after reset (attempt {reset_attempt + 1}/{max_reset_attempts}), retrying...")
             reset_attempt += 1
+            env_reset_probability_temp = 1.0
             continue
         else:
             break
@@ -169,6 +175,9 @@ def collect_batch_data(env, model, batch_size, gamma, current_step, epsilon=0.1,
     
     if feature_reducer is not None:
         state = feature_reducer.transform(state.reshape(1, -1))[0]
+        if np.any(np.isnan(state)) or np.any(np.isinf(state)):
+            print(f"WARNING: Feature reducer produced NaN/Inf, cleaning...")
+            state = np.nan_to_num(state, nan=0.0, posinf=1.0, neginf=0.0)
     
     done = False
     steps_collected = 0
@@ -178,16 +187,13 @@ def collect_batch_data(env, model, batch_size, gamma, current_step, epsilon=0.1,
     while steps_collected < batch_size and not done:
         state_tensor = tf.convert_to_tensor(state[np.newaxis, :], dtype=tf.float32)
         
-        # Check for NaN in state
         if np.any(np.isnan(state)) or np.any(np.isinf(state)):
             print(f"WARNING: NaN/Inf detected in state at step {steps_collected}, resetting episode")
-            # Reset environment and try to continue
             state = env.reset()
             raw_state = state.copy()
             if feature_reducer is not None:
                 state = feature_reducer.transform(state.reshape(1, -1))[0]
             
-            # If still NaN after reset, we need to give up on this batch
             if np.any(np.isnan(state)) or np.any(np.isinf(state)):
                 print(f"ERROR: State still invalid after reset, ending batch early")
                 done = True
@@ -198,11 +204,15 @@ def collect_batch_data(env, model, batch_size, gamma, current_step, epsilon=0.1,
         action = action_probs[0].numpy()
         value = value[0, 0].numpy()
         
-        # Check for NaN in model outputs
         if np.any(np.isnan(action)) or np.isnan(value):
             print(f"WARNING: NaN in model output (action or value), using random action")
             action = env.sample()
             value = 0.0
+            is_random = True
+        elif np.isinf(value) or abs(value) > 1000:
+            print(f"WARNING: Extreme value prediction: {value:.2f}, clipping and using random action")
+            value = np.clip(value, -100.0, 100.0)
+            action = env.sample()
             is_random = True
         else:
             is_random = False
@@ -218,10 +228,12 @@ def collect_batch_data(env, model, batch_size, gamma, current_step, epsilon=0.1,
         
         next_state, reward, done, info = env.step(action)
         
-        # Check for NaN in reward
         if np.isnan(reward) or np.isinf(reward):
             print(f"WARNING: NaN/Inf reward detected, replacing with 0.0")
             reward = 0.0
+        elif abs(reward) > 20:
+            print(f"WARNING: Extreme reward detected: {reward:.2f}, clipping to +-10")
+            reward = np.clip(reward, -10.0, 10.0)
         
         env.render()
         
@@ -248,24 +260,10 @@ def collect_batch_data(env, model, batch_size, gamma, current_step, epsilon=0.1,
             'action_mean': np.mean(action),
             'action_std': np.std(action),
             'action_max': np.max(action),
-            'done': done
+            'done': done,
+            'portfolio_layout': info.get('portfolio_layout', {})
         }
         
-        wandb.log({
-            "step/global": step_log['step_global'],
-            "step/batch": step_log['step_batch'],
-            "step/reward": step_log['reward'],
-            "step/value": step_log['value'],
-            "step/portfolio_value": step_log['portfolio_value'],
-            "step/benchmark_value": step_log['benchmark_value'],
-            "step/outperformance": (step_log['outperformance'] - 1) * 100,
-            "step/action_mean": step_log['action_mean'],
-            "step/action_std": step_log['action_std'],
-            "step/action_max": step_log['action_max'],
-            "step/done": step_log['done'],
-            "step/portfolio_layout": info['portfolio_layout']
-        })
-
         step_logs.append(step_log)
         
         state = next_state
@@ -276,12 +274,10 @@ def collect_batch_data(env, model, batch_size, gamma, current_step, epsilon=0.1,
             print(f"  Warning: Episode exceeded 10000 steps, forcing termination")
             break
     
-    # Initialize returns and advantages with empty arrays as fallback
     returns = np.array([], dtype=np.float32)
     advantages = np.array([], dtype=np.float32)
     
     if steps_collected > 0:
-        # First, check all inputs for NaN
         rewards_array = np.array(rewards, dtype=np.float32)
         values_array = np.array(values, dtype=np.float32)
         
@@ -303,7 +299,6 @@ def collect_batch_data(env, model, batch_size, gamma, current_step, epsilon=0.1,
         for i in reversed(range(len(rewards))):
             G = rewards[i] + gamma * G
             
-            # Safety check for G
             if np.isnan(G) or np.isinf(G):
                 print(f"WARNING: NaN/Inf in return calculation at step {i}, resetting to 0")
                 G = 0.0
@@ -313,14 +308,12 @@ def collect_batch_data(env, model, batch_size, gamma, current_step, epsilon=0.1,
             next_value = values[i+1] if i+1 < len(values) else 0.0
             td_error = rewards[i] + gamma * next_value - values[i]
             
-            # Safety check for td_error
             if np.isnan(td_error) or np.isinf(td_error):
                 print(f"WARNING: NaN/Inf in TD error at step {i}, resetting to 0")
                 td_error = 0.0
             
             A = td_error + gamma * 0.95 * A
             
-            # Safety check for A
             if np.isnan(A) or np.isinf(A):
                 print(f"WARNING: NaN/Inf in advantage calculation at step {i}, resetting to 0")
                 A = 0.0
@@ -330,7 +323,6 @@ def collect_batch_data(env, model, batch_size, gamma, current_step, epsilon=0.1,
         returns = np.array(returns, dtype=np.float32)
         advantages = np.array(advantages, dtype=np.float32)
         
-        # Check for NaN in raw advantages
         if np.any(np.isnan(advantages)):
             print("WARNING: NaN in raw advantages, replacing with zeros")
             advantages = np.nan_to_num(advantages, nan=0.0)
@@ -339,7 +331,6 @@ def collect_batch_data(env, model, batch_size, gamma, current_step, epsilon=0.1,
             print("WARNING: NaN in returns, replacing with zeros")
             returns = np.nan_to_num(returns, nan=0.0)
         
-        # Normalize advantages safely with additional checks
         if len(advantages) > 1:
             adv_std = np.std(advantages)
             adv_mean = np.mean(advantages)
@@ -348,19 +339,16 @@ def collect_batch_data(env, model, batch_size, gamma, current_step, epsilon=0.1,
                 print("WARNING: NaN in advantage mean/std, resetting advantages to zero")
                 advantages = np.zeros_like(advantages)
             elif adv_std > 1e-8:
-                advantages = (advantages - adv_mean) / (adv_std + 1e-8)  # Add epsilon for safety
+                advantages = (advantages - adv_mean) / (adv_std + 1e-8)
             else:
-                # If std is too small, just center around mean
                 if not np.isnan(adv_mean):
                     advantages = advantages - adv_mean
                 else:
                     advantages = np.zeros_like(advantages)
         else:
-            # Single advantage, can't normalize
             if np.isnan(advantages[0]) or np.isinf(advantages[0]):
                 advantages[0] = 0.0
         
-        # Final safety check
         if np.any(np.isnan(advantages)) or np.any(np.isinf(advantages)):
             print("WARNING: NaN/Inf in normalized advantages, replacing with zeros")
             advantages = np.nan_to_num(advantages, nan=0.0, posinf=0.0, neginf=0.0)
@@ -369,7 +357,6 @@ def collect_batch_data(env, model, batch_size, gamma, current_step, epsilon=0.1,
     if not os.path.exists(train_data_dir):
         os.makedirs(train_data_dir)
 
-    # Only save if we have valid data
     if steps_collected > 0 and len(states) > 0:
         with open(os.path.join(train_data_dir, "training_data.pkl"), 'ab') as f:
             pickle.dump({'states': states, 'actions': actions, 'returns': returns, 'advantages': advantages, 'is_random': is_random_flags}, f)
@@ -377,7 +364,6 @@ def collect_batch_data(env, model, batch_size, gamma, current_step, epsilon=0.1,
     random_count = sum(is_random_flags)
     policy_count = len(is_random_flags) - random_count
     
-    # Ensure we have valid info even if episode ended early
     if steps_collected == 0:
         batch_info = {
             'steps_collected': 0,
@@ -409,166 +395,64 @@ def train_on_batch(model, optimizer, batch_states, batch_raw_states, batch_actio
                    batch_advantages, is_random_flags, batch_num, feature_reducer=None, 
                    feature_reducer_optimizer=None, clip_ratio=0.2, train_encoder=True):
     states_batch = np.array(batch_states, dtype=np.float32)
-    raw_states_batch = np.array(batch_raw_states, dtype=np.float32)
     actions_batch = np.array(batch_actions, dtype=np.float32)
     returns_batch = np.array(batch_returns, dtype=np.float32)
-    advantages_batch = np.array(batch_advantages, dtype=np.float32)
-    is_random_batch = np.array(is_random_flags, dtype=np.float32)
     
-    # Check for NaN in inputs
-    if np.any(np.isnan(advantages_batch)):
-        print("WARNING: NaN detected in advantages_batch, replacing with zeros")
-        advantages_batch = np.nan_to_num(advantages_batch, nan=0.0)
-    
-    importance_weights = np.where(is_random_batch == 1.0, 0.5, 1.0)
-    
-    old_action_probs, old_values = model(states_batch, training=False)
-    old_action_probs = old_action_probs.numpy()
-    old_log_probs = np.sum(actions_batch * np.log(old_action_probs + 1e-8), axis=1)
-    
-    encoder_loss = 0.0
-    total_loss = 0.0
-    policy_loss = 0.0
-    actor_loss = 0.0
-    value_loss = 0.0
-    entropy = 0.0
-    action_probs = None
-    values = None
-    grads = []
-    ratio = None
-    
-    if train_encoder and feature_reducer is not None and feature_reducer_optimizer is not None:
-        with tf.GradientTape(persistent=True) as tape:
-            encoded = feature_reducer.encoder(raw_states_batch, training=True)
-            action_probs, values = model(encoded, training=True)
-            action_probs_clipped = tf.clip_by_value(action_probs, 1e-8, 1.0)
-            
-            log_probs = tf.reduce_sum(actions_batch * tf.math.log(action_probs_clipped), axis=1)
-            ratio = tf.exp(log_probs - old_log_probs)
-            
-            surr1 = ratio * advantages_batch * importance_weights
-            surr2 = tf.clip_by_value(ratio, 1 - clip_ratio, 1 + clip_ratio) * advantages_batch * importance_weights
-            actor_loss = -tf.reduce_mean(tf.minimum(surr1, surr2))
-            
-            values_squeezed = tf.squeeze(values)
-            value_loss = tf.reduce_mean(tf.square(returns_batch - values_squeezed))
-            
-            entropy = -tf.reduce_mean(tf.reduce_sum(action_probs * tf.math.log(action_probs_clipped), axis=1))
-            
-            policy_loss = actor_loss + 0.5 * value_loss - 0.01 * entropy
-            
-            total_encoder_loss = policy_loss
-        
-        policy_grads = tape.gradient(policy_loss, model.trainable_variables)
-        
-        # Check for NaN gradients
-        nan_grad_count = sum(1 for g in policy_grads if g is not None and tf.reduce_any(tf.math.is_nan(g)))
-        if nan_grad_count > 0:
-            print(f"WARNING: {nan_grad_count} policy gradients contain NaN, skipping update")
-            del tape
-            return {
-                'batch/loss': 0.0,
-                'batch/actor_loss': 0.0,
-                'batch/critic_loss': 0.0,
-                'batch/entropy': 0.0,
-                'batch/mean_action_prob': 0.0,
-                'batch/max_action_prob': 0.0,
-                'batch/min_action_prob': 0.0,
-                'batch/action_std': 0.0,
-                'batch/mean_return': 0.0,
-                'batch/std_return': 0.0,
-                'batch/mean_value': 0.0,
-                'batch/mean_advantage': 0.0,
-                'batch/grad_norm': 0.0,
-                'batch/random_action_ratio': 0.0,
-                'batch/clip_fraction': 0.0,
-                'batch/encoder_loss': 0.0,
-            }
-        
-        policy_grads = [tf.clip_by_norm(g, 1.0) if g is not None else g for g in policy_grads]
-        optimizer.apply_gradients(zip(policy_grads, model.trainable_variables))
-        
-        # Only train encoder (not decoder) since we're not using reconstruction loss
-        encoder_grads = tape.gradient(total_encoder_loss, feature_reducer.encoder.trainable_variables)
-        encoder_grads = [tf.clip_by_norm(g, 1.0) if g is not None else g for g in encoder_grads]
-        
-        # Filter out None gradients
-        encoder_vars_and_grads = [(g, v) for g, v in zip(encoder_grads, feature_reducer.encoder.trainable_variables) if g is not None]
-        
-        if encoder_vars_and_grads:
-            feature_reducer_optimizer.apply_gradients(encoder_vars_and_grads)
-        else:
-            print("WARNING: No gradients for encoder")
-        
-        encoder_loss = total_encoder_loss.numpy()
-        total_loss = policy_loss  # Set total_loss for metrics
-        
-        del tape
-        
+    returns_mean = np.mean(returns_batch)
+    returns_std = np.std(returns_batch)
+    if returns_std > 1e-6 and not np.isnan(returns_std):
+        returns_batch = (returns_batch - returns_mean) / (returns_std + 1e-8)
     else:
-        with tf.GradientTape() as tape:
-            action_probs, values = model(states_batch, training=True)
-            action_probs_clipped = tf.clip_by_value(action_probs, 1e-8, 1.0)
-            
-            log_probs = tf.reduce_sum(actions_batch * tf.math.log(action_probs_clipped), axis=1)
-            ratio = tf.exp(log_probs - old_log_probs)
-            
-            surr1 = ratio * advantages_batch * importance_weights
-            surr2 = tf.clip_by_value(ratio, 1 - clip_ratio, 1 + clip_ratio) * advantages_batch * importance_weights
-            actor_loss = -tf.reduce_mean(tf.minimum(surr1, surr2))
-            
-            values_squeezed = tf.squeeze(values)
-            value_loss = tf.reduce_mean(tf.square(returns_batch - values_squeezed))
-            
-            entropy = -tf.reduce_mean(tf.reduce_sum(action_probs * tf.math.log(action_probs_clipped), axis=1))
-            
-            total_loss = actor_loss + 0.5 * value_loss - 0.01 * entropy
-        
-        grads = tape.gradient(total_loss, model.trainable_variables)
-        
-        # Check for NaN gradients before clipping
-        nan_grad_count = sum(1 for g in grads if g is not None and tf.reduce_any(tf.math.is_nan(g)))
-        if nan_grad_count > 0:
-            print(f"WARNING: {nan_grad_count} gradients contain NaN, skipping update")
-            return {
-                'batch/loss': 0.0,
-                'batch/actor_loss': 0.0,
-                'batch/critic_loss': 0.0,
-                'batch/entropy': 0.0,
-                'batch/mean_action_prob': 0.0,
-                'batch/max_action_prob': 0.0,
-                'batch/min_action_prob': 0.0,
-                'batch/action_std': 0.0,
-                'batch/mean_return': 0.0,
-                'batch/std_return': 0.0,
-                'batch/mean_value': 0.0,
-                'batch/mean_advantage': 0.0,
-                'batch/grad_norm': 0.0,
-                'batch/random_action_ratio': 0.0,
-                'batch/clip_fraction': 0.0,
-            }
-        
-        grads = [tf.clip_by_norm(g, 1.0) for g in grads]
-        optimizer.apply_gradients(zip(grads, model.trainable_variables))
+        returns_batch = returns_batch - returns_mean if not np.isnan(returns_mean) else returns_batch
     
-    # Ensure action_probs and values are available for metrics
-    if action_probs is None:
-        action_probs, values = model(states_batch, training=False)
+    returns_batch = np.clip(returns_batch, -10.0, 10.0)
     
-    # Ensure ratio is computed for metrics
-    if ratio is None:
+    with tf.GradientTape() as tape:
+        action_probs, values = model(states_batch, training=True)
         action_probs_clipped = tf.clip_by_value(action_probs, 1e-8, 1.0)
+        
         log_probs = tf.reduce_sum(actions_batch * tf.math.log(action_probs_clipped), axis=1)
-        ratio = tf.exp(log_probs - old_log_probs)
+        actor_loss = -tf.reduce_mean(log_probs * returns_batch)
+        
+        values_squeezed = tf.squeeze(values)
+        value_loss = tf.reduce_mean(tf.square(returns_batch - values_squeezed))
+        
+        entropy = -tf.reduce_mean(tf.reduce_sum(action_probs * tf.math.log(action_probs_clipped), axis=1))
+        
+        total_loss = actor_loss + 1.0 * value_loss - 0.01 * entropy
+    
+    grads = tape.gradient(total_loss, model.trainable_variables)
+    
+    nan_grad_count = sum(1 for g in grads if g is not None and tf.reduce_any(tf.math.is_nan(g)))
+    if nan_grad_count > 0:
+        print(f"WARNING: {nan_grad_count} gradients contain NaN, skipping update")
+        return {
+            'batch/loss': 0.0,
+            'batch/actor_loss': 0.0,
+            'batch/critic_loss': 0.0,
+            'batch/entropy': 0.0,
+            'batch/mean_action_prob': 0.0,
+            'batch/max_action_prob': 0.0,
+            'batch/min_action_prob': 0.0,
+            'batch/action_std': 0.0,
+            'batch/mean_return': 0.0,
+            'batch/std_return': 0.0,
+            'batch/mean_value': 0.0,
+            'batch/grad_norm': 0.0,
+            'batch/random_action_ratio': 0.0,
+        }
+    
+    grads = [tf.clip_by_norm(g, 0.5) for g in grads]
+    optimizer.apply_gradients(zip(grads, model.trainable_variables))
     
     action_probs_np = action_probs.numpy()
+    grad_norm = float(tf.linalg.global_norm(grads).numpy())
     
-    # Safe metric extraction with NaN handling
     metrics = {
-        'batch/loss': float(total_loss.numpy() if hasattr(total_loss, 'numpy') else total_loss),
-        'batch/actor_loss': float(actor_loss.numpy() if hasattr(actor_loss, 'numpy') else actor_loss),
-        'batch/critic_loss': float(value_loss.numpy() if hasattr(value_loss, 'numpy') else value_loss),
-        'batch/entropy': float(entropy.numpy() if hasattr(entropy, 'numpy') else entropy),
+        'batch/loss': float(total_loss.numpy()),
+        'batch/actor_loss': float(actor_loss.numpy()),
+        'batch/critic_loss': float(value_loss.numpy()),
+        'batch/entropy': float(entropy.numpy()),
         'batch/mean_action_prob': float(tf.reduce_mean(action_probs).numpy()),
         'batch/max_action_prob': float(tf.reduce_max(action_probs).numpy()),
         'batch/min_action_prob': float(tf.reduce_min(action_probs).numpy()),
@@ -576,18 +460,29 @@ def train_on_batch(model, optimizer, batch_states, batch_raw_states, batch_actio
         'batch/mean_return': float(np.mean(batch_returns)),
         'batch/std_return': float(np.std(batch_returns)),
         'batch/mean_value': float(tf.reduce_mean(values).numpy()),
-        'batch/mean_advantage': float(np.mean(batch_advantages)),
-        'batch/grad_norm': float(tf.linalg.global_norm(grads).numpy() if grads else 0.0),
-        'batch/random_action_ratio': float(np.mean(is_random_batch)),
-        'batch/clip_fraction': float(np.mean(np.abs(ratio.numpy() - 1.0) > clip_ratio)),
+        'batch/grad_norm': grad_norm,
+        'batch/random_action_ratio': float(np.mean(is_random_flags)),
     }
     
-    if train_encoder and feature_reducer is not None:
+    grad_values = [g.numpy() for g in grads if g is not None]
+    if grad_values:
+        all_grads = np.concatenate([g.flatten() for g in grad_values])
         metrics.update({
-            'batch/encoder_loss': float(encoder_loss),
+            'gradients/mean': float(np.mean(all_grads)),
+            'gradients/std': float(np.std(all_grads)),
+            'gradients/min': float(np.min(all_grads)),
+            'gradients/max': float(np.max(all_grads)),
+            'gradients/abs_mean': float(np.mean(np.abs(all_grads))),
         })
+        
+        if batch_num % 2 == 0:
+            metrics['gradients/histogram'] = wandb.Histogram(all_grads)
     
-    # Final NaN check - replace any NaN values with 0.0
+    if batch_num % 2 == 0:
+        metrics['action_probs/histogram'] = wandb.Histogram(action_probs_np.flatten())
+        metrics['values/histogram'] = wandb.Histogram(values.numpy().flatten())
+        metrics['returns/histogram'] = wandb.Histogram(batch_returns)
+    
     for key, value in metrics.items():
         if np.isnan(value):
             print(f"WARNING: NaN detected in metric {key}, replacing with 0.0")
@@ -596,9 +491,8 @@ def train_on_batch(model, optimizer, batch_states, batch_raw_states, batch_actio
     return metrics
 
 def offline_pretrain(env, model, optimizer, num_episodes=50, gamma=0.99, batch_size=256, epochs=20, chunk_size=10000):
-    print("\n=== OFFLINE PRETRAINING (MEMORY OPTIMIZED) ===")
+    print("\nOFFLINE PRETRAINING (MEMORY OPTIMIZED)")
     
-    # Try compressed data first, fallback to raw
     pkl_files = [
         '/media/user/HDD 1TB/Data/synthetic_training_data_compressed.pkl',
         '/media/user/HDD 1TB/Data/synthetic_training_data.pkl'
@@ -844,29 +738,29 @@ if __name__ == "__main__":
     ENABLE_PRETRAINING = True
     
     config = {
-        "architecture": "transformer_v2",
-        "num_transformer_blocks": 8,
-        "embed_dim": 192,
-        "num_heads": 12,
-        "ff_dim": 768,
+        "architecture": "dense_residual",
         "dropout_rate": 0.15,
-        "feature_extractor_dim": 384,
-        "num_attention_blocks": 2,
-        "initial_lr": 0.0015,
+        "compression_layers": [4096, 2048, 1024],
+        "compression_dropout": 0.1,
+        "shared_layers": [1024, 768, 512, 384, 256],
+        "residual_connections": [True, True, True, False],
+        "actor_layers": [256, 256, 256, 256, 256, 256, 128],
+        "critic_layers": [256, 256, 256, 256, 256, 256, 128],
+        "initial_lr": 0.0001,
         "pretrain_episodes": 10,
         "pretrain_epochs": 0,
         "pretrain_batch_size": 512,
         "pretrain_chunk_size": 512 * 10,
         "online_total_batches": 5000,
-        "online_batch_size": 64,
+        "online_batch_size": 128,
         "gamma": 0.99,
-        "lr_patience": 100,
-        "lr_decay": 0.5,
+        "lr_patience": 200,
+        "lr_decay": 0.8,
         "log_step_frequency": 1,
-        "epsilon_start": 0.075,
-        "epsilon_end": 0.02,
+        "epsilon_start": 0.025,
+        "epsilon_end": 0.0001,
         "epsilon_decay": 0.9995,
-        "env_reset_probability": 0.15,
+        "env_reset_probability": 0.25,
     }
     
     wandb.init(project="portfolio-trading-online-batch", config=config)
@@ -876,41 +770,90 @@ if __name__ == "__main__":
     env = PortfolioEnv(max_records=100_000)
     observation = env.reset()
     
-    # Apply feature reduction if available
-    if FEATURE_REDUCER is not None:
-        observation = FEATURE_REDUCER.transform(observation.reshape(1, -1))[0]
-        print(f"Using feature reducer: {FEATURE_REDUCER.input_dim} → {len(observation)} dims")
-    
     obs_shape = observation.shape
     num_assets = len(env.asset_names)
     
-    print("Building model...")
+    print(f"Raw observation shape: {obs_shape}")
+    print("Building model with built-in feature compression...")
     model = build_model(obs_shape, num_assets, config, FEATURE_REDUCER)
     model.summary()
     
-    optimizer = tf.keras.optimizers.Adam(learning_rate=config.initial_lr)
-    feature_reducer_optimizer = None
+    # Calculate and log model architecture details
+    total_params = sum([tf.size(var).numpy() for var in model.trainable_variables])
     
-    if FEATURE_REDUCER is not None and TRAIN_FEATURE_REDUCER:
-        feature_reducer_optimizer = tf.keras.optimizers.Adafactor(learning_rate=config.initial_lr * 0.1)
-        print(f"Feature reducer will be trained end-to-end with policy")
-        print(f"Encoder LR: {config.initial_lr * 0.1:.6f} (Adafactor)")
-    elif FEATURE_REDUCER is not None:
-        print(f"Feature reducer frozen (pretrained)")
-    else:
-        print(f"No feature reducer - using raw observations")
+    # Get layer-wise breakdown
+    actor_params = 0
+    critic_params = 0
+    shared_params = 0
+    
+    for layer in model.layers:
+        layer_params = sum([tf.size(var).numpy() for var in layer.trainable_variables])
+        layer_name = layer.name.lower()
+        
+        if 'actor' in layer_name or 'portfolio_allocation' in layer_name:
+            actor_params += layer_params
+        elif 'critic' in layer_name or 'value' in layer_name:
+            critic_params += layer_params
+        else:
+            shared_params += layer_params
+    
+    model_info = {
+        "model/total_parameters": int(total_params),
+        "model/total_parameters_millions": float(total_params / 1e6),
+        "model/actor_parameters": int(actor_params),
+        "model/critic_parameters": int(critic_params),
+        "model/shared_parameters": int(shared_params),
+        "model/observation_shape": int(obs_shape[0]),
+        "model/num_assets": int(num_assets),
+        "model/num_layers": len(model.layers),
+        "model/num_trainable_variables": len(model.trainable_variables),
+    }
+    
+    wandb.config.update(model_info)
+    wandb.log(model_info)
+    
+    print(f"\nMODEL ARCHITECTURE SUMMARY")
+    print(f"Total Parameters: {total_params:,} ({total_params/1e6:.2f}M)")
+    print(f"  - Shared Backbone: {shared_params:,} ({shared_params/total_params*100:.1f}%)")
+    print(f"  - Actor Head: {actor_params:,} ({actor_params/total_params*100:.1f}%)")
+    print(f"  - Critic Head: {critic_params:,} ({critic_params/total_params*100:.1f}%)")
+    print(f"Observation Shape: {obs_shape}")
+    print(f"Number of Assets: {num_assets}\n")
+    
+    optimizer = tf.keras.optimizers.Adam(learning_rate=config.initial_lr)
+    
+    print(f"Using Adam optimizer with simple policy gradient (no PPO)")
+    print(f"All features compressed within model (no external feature reducer)")
+    print(f"Model includes built-in compression layers for large observations\n")
     
     pretrained_model_path = 'models/pretrained_model.weights.h5'
     best_model_path = 'models/best_model.weights.h5'
 
-    if os.path.exists(best_model_path):
-        print(f"\n=== LOADING BEST MODEL FROM {best_model_path} ===")
-        model.load_weights(best_model_path)
-        print("Best model loaded successfully!\n")
-    elif os.path.exists(pretrained_model_path):
-        print(f"\n=== LOADING PRETRAINED MODEL FROM {pretrained_model_path} ===")
-        model.load_weights(pretrained_model_path)
-        print("Pretrained model loaded successfully!\n")
+    print(f"\nSTARTING WITH FRESH MODEL (NO PRETRAINED WEIGHTS)")
+    print(f"All previous models have been backed up to models_corrupted_backup/")
+    print(f"Training from scratch with fixed reward scaling and stability improvements\n")
+    
+    has_nan = False
+    for var in model.trainable_variables:
+        if tf.reduce_any(tf.math.is_nan(var)):
+            has_nan = True
+            break
+    
+    if has_nan:
+        print("ERROR: Freshly initialized model has NaN weights! This should not happen.")
+        print("Rebuilding model...")
+        model = build_model(obs_shape, num_assets, config, FEATURE_REDUCER)
+    else:
+        print("Model weights validated: No NaN detected in fresh initialization")
+    
+    # if os.path.exists(best_model_path):
+    #     print(f"\n=== LOADING BEST MODEL FROM {best_model_path} ===")
+    #     model.load_weights(best_model_path)
+    #     print("Best model loaded successfully!\n")
+    # elif os.path.exists(pretrained_model_path):
+    #     print(f"\n=== LOADING PRETRAINED MODEL FROM {pretrained_model_path} ===")
+    #     model.load_weights(pretrained_model_path)
+    #     print("Pretrained model loaded successfully!\n")
 
     if not os.path.exists('/media/user/HDD 1TB/Data/training_data.pkl') and \
        not os.path.exists('/media/user/HDD 1TB/Data/training_data_compressed.pkl') and \
@@ -928,13 +871,12 @@ if __name__ == "__main__":
                         chunk_size=config.pretrain_chunk_size)
         model.save_weights('models/best_model.weights.h5')
     else:
-        print("\n=== SKIPPING PRETRAINING ===")
+        print("\nSKIPPING PRETRAINING")
     
-    print("\n=== ONLINE TRAINING (BATCH-BY-BATCH) ===")
+    print("\nONLINE TRAINING (BATCH-BY-BATCH)")
     print(f"Batch size: {config.online_batch_size}")
     print(f"Total target batches: {config.online_total_batches}")
     
-    # Warmup window: ignore first N batches for best model tracking (avoid early spikes)
     WARMUP_BATCHES = 20
     
     best_avg_reward = float('-inf')
@@ -949,9 +891,7 @@ if __name__ == "__main__":
     recent_outperformance = deque(maxlen=50)
     recent_losses = deque(maxlen=50)
     
-    print(f"\n{'='*80}")
-    print("STARTING BATCH TRAINING LOOP")
-    print(f"{'='*80}")
+    print(f"\nSTARTING BATCH TRAINING LOOP")
     
     start_time = time.time()
     
@@ -972,6 +912,7 @@ if __name__ == "__main__":
         
         epsilon = max(config.epsilon_end, epsilon * config.epsilon_decay)
         
+        # Log all step data
         for i, step_log in enumerate(step_logs):
             if i % config.log_step_frequency == 0:
                 wandb.log({
@@ -985,17 +926,66 @@ if __name__ == "__main__":
                     "step/action_mean": step_log['action_mean'],
                     "step/action_std": step_log['action_std'],
                     "step/action_max": step_log['action_max'],
+                    "step/done": step_log['done'],
+                    "step/portfolio_layout": step_log['portfolio_layout']
                 })
         
         train_start = time.time()
         if len(states) > 0:
             batch_metrics = train_on_batch(
                 model, optimizer, states, raw_states, actions, returns, advantages, 
-                is_random_flags, batch_count, FEATURE_REDUCER, feature_reducer_optimizer,
-                clip_ratio=0.2, train_encoder=TRAIN_FEATURE_REDUCER
+                is_random_flags, batch_count, None, None,
+                clip_ratio=0.2, train_encoder=False
             )
             train_time = time.time() - train_start
             recent_losses.append(batch_metrics['batch/loss'])
+            
+            # Check for NaN in model weights after training
+            has_nan_weights = False
+            for var in model.trainable_variables:
+                if tf.reduce_any(tf.math.is_nan(var)):
+                    has_nan_weights = True
+                    break
+            
+            if has_nan_weights:
+                print("CRITICAL: NaN detected in model weights! Reloading best model...")
+                if os.path.exists('models/best_model.weights.h5'):
+                    model.load_weights('models/best_model.weights.h5')
+                    print("Best model reloaded successfully")
+                else:
+                    print("ERROR: No best model to reload! Training may be unstable")
+            
+            if batch_count % 50 == 0:
+                all_weights = tf.concat([tf.reshape(var, [-1]) for var in model.trainable_variables], axis=0)
+                weight_stats = {
+                    'model_stats/weight_mean': float(tf.reduce_mean(all_weights).numpy()),
+                    'model_stats/weight_std': float(tf.math.reduce_std(all_weights).numpy()),
+                    'model_stats/weight_min': float(tf.reduce_min(all_weights).numpy()),
+                    'model_stats/weight_max': float(tf.reduce_max(all_weights).numpy()),
+                    'model_stats/weight_abs_mean': float(tf.reduce_mean(tf.abs(all_weights)).numpy()),
+                }
+                
+                extreme_weight_fraction = float(tf.reduce_sum(
+                    tf.cast(tf.abs(all_weights) > 10.0, tf.float32)
+                ).numpy() / tf.size(all_weights, out_type=tf.float32).numpy())
+                
+                weight_stats['model_stats/extreme_weight_fraction'] = extreme_weight_fraction
+                
+                wandb.log(weight_stats)
+                
+                if extreme_weight_fraction > 0.01:
+                    print(f"  WARNING: {extreme_weight_fraction*100:.2f}% of weights are extreme (>10)")
+            
+            if batch_count % 2 == 0:
+                histogram_data = {}
+                for layer in model.layers:
+                    if len(layer.trainable_variables) > 0:
+                        layer_name = layer.name
+                        for i, var in enumerate(layer.trainable_variables):
+                            var_name = var.name.replace('/', '_').replace(':', '_')
+                            histogram_data[f"weights/{layer_name}/{var_name}"] = wandb.Histogram(var.numpy().flatten())
+                
+                wandb.log(histogram_data)
         else:
             # Empty batch - set all metrics to 0
             batch_metrics = {
@@ -1049,7 +1039,17 @@ if __name__ == "__main__":
         wandb.log(batch_metrics)
         
         print(f"Collected {steps_collected} steps in {collect_time:.2f}s")
-        if TRAIN_FEATURE_REDUCER and FEATURE_REDUCER is not None:
+        
+        # Add diagnostic info about rewards and values
+        if len(states) > 0 and len(returns) > 0:
+            reward_mean = batch_info['total_reward'] / max(1, steps_collected)
+            return_stats = f"Returns: min={np.min(returns):.2f}, max={np.max(returns):.2f}, mean={np.mean(returns):.2f}"
+            value_stats = f"Values: min={np.min(values):.2f}, max={np.max(values):.2f}, mean={np.mean(values):.2f}"
+            print(f"  Avg Reward/step: {reward_mean:.3f}")
+            print(f"  {return_stats}")
+            print(f"  {value_stats}")
+        
+        if TRAIN_FEATURE_REDUCER:
             print(f"Trained in {train_time:.2f}s, Loss: {batch_metrics['batch/loss']:.4f} (Actor: {batch_metrics['batch/actor_loss']:.4f}, Critic: {batch_metrics['batch/critic_loss']:.4f})")
             print(f"Encoder Loss: {batch_metrics.get('batch/encoder_loss', 0):.4f}")
         else:
@@ -1057,9 +1057,12 @@ if __name__ == "__main__":
         print(f"Reward: {batch_info['total_reward']:.2f}, Outperformance: {(batch_info['outperformance'] - 1) * 100:.2f}%")
         print(f"Recent avg outperformance: {(avg_recent_outperformance - 1) * 100:.2f}%")
 
-        wandb.log({'best/avg_recent_outperformance': (avg_recent_outperformance - 1) * 100})
-        wandb.log({'best/best_outperformance': (best_outperformance - 1) * 100})
-        wandb.log({'best/current_outperformance': (batch_info['outperformance'] - 1) * 100})
+        # Log best model tracking metrics
+        wandb.log({
+            'best/avg_recent_outperformance': (avg_recent_outperformance - 1) * 100,
+            'best/best_outperformance': (best_outperformance - 1) * 100,
+            'best/current_outperformance': (batch_info['outperformance'] - 1) * 100
+        })
 
         if batch_count <= WARMUP_BATCHES:
             print(f"[WARMUP {batch_count}/{WARMUP_BATCHES}] Ignoring early performance for best model tracking")
@@ -1069,12 +1072,6 @@ if __name__ == "__main__":
             best_outperformance = avg_recent_outperformance
             model.save_weights('models/best_model.weights.h5')
             wandb.save('models/best_model.weights.h5')
-            
-            if FEATURE_REDUCER is not None and TRAIN_FEATURE_REDUCER:
-                FEATURE_REDUCER.save('models/feature_reducer_trained.h5')
-                wandb.save('models/feature_reducer_trained_encoder.h5')
-                wandb.save('models/feature_reducer_trained_decoder.h5')
-                wandb.save('models/feature_reducer_trained_scaler.pkl')
             
             no_improvement = 0
             print(f"NEW BEST OUTPERFORMANCE: {(best_outperformance - 1) * 100:.2f}%")
@@ -1087,11 +1084,9 @@ if __name__ == "__main__":
                 current_lr = 1e-6
             optimizer.learning_rate.assign(current_lr)
             
-            if feature_reducer_optimizer is not None:
-                feature_reducer_lr = current_lr * 0.1
-                feature_reducer_optimizer.learning_rate.assign(feature_reducer_lr)
-            
-            print(f"\nLearning rate reduced to {current_lr:.6f}")
+            print(f"\nLEARNING RATE DECAY TRIGGERED")
+            print(f"No improvement for {config.lr_patience} batches")
+            print(f"New learning rate: {current_lr:.6f} (reduced by {config.lr_decay}x)\n")
             no_improvement = 0
         
         progress = (batch_count / config.online_total_batches) * 100
@@ -1103,7 +1098,7 @@ if __name__ == "__main__":
         print(f"Time elapsed: {elapsed_time:.1f}s, Batches/sec: {batches_per_sec:.2f}, Steps/sec: {steps_per_sec:.2f}")
         print(f"Current LR: {current_lr:.6f}, Epsilon: {epsilon:.4f}, Best outperformance: {(best_outperformance - 1) * 100:.2f}%")
         
-        if batch_count % 100 == 0:
+        if batch_count % 2 == 0:
             checkpoint_path = f'models/checkpoint_batch{batch_count}.weights.h5'
             model.save_weights(checkpoint_path)
             print(f"Saved checkpoint: {checkpoint_path}")
@@ -1115,9 +1110,7 @@ if __name__ == "__main__":
     wandb.save('models/final_model.weights.h5')
     
     total_time = time.time() - start_time
-    print(f"\n{'='*80}")
-    print("TRAINING COMPLETE!")
-    print(f"{'='*80}")
+    print(f"\nTRAINING COMPLETE!")
     print(f"Total batches: {batch_count}")
     print(f"Total steps: {global_step}")
     print(f"Total time: {total_time:.1f}s")

@@ -67,13 +67,29 @@ class PortfolioEnv():
         self.reset_value = self.initial_account_balance // 2
         self.df = load_and_align_data(data_dir, max_records)
         self.asset_names = list(self.df.keys()) + ['cash']
-        self.step_count = random.randint(2000, len(self.df['BTCUSDT']) - 1000)
-        self.max_steps = len(self.df['BTCUSDT']) - self.step_count - 100
+        
+        # Calculate safe bounds for initial step_count
+        total_length = len(self.df['BTCUSDT'])
+        self.lookback_window_size = 48
+        
+        # Need enough lookback for observation
+        # Need enough lookforward for higher timeframes (max is 288 for 1d)
+        min_step = max(2000, self.lookback_window_size + 288 * 3)
+        max_step = total_length - 1000
+        
+        if min_step >= max_step:
+            min_step = max(100, self.lookback_window_size + 288 * 3)
+            max_step = total_length - 100
+            
+        if min_step >= max_step:
+            raise ValueError(f"Dataset too small: {total_length} records. Need at least {min_step + 100}")
+        
+        self.step_count = random.randint(min_step, max_step)
+        self.max_steps = total_length - self.step_count - 100
         self.candle_interval = '5m'
         self.high_timeframes = ['15m', '1h', '4h', '1d']
         self.high_timeframes_count = [64, 48, 24, 3]
 
-        self.lookback_window_size = 48
         # Note: lookforward_window_size removed - new reward function uses only 1-step ahead
         
         self.portfolio = {'cash': self.initial_account_balance}
@@ -138,6 +154,12 @@ class PortfolioEnv():
         
 
     def get_observation(self):
+        # Validate step_count is within bounds
+        total_length = len(self.df['BTCUSDT'])
+        if self.step_count < 0 or self.step_count >= total_length - 2:
+            print(f"WARNING: step_count {self.step_count} out of bounds (max: {total_length}), resetting")
+            self.step_count = max(2000, self.lookback_window_size + 288 * 3)
+        
         obs = [[] for _ in range(len(self.df))]
         
         # Define aggregation factors (how many 5m candles make up each timeframe)
@@ -632,9 +654,9 @@ class PortfolioEnv():
         # Cash earns nothing (actually loses to inflation, but simplified)
         # This naturally penalizes holding too much cash
         
-        # Scale reward to make it meaningful for learning
-        # A 1% portfolio return gives reward of 10
-        reward = portfolio_future_return * 1000
+        # FIXED: Much more conservative reward scaling to prevent instability
+        # A 1% portfolio return gives reward of 1.0 (reduced from 10)
+        reward = portfolio_future_return * 100
         
         # Add benchmark comparison bonus
         # Reward beating the passive buy-and-hold strategy
@@ -653,16 +675,16 @@ class PortfolioEnv():
             
             # Safety check
             if not np.isnan(benchmark_future_return) and not np.isinf(benchmark_future_return):
-                # Bonus for outperforming benchmark
+                # FIXED: Smaller bonus for outperforming benchmark (reduced from 500 to 50)
                 outperformance = portfolio_future_return - benchmark_future_return
-                reward += outperformance * 500  # Extra reward for beating benchmark
+                reward += outperformance * 50  # Extra reward for beating benchmark
         
         # Final safety checks
         if np.isnan(reward) or np.isinf(reward):
             reward = 0.0
         
-        # Clip to prevent extreme values
-        reward = np.clip(reward, -100, 100)
+        # FIXED: Tighter clipping to prevent extreme values (±10 instead of ±100)
+        reward = np.clip(reward, -10.0, 10.0)
         
         return float(reward)
     
@@ -791,28 +813,86 @@ class PortfolioEnv():
         Reset the environment to initial state.
         Returns: initial observation
         """
-        # Reset step count to random position
-        self.step_count = random.randint(2000, len(self.df['BTCUSDT']) - 1000)
+        # Calculate safe bounds for step_count
+        total_length = len(self.df['BTCUSDT'])
+        
+        # Need enough lookback for observation (lookback_window_size = 48)
+        # Need enough lookforward for higher timeframes (max is 288 for 1d with count of 3)
+        # Need at least 1 step ahead for reward calculation
+        min_step = max(2000, self.lookback_window_size + 288 * 3)
+        max_step = total_length - 1000  # Reserve 1000 steps at the end
+        
+        # Validate bounds
+        if min_step >= max_step:
+            # Data is too small, use minimal safe bounds
+            min_step = max(100, self.lookback_window_size + 288 * 3)
+            max_step = total_length - 100
+            
+        if min_step >= max_step:
+            raise ValueError(f"Dataset too small: {total_length} records. Need at least {min_step + 100}")
+        
+        # Reset step count to random position within safe bounds
+        self.step_count = random.randint(min_step, max_step)
+        
+        # Recalculate max_steps based on new position
+        self.max_steps = total_length - self.step_count - 100
+        
+        # Validate the chosen step_count has valid data
+        try:
+            test_price = self.df['BTCUSDT']['close'].iloc[self.step_count]
+            if np.isnan(test_price) or test_price <= 0:
+                print(f"WARNING: Invalid price at step {self.step_count}, trying different position")
+                # Try a few more times
+                for attempt in range(5):
+                    self.step_count = random.randint(min_step, max_step)
+                    test_price = self.df['BTCUSDT']['close'].iloc[self.step_count]
+                    if not np.isnan(test_price) and test_price > 0:
+                        break
+        except Exception as e:
+            print(f"ERROR in reset: {e}")
+            self.step_count = min_step  # Fallback to minimum safe position
         
         # Reset portfolio
         self.portfolio = {'cash': 2000.0}
         self.portfolio_value = self.initial_account_balance
         for symbol in self.df.keys():
             price = self.df[symbol]['close'].iloc[self.step_count]
+            # Validate price
+            if np.isnan(price) or price <= 0:
+                print(f"WARNING: Invalid price for {symbol} at step {self.step_count}, using 1.0")
+                price = 1.0
             self.portfolio[symbol] = (self.initial_account_balance - 2000) / len(self.df) / price
         
         # Reset average prices
         self.average_prices = {}
         for symbol in self.df.keys():
             if self.portfolio[symbol] > 0:
-                self.average_prices[symbol] = self.df[symbol]['close'].iloc[self.step_count]
+                price = self.df[symbol]['close'].iloc[self.step_count]
+                if not np.isnan(price) and price > 0:
+                    self.average_prices[symbol] = price
+                else:
+                    self.average_prices[symbol] = 1.0
         
         # Reset benchmark portfolio (equal weight across all assets)
         self.passive_portfolio = {}
         for symbol in self.df.keys():
             price = self.df[symbol]['close'].iloc[self.step_count]
+            if np.isnan(price) or price <= 0:
+                price = 1.0
             self.passive_portfolio[symbol] = self.initial_account_balance / len(self.df) / price
         self.passive_portfolio_value = self.initial_account_balance
         
         # Return initial observation
-        return self.get_observation()
+        obs = self.get_observation()
+        
+        # Final validation - if observation has NaN, try one more reset
+        if np.any(np.isnan(obs)) or np.any(np.isinf(obs)):
+            print(f"WARNING: Invalid observation after reset, trying fallback position")
+            self.step_count = min_step
+            self.max_steps = total_length - self.step_count - 100
+            obs = self.get_observation()
+        
+        # Always clean any remaining NaN/Inf to prevent training issues
+        obs = np.nan_to_num(obs, nan=0.0, posinf=1.0, neginf=0.0)
+        
+        return obs
