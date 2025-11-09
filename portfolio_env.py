@@ -1,21 +1,37 @@
 """
-Portfolio Trading Environment with Simplified Reward Function
+Portfolio Trading Environment with Multi-Timeframe Reward Function
 
 REWARD SYSTEM:
 --------------
-The agent is rewarded based on ACTUAL 1-step ahead portfolio returns.
-This encourages the model to learn short-term price prediction and optimal allocation.
+The agent is rewarded based on ACTUAL future portfolio returns across multiple timeframes.
+This encourages the model to learn both short-term and long-term price prediction and optimal allocation.
 
-Reward = portfolio_weighted_next_step_return * 1000 + outperformance_bonus
+Reward = weighted_average(returns_normalized_by_days) * 100 + outperformance_bonus
+
+Multi-Timeframe Approach:
+- Next Step (5 min): 40% weight - immediate price action
+- Next Day (24h): 30% weight - intraday trends
+- Next Week (7d): 20% weight - swing trading
+- Next Month (30d): 10% weight - position trading
+
+Each return is normalized by the number of days to make them comparable:
+- A 1% gain in 5 minutes = much stronger signal than 1% gain in 30 days
+- Returns are scaled: return / days
+
+Safety Features:
+1. All timeframe lookups check for out-of-bounds indices
+2. Missing timeframes are gracefully skipped with weight rebalancing
+3. Returns are clipped to ±200% per day to prevent extreme values
+4. NaN and Inf values are sanitized to 0.0
 
 Key Points:
-1. Looks only 1 step ahead (not 30 steps) to avoid complex weighted averaging
-2. Directly rewards positions that will increase in the next step
+1. Looks across multiple timeframes (not just 1 step)
+2. Rewards positions that will increase across all timeframes
 3. Naturally penalizes holding cash (0% return = opportunity cost)
 4. Includes bonus for beating the buy-and-hold benchmark
-5. Simple and interpretable - agent learns to maximize actual profit
+5. Day-normalized returns ensure fairness across timeframes
 
-This design ensures the agent focuses on what matters: making money.
+This design ensures the agent learns both short-term tactical and long-term strategic positioning.
 """
 
 import numpy as np
@@ -74,23 +90,25 @@ class PortfolioEnv():
         
         # Need enough lookback for observation
         # Need enough lookforward for higher timeframes (max is 288 for 1d)
+        # Need enough space for multi-timeframe reward lookahead (max is 288*30 for next_month)
+        max_lookahead = 288 * 30  # 30 days
         min_step = max(2000, self.lookback_window_size + 288 * 3)
-        max_step = total_length - 1000
+        max_step = total_length - max_lookahead - 100
         
         if min_step >= max_step:
             min_step = max(100, self.lookback_window_size + 288 * 3)
-            max_step = total_length - 100
+            max_step = total_length - max_lookahead - 50
             
         if min_step >= max_step:
-            raise ValueError(f"Dataset too small: {total_length} records. Need at least {min_step + 100}")
+            raise ValueError(f"Dataset too small: {total_length} records. Need at least {min_step + max_lookahead + 100}")
         
         self.step_count = random.randint(min_step, max_step)
-        self.max_steps = total_length - self.step_count - 100
+        self.max_steps = total_length - self.step_count - max_lookahead - 10
         self.candle_interval = '5m'
         self.high_timeframes = ['15m', '1h', '4h', '1d']
         self.high_timeframes_count = [64, 48, 24, 3]
 
-        # Note: lookforward_window_size removed - new reward function uses only 1-step ahead
+        # Multi-timeframe reward: looks at next step, next day, next week, next month
         
         self.portfolio = {'cash': self.initial_account_balance}
         self.portfolio_value = self.initial_account_balance
@@ -420,31 +438,101 @@ class PortfolioEnv():
     
     def _calculate_future_profit(self) -> dict:
         """
-        Calculate the ACTUAL future profit for each asset.
+        Calculate the ACTUAL future profit for each asset across multiple timeframes.
         This looks ahead and is used ONLY for reward calculation (not available to agent).
-        Returns the actual percentage return that will happen in the next step.
+        Returns a weighted average of returns over:
+        - Next step (1 candle = 5 minutes)
+        - Next day (288 candles = 24 hours)
+        - Next week (288 * 7 = 2016 candles)
+        - Next month (288 * 30 = 8640 candles)
+        
+        Each return is normalized by the number of days to make them comparable.
+        Weights: 40% next step, 30% next day, 20% next week, 10% next month
         """
         future_profits = {}
+        data_length = len(self.df['BTCUSDT'])
+        
+        # Define timeframes (in 5-minute candles)
+        timeframes = {
+            'next_step': 1,           # 5 minutes
+            'next_day': 288,          # 24 hours
+            'next_week': 288 * 7,     # 7 days
+            'next_month': 288 * 30,   # 30 days
+        }
+        
+        # Weights for each timeframe (must sum to 1.0)
+        weights = {
+            'next_step': 0.40,
+            'next_day': 0.30,
+            'next_week': 0.20,
+            'next_month': 0.10,
+        }
+        
         for symbol, data in self.df.items():
             current_price = data['close'].iloc[self.step_count]
-            # Look at the NEXT step's price (what actually happens)
-            next_price = data['close'].iloc[self.step_count + 1]
             
-            # Protect against division by zero or invalid prices
-            if current_price <= 0 or np.isnan(current_price) or np.isnan(next_price):
+            # Protect against invalid current price
+            if current_price <= 0 or np.isnan(current_price):
                 future_profits[symbol] = 0.0
                 continue
             
-            # Calculate actual return
-            actual_return = (next_price - current_price) / current_price
+            weighted_return = 0.0
+            total_weight_used = 0.0
             
-            # Sanity check and clip extreme values
-            if np.isnan(actual_return) or np.isinf(actual_return):
-                actual_return = 0.0
+            for tf_name, candles_ahead in timeframes.items():
+                # Safety check: ensure we don't go out of bounds
+                future_idx = self.step_count + candles_ahead
+                
+                if future_idx >= data_length:
+                    # Out of bounds - skip this timeframe
+                    continue
+                
+                try:
+                    future_price = data['close'].iloc[future_idx]
+                    
+                    # Validate future price
+                    if future_price <= 0 or np.isnan(future_price):
+                        continue
+                    
+                    # Calculate raw return
+                    raw_return = (future_price - current_price) / current_price
+                    
+                    # Normalize by number of days to make returns comparable
+                    # (5-minute candles, so 288 candles = 1 day)
+                    days = candles_ahead / 288.0
+                    if days <= 0:
+                        days = 1.0 / 288.0  # Minimum (for next_step)
+                    
+                    normalized_return = raw_return / days
+                    
+                    # Sanity check and clip extreme values
+                    if np.isnan(normalized_return) or np.isinf(normalized_return):
+                        normalized_return = 0.0
+                    else:
+                        # Clip to ±200% per day (very extreme movements)
+                        normalized_return = np.clip(normalized_return, -2.0, 2.0)
+                    
+                    # Apply weight
+                    weight = weights[tf_name]
+                    weighted_return += normalized_return * weight
+                    total_weight_used += weight
+                    
+                except (IndexError, KeyError):
+                    # If we can't access the data, skip this timeframe
+                    continue
+            
+            # Normalize by actual weights used (in case some timeframes were skipped)
+            if total_weight_used > 0:
+                final_return = weighted_return / total_weight_used
             else:
-                actual_return = np.clip(actual_return, -0.5, 0.5)  # Clip to ±50%
+                final_return = 0.0
             
-            future_profits[symbol] = actual_return
+            # Final safety check
+            if np.isnan(final_return) or np.isinf(final_return):
+                final_return = 0.0
+            
+            future_profits[symbol] = final_return
+            
         return future_profits
 
     
@@ -521,18 +609,42 @@ class PortfolioEnv():
                     total_cost = trade_value + fee
                     pending_buys.append((symbol, trade_value, fee, current_price, allocation_diff))
                 else:  # Sell
-                    # Selling adds to cash, so we can execute immediately
-                    sell_quantity = trade_value / current_price
-                    self.portfolio['cash'] += (trade_value - fee)
+                    # FIXED: When selling, we want to REDUCE our holdings by trade_value worth
+                    # But we need to account for the fee. If we sell X worth of assets:
+                    # - We get: X - (X * fee_rate) = X * (1 - fee_rate) in cash
+                    # - We need to sell: X / current_price quantity
+                    # The fee is deducted from the proceeds, not added to the quantity
+                    
+                    # CRITICAL FIX: Validate we have enough to sell!
+                    max_sellable_value = current_holdings * current_price
+                    actual_sell_value = min(trade_value, max_sellable_value)
+                    
+                    if actual_sell_value < trade_value * 0.99:  # Sold significantly less than intended
+                        if DEBUG:
+                            print(f"WARNING: Wanted to sell ${trade_value:.2f} of {symbol} but only have ${max_sellable_value:.2f}")
+                    
+                    sell_quantity = actual_sell_value / current_price
+                    fee = actual_sell_value * self.fee_rate
+                    net_proceeds = actual_sell_value - fee
+                    
+                    # Safety check: don't sell more than we have (with tiny epsilon for rounding)
+                    if sell_quantity > current_holdings:
+                        sell_quantity = current_holdings
+                        actual_sell_value = sell_quantity * current_price
+                        fee = actual_sell_value * self.fee_rate
+                        net_proceeds = actual_sell_value - fee
+                    
+                    self.portfolio['cash'] += net_proceeds
                     self.portfolio[symbol] -= sell_quantity
                     total_fees += fee
                     
-                    # If we sold all, remove from average prices
+                    # If we sold all (or nearly all), remove from average prices
                     if self.portfolio[symbol] <= 0.000001:
+                        self.portfolio[symbol] = 0.0  # Clean up rounding errors
                         self.average_prices.pop(symbol, None)
                     
                     if DEBUG:
-                        print(f"SELL {symbol}: ${trade_value:.2f} (allocation diff: {allocation_diff:.3f})")
+                        print(f"SELL {symbol}: ${actual_sell_value:.2f} -> ${net_proceeds:.2f} after fee (allocation diff: {allocation_diff:.3f})")
         
         # FIXED: Process buy orders in order of allocation difference (most important first)
         # Sort by allocation difference (descending) to prioritize most important trades
@@ -570,8 +682,12 @@ class PortfolioEnv():
                     print(f"BUY {symbol}: ${trade_value:.2f} (allocation diff: {allocation_diff:.3f})")
             else:
                 # FIXED: If not enough cash, buy what we can afford
-                if available_cash > fee:  # Need at least enough for fee + minimal trade
-                    affordable_trade_value = (available_cash - fee) / (1 + self.fee_rate)
+                # available_cash = trade_value + fee
+                # We want to find max trade_value where: trade_value + (trade_value * fee_rate) <= available_cash
+                # => trade_value * (1 + fee_rate) <= available_cash
+                # => trade_value <= available_cash / (1 + fee_rate)
+                if available_cash > 0.10:  # Need at least $0.10 to make a trade
+                    affordable_trade_value = available_cash / (1 + self.fee_rate)
                     if affordable_trade_value > 1.0:  # Only trade if meaningful amount
                         affordable_fee = affordable_trade_value * self.fee_rate
                         buy_quantity = affordable_trade_value / current_price
@@ -593,7 +709,7 @@ class PortfolioEnv():
                         total_fees += affordable_fee
                         
                         if DEBUG:
-                            print(f"PARTIAL BUY {symbol}: ${affordable_trade_value:.2f} (could afford ${trade_value:.2f})")
+                            print(f"PARTIAL BUY {symbol}: ${affordable_trade_value:.2f} (wanted ${trade_value:.2f})")
         
         # Also check cash rebalancing threshold
         cash_allocation_diff = abs(cash_action - current_cash_allocation)
@@ -601,8 +717,13 @@ class PortfolioEnv():
             if DEBUG:
                 print(f"CASH allocation diff: {cash_allocation_diff:.3f}")
         
-        # Apply cash inflation (opportunity cost)
-        self.portfolio['cash'] *= (1 - self.cash_inflation_rate / (365 * (5/60)))  # 5-minute interval
+        # FIXED: Only apply cash inflation if we actually hold significant cash AND made trades
+        # This prevents unfair penalty when not trading (benchmark never pays this)
+        # Only apply if: (1) we have cash, (2) we made trades this step (total_fees > 0)
+        if total_fees > 0 and self.portfolio['cash'] > 1.0:
+            # Apply cash inflation only on the cash portion (opportunity cost)
+            # Rate is very small per 5-minute interval: 0.004 / (365 * 288) ≈ 0.000000038 per step
+            self.portfolio['cash'] *= (1 - self.cash_inflation_rate / (365 * 288))
         
         # FIXED: Ensure cash doesn't go negative due to rounding errors
         if self.portfolio['cash'] < -0.01:  # Small negative due to rounding
@@ -694,21 +815,34 @@ class PortfolioEnv():
         Action: list with target allocation percentages for each asset INCLUDING cash
         Returns: observation, reward, done, info
         """
-        # Check if we've reached the end of data (need at least 1 step ahead for reward)
-        if self.step_count >= len(self.df['BTCUSDT']) - 2:
+        # Check if we've reached the end of data
+        # Need enough space for multi-timeframe lookahead (max is 288*30 for next_month)
+        max_lookahead = 288 * 30  # 30 days
+        if self.step_count >= len(self.df['BTCUSDT']) - max_lookahead - 10:
             return self.get_observation(), 0, True, {'reason': 'end_of_data'}
         
         # Store previous values for reward calculation
         prev_portfolio_value = self._portfolio_portfolio_value()
         prev_benchmark_value = self.passive_portfolio_value
         
-        # Execute rebalancing
+        # Execute rebalancing (uses current step prices)
         fees_paid = self._rebalance_portfolio(action)
+        
+        # CRITICAL: Validate portfolio state after rebalancing
+        # Check for negative holdings (should never happen with our fixes)
+        for symbol in self.df.keys():
+            if self.portfolio[symbol] < -0.000001:  # Allow tiny rounding errors
+                print(f"CRITICAL ERROR: Negative holdings for {symbol}: {self.portfolio[symbol]}")
+                self.portfolio[symbol] = 0.0  # Fix it
+        
+        if self.portfolio['cash'] < -0.01:
+            print(f"CRITICAL ERROR: Negative cash: ${self.portfolio['cash']:.2f}")
+            self.portfolio['cash'] = 0.0  # Fix it
         
         # Move to next step
         self.step_count += 1
         
-        # Calculate reward (this looks 1 step ahead to see actual profit)
+        # Calculate reward (this looks ahead across multiple timeframes)
         reward = self._calculate_reward()
         
         # Get new observation
@@ -724,7 +858,7 @@ class PortfolioEnv():
             info['reason'] = 'bankruptcy'
             reward -= 100  # Large penalty
         
-        if self.step_count >= len(self.df['BTCUSDT']) - 2:
+        if self.step_count >= len(self.df['BTCUSDT']) - max_lookahead - 10:
             done = True
             info['reason'] = 'end_of_data'
 
@@ -818,24 +952,25 @@ class PortfolioEnv():
         
         # Need enough lookback for observation (lookback_window_size = 48)
         # Need enough lookforward for higher timeframes (max is 288 for 1d with count of 3)
-        # Need at least 1 step ahead for reward calculation
+        # Need enough space for multi-timeframe reward lookahead (max is 288*30 for next_month)
+        max_lookahead = 288 * 30  # 30 days
         min_step = max(2000, self.lookback_window_size + 288 * 3)
-        max_step = total_length - 1000  # Reserve 1000 steps at the end
+        max_step = total_length - max_lookahead - 100  # Reserve space for lookahead + buffer
         
         # Validate bounds
         if min_step >= max_step:
             # Data is too small, use minimal safe bounds
             min_step = max(100, self.lookback_window_size + 288 * 3)
-            max_step = total_length - 100
+            max_step = total_length - max_lookahead - 50
             
         if min_step >= max_step:
-            raise ValueError(f"Dataset too small: {total_length} records. Need at least {min_step + 100}")
+            raise ValueError(f"Dataset too small: {total_length} records. Need at least {min_step + max_lookahead + 100}")
         
         # Reset step count to random position within safe bounds
         self.step_count = random.randint(min_step, max_step)
         
         # Recalculate max_steps based on new position
-        self.max_steps = total_length - self.step_count - 100
+        self.max_steps = total_length - self.step_count - max_lookahead - 10
         
         # Validate the chosen step_count has valid data
         try:
