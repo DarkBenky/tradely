@@ -199,61 +199,73 @@ def collect_batch_data(env, model, batch_size, gamma, current_step, epsilon=0.1,
                 break
             continue
         
-        # Model now outputs action probabilities and per-asset confidence
-        action_probs, confidence = model(state_tensor, training=False)
-        action = action_probs[0].numpy()
-        conf_values = confidence[0].numpy()  # Per-asset confidence array
+        # Check if this is a rebalancing step (model should make a decision)
+        # env.steps_since_last_rebalance will be 0 after reset, or >= rebalance_interval when it's time
+        is_rebalancing_step = (env.steps_since_last_rebalance >= env.rebalance_interval or env.last_action is None)
         
-        # Track mean confidence for logging
-        mean_conf = float(np.mean(conf_values))
+        if is_rebalancing_step:
+            # Model makes a NEW prediction - this is a decision point
+            action_probs, confidence = model(state_tensor, training=False)
+            action = action_probs[0].numpy()
+            conf_values = confidence[0].numpy()  # Per-asset confidence array
+            
+            # Track mean confidence for logging
+            mean_conf = float(np.mean(conf_values))
 
-        print("="*90)
-        print(f"Step {current_step + steps_collected}: Mean Confidence = {mean_conf:.4f}")
-        print(f"Per-asset confidence: min={np.min(conf_values):.3f}, max={np.max(conf_values):.3f}")
-        print("="*90)
-        
-        # Modulate allocation based on PER-ASSET confidence (AGGRESSIVE)
-        # For each asset: low confidence -> heavily reduce allocation
-        # High confidence -> amplify model's allocation
-        equal_weight = np.ones_like(action) / len(action)
-        
-        # Apply AGGRESSIVE per-asset confidence modulation
-        for i in range(len(action)):
-            conf = conf_values[i]
-            if conf < 0.4:  # Low confidence for this asset
-                # Drastically reduce: only 10% of model allocation + 90% equal weight
-                action[i] = 0.1 * action[i] + 0.9 * equal_weight[i]
-            elif conf < 0.6:  # Medium confidence for this asset
-                # Moderate reduction: 40% model + 60% equal weight
-                action[i] = 0.4 * action[i] + 0.6 * equal_weight[i]
-            elif conf < 0.75:  # Medium-high confidence
-                # Slight boost: use model allocation as-is
-                action[i] = action[i]
-            else:  # Very high confidence (>= 0.75)
-                # Amplify: boost model allocation by confidence factor
-                # Scale up allocation proportionally to confidence
-                action[i] = action[i] * (1.0 + (conf - 0.75))  # Up to 1.25x boost at conf=1.0
-        
-        # Re-normalize after blending
-        action = action / action.sum()
-        
-        if np.any(np.isnan(action)):
-            print(f"WARNING: NaN in model output (action), using random action")
-            action = env.sample()
-            is_random = True
-            conf_values = np.zeros_like(action)
-            mean_conf = 0.0
-        else:
-            is_random = False
-        
-        if random.random() < epsilon and not is_random:
-            action = env.sample()
-            is_random = True
-        elif random.random() < epsilon * 2 and not is_random:
-            noise = np.random.normal(0, 0.1, size=action.shape)
-            action = action + noise
-            action = np.clip(action, 0, 1)
+            print("="*90)
+            print(f"Step {current_step + steps_collected}: Mean Confidence = {mean_conf:.4f}")
+            print(f"Per-asset confidence: min={np.min(conf_values):.3f}, max={np.max(conf_values):.3f}")
+            print("="*90)
+            
+            # Modulate allocation based on PER-ASSET confidence (AGGRESSIVE)
+            # For each asset: low confidence -> heavily reduce allocation
+            # High confidence -> amplify model's allocation
+            equal_weight = np.ones_like(action) / len(action)
+            
+            # Apply AGGRESSIVE per-asset confidence modulation
+            for i in range(len(action)):
+                conf = conf_values[i]
+                if conf < 0.4:  # Low confidence for this asset
+                    # Drastically reduce: only 10% of model allocation + 90% equal weight
+                    action[i] = 0.1 * action[i] + 0.9 * equal_weight[i]
+                elif conf < 0.6:  # Medium confidence for this asset
+                    # Moderate reduction: 40% model + 60% equal weight
+                    action[i] = 0.4 * action[i] + 0.6 * equal_weight[i]
+                elif conf < 0.75:  # Medium-high confidence
+                    # Slight boost: use model allocation as-is
+                    action[i] = action[i]
+                else:  # Very high confidence (>= 0.75)
+                    # Amplify: boost model allocation by confidence factor
+                    # Scale up allocation proportionally to confidence
+                    action[i] = action[i] * (1.0 + (conf - 0.75))  # Up to 1.25x boost at conf=1.0
+            
+            # Re-normalize after blending
             action = action / action.sum()
+            
+            if np.any(np.isnan(action)):
+                print(f"WARNING: NaN in model output (action), using random action")
+                action = env.sample()
+                is_random = True
+                conf_values = np.zeros_like(action)
+                mean_conf = 0.0
+            else:
+                is_random = False
+            
+            if random.random() < epsilon and not is_random:
+                action = env.sample()
+                is_random = True
+            elif random.random() < epsilon * 2 and not is_random:
+                noise = np.random.normal(0, 0.1, size=action.shape)
+                action = action + noise
+                action = np.clip(action, 0, 1)
+                action = action / action.sum()
+        else:
+            # NOT a rebalancing step - use a dummy action (will be ignored by env)
+            # We don't call the model here to save computation
+            action = env.sample()  # Dummy action, won't be used
+            is_random = False  # Mark as not random (it's a holding period)
+            conf_values = np.zeros(len(env.asset_names))  # Dummy confidence
+            mean_conf = 0.0
         
         next_state, reward, done, info = env.step(action)
         
@@ -271,30 +283,72 @@ def collect_batch_data(env, model, batch_size, gamma, current_step, epsilon=0.1,
         if feature_reducer is not None:
             next_state = feature_reducer.transform(next_state.reshape(1, -1))[0]
 
-        states.append(state)
-        raw_states.append(raw_state)
-        actions.append(action)
-        rewards.append(reward)
-        confidences.append(conf_values)  # Store per-asset confidence array
-        is_random_flags.append(is_random)
+        # CRITICAL FIX: Only append to training data if this was a rebalancing step
+        # During holding periods, we don't want to train on dummy actions
+        if is_rebalancing_step:
+            states.append(state)
+            raw_states.append(raw_state)
+            actions.append(action)
+            rewards.append(reward)
+            confidences.append(conf_values)  # Store per-asset confidence array
+            is_random_flags.append(is_random)
+        
+        # Calculate current portfolio allocation percentages for logging
+        # This shows ACTUAL current allocation as portfolio drifts
+        portfolio_value = info.get('portfolio_value', 1.0)
+        current_allocations = {}
+        for symbol in env.df.keys():
+            holdings = info.get('portfolio_layout', {}).get(symbol, 0)
+            price = env.df[symbol]['close'].iloc[env.step_count - 1]  # Current price (step was already incremented)
+            value = holdings * price
+            current_allocations[symbol] = value / portfolio_value if portfolio_value > 0 else 0
+        
+        cash_allocation = info.get('cash_allocation', 0)
+        
+        # For logging, use real data during holding periods
+        if is_rebalancing_step:
+            # Rebalancing step: log model's decision
+            log_confidence = mean_conf
+            log_confidence_min = float(np.min(conf_values))
+            log_confidence_max = float(np.max(conf_values))
+            log_confidence_std = float(np.std(conf_values))
+            log_action_mean = np.mean(action)
+            log_action_std = np.std(action)
+            log_action_max = np.max(action)
+            log_per_asset_confidence = conf_values
+        else:
+            # Holding period: log actual portfolio state, not dummy values
+            log_confidence = None  # No model prediction this step
+            log_confidence_min = None
+            log_confidence_max = None
+            log_confidence_std = None
+            # Log ACTUAL current allocation percentages (how portfolio drifted)
+            allocation_values = list(current_allocations.values()) + [cash_allocation]
+            log_action_mean = np.mean(allocation_values) if allocation_values else 0
+            log_action_std = np.std(allocation_values) if allocation_values else 0
+            log_action_max = np.max(allocation_values) if allocation_values else 0
+            log_per_asset_confidence = None
         
         step_log = {
             'step_global': current_step + steps_collected,
             'step_batch': steps_collected,
             'reward': reward,
-            'confidence': mean_conf,  # Log mean confidence
-            'confidence_min': float(np.min(conf_values)),
-            'confidence_max': float(np.max(conf_values)),
-            'confidence_std': float(np.std(conf_values)),
+            'confidence': log_confidence,  # None during holding periods
+            'confidence_min': log_confidence_min,
+            'confidence_max': log_confidence_max,
+            'confidence_std': log_confidence_std,
             'portfolio_value': info.get('portfolio_value', 0),
             'benchmark_value': info.get('benchmark_value', 0),
             'outperformance': info.get('outperformance', 0),
-            'action_mean': np.mean(action),
-            'action_std': np.std(action),
-            'action_max': np.max(action),
+            'action_mean': log_action_mean,  # Actual allocation % during holding
+            'action_std': log_action_std,    # Allocation spread during holding
+            'action_max': log_action_max,    # Max allocation during holding
             'done': done,
             'portfolio_layout': info.get('portfolio_layout', {}),
-            'per_asset_confidence': conf_values,  # Store full array for logging
+            'per_asset_confidence': log_per_asset_confidence,  # None during holding
+            'was_rebalancing_step': is_rebalancing_step,
+            'current_allocations': current_allocations,  # REAL allocation percentages
+            'cash_allocation': cash_allocation,
         }
         
         step_logs.append(step_log)
@@ -772,13 +826,14 @@ if __name__ == "__main__":
         "shared_layers": [2024, 2024, 2024, 2048, 1024, 512, 512],
         "residual_connections": [True, True, True, True, True, False],
         "actor_layers": [512, 512, 512, 512, 512, 256, 128],
-        "initial_lr": 0.0001,
+        "initial_lr": 0.00015,
         "pretrain_episodes": 10,
         "pretrain_epochs": 0,
         "pretrain_batch_size": 512,
         "pretrain_chunk_size": 512 * 10,
         "online_total_batches": 5000,
-        "online_batch_size": 512,
+        "rebalance_interval": 12,  # Rebalance every N steps (24 steps = 2 hour with 5min candles)
+        "online_batch_size": 64 * 12, # 512 rebalancing steps per batch
         "gamma": 0.99,
         "lr_patience": 200,
         "lr_decay": 0.8,
@@ -795,6 +850,10 @@ if __name__ == "__main__":
     print("Initializing environment...")
     env = PortfolioEnv(max_records=150_000)
     observation = env.reset()
+    
+    # Set rebalance interval from config
+    env.rebalance_interval = config.rebalance_interval
+    print(f"Rebalance interval set to: {env.rebalance_interval} steps ({env.rebalance_interval * 5} minutes)")
     
     obs_shape = observation.shape
     num_assets = len(env.asset_names)
@@ -951,11 +1010,12 @@ if __name__ == "__main__":
                     "step/portfolio_layout": step_log['portfolio_layout']
                 }
                 
-                # Add per-asset confidence values
+                # Add per-asset confidence values (only if we have them - rebalancing steps only)
                 per_asset_conf = step_log['per_asset_confidence']
-                for asset_idx, conf_val in enumerate(per_asset_conf):
-                    asset_name = env.asset_names[asset_idx] if asset_idx < len(env.asset_names) else f"asset_{asset_idx}"
-                    log_dict[f"confidence_per_asset/{asset_name}"] = float(conf_val)
+                if per_asset_conf is not None:
+                    for asset_idx, conf_val in enumerate(per_asset_conf):
+                        asset_name = env.asset_names[asset_idx] if asset_idx < len(env.asset_names) else f"asset_{asset_idx}"
+                        log_dict[f"confidence_per_asset/{asset_name}"] = float(conf_val)
                 
                 wandb.log(log_dict)
         

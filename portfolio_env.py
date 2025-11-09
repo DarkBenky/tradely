@@ -126,6 +126,11 @@ class PortfolioEnv():
        
         self.cash_inflation_rate = 0.004
         self.fee_rate = 0.001
+        
+        # NEW: Track when we last rebalanced
+        self.steps_since_last_rebalance = 0
+        self.rebalance_interval = 12  # Rebalance every 12 steps (1 hour)
+        self.last_action = None  # Store last action to reuse
        
     def _portfolio_portfolio_value(self):
         total_value = self.portfolio['cash']
@@ -543,7 +548,19 @@ class PortfolioEnv():
         Example: [0.3, 0.2, 0.1, ..., 0.15] for ['BTCUSDT', 'ETHUSDT', ..., 'cash']
         
         Only rebalances when the allocation difference exceeds a threshold.
+        NOW: Only rebalances every rebalance_interval steps (e.g., every 12 steps = 1 hour)
         """
+        # NEW: Check if it's time to rebalance
+        if self.steps_since_last_rebalance < self.rebalance_interval and self.last_action is not None:
+            # Not time to rebalance yet - DO NOTHING, just return 0 fees
+            # Portfolio holds whatever quantities it has and lets prices drift naturally
+            # NO trading, NO rebalancing, NO trying to maintain allocation percentages
+            return 0.0
+        
+        # Reset counter and store this action
+        self.steps_since_last_rebalance = 0
+        self.last_action = action.copy() if hasattr(action, 'copy') else list(action)
+        
         # Calculate current portfolio value
         current_value = self._portfolio_portfolio_value()
         
@@ -805,7 +822,8 @@ class PortfolioEnv():
             reward = 0.0
         
         # FIXED: Tighter clipping to prevent extreme values (±10 instead of ±100)
-        reward = np.clip(reward, -10.0, 10.0)
+        reward = reward * (self._calculate_benchmark_outperformance() * 0.1)
+        reward = np.clip(reward, -100.0, 100.0)
         
         return float(reward)
     
@@ -827,6 +845,9 @@ class PortfolioEnv():
         
         # Execute rebalancing (uses current step prices)
         fees_paid = self._rebalance_portfolio(action)
+        
+        # NEW: Increment steps since last rebalance
+        self.steps_since_last_rebalance += 1
         
         # CRITICAL: Validate portfolio state after rebalancing
         # Check for negative holdings (should never happen with our fixes)
@@ -876,6 +897,8 @@ class PortfolioEnv():
         info['cash_allocation'] = self.portfolio['cash'] / current_value if current_value > 0 else 1.0
         info['portfolio_layout'] = {symbol: self.portfolio[symbol] for symbol in self.df.keys()}
         info['portfolio_layout']['cash'] = self.portfolio['cash']
+        info['rebalanced'] = (fees_paid > 0)  # NEW: Track if we actually rebalanced this step
+        info['steps_until_next_rebalance'] = self.rebalance_interval - self.steps_since_last_rebalance  # NEW
         
         return obs, reward, done, info
     
@@ -887,7 +910,26 @@ class PortfolioEnv():
         benchmark_value = self._update_benchmark_value()
         outperformance = self._calculate_benchmark_outperformance()
         
+        # Determine if this is a new prediction or following previous prediction
+        # After rebalancing, steps_since_last_rebalance is incremented to 1
+        # So we check if it's 1 (just rebalanced) or > 1 (following)
+        is_new_prediction = (self.steps_since_last_rebalance == 1)
+        steps_remaining = self.rebalance_interval - self.steps_since_last_rebalance + 1
+        
         print(f"\n{'='*90}")
+        
+        # Color coding: Green for new prediction, Red for following
+        if is_new_prediction:
+            status_color = "\033[92m"  # Green
+            status_text = "NEW PREDICTION - Model just decided allocation for next hour"
+        else:
+            status_color = "\033[91m"  # Red
+            status_text = f"FOLLOWING PREDICTION - Holding allocation ({steps_remaining} steps until next decision)"
+        
+        reset_color = "\033[0m"
+        
+        print(f"{status_color}*** {status_text} ***{reset_color}")
+        print(f"{'='*90}")
         print(f"Step: {self.step_count}")
         print(f"{'='*90}")
         print(f"Portfolio Value: ${portfolio_value:,.2f}")
@@ -1007,6 +1049,10 @@ class PortfolioEnv():
                     self.average_prices[symbol] = price
                 else:
                     self.average_prices[symbol] = 1.0
+        
+        # NEW: Reset rebalancing tracking
+        self.steps_since_last_rebalance = 0
+        self.last_action = None
         
         # Reset benchmark portfolio (equal weight across all assets)
         self.passive_portfolio = {}
