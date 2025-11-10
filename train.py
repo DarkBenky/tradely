@@ -826,14 +826,14 @@ if __name__ == "__main__":
         "shared_layers": [2024, 2024, 2024, 2048, 1024, 512, 512],
         "residual_connections": [True, True, True, True, True, False],
         "actor_layers": [512, 512, 512, 512, 512, 256, 128],
-        "initial_lr": 0.00015,
+        "initial_lr": 0.000175,
         "pretrain_episodes": 10,
         "pretrain_epochs": 0,
         "pretrain_batch_size": 512,
         "pretrain_chunk_size": 512 * 10,
         "online_total_batches": 5000,
-        "rebalance_interval": 12,  # Rebalance every N steps (24 steps = 2 hour with 5min candles)
-        "online_batch_size": 64 * 12, # 512 rebalancing steps per batch
+        "rebalance_interval": 12,  # Rebalance every N steps (12 steps = 1 hour with 5min candles)
+        "online_batch_size": 128 * 12, # 512 rebalancing steps per batch
         "gamma": 0.99,
         "lr_patience": 200,
         "lr_decay": 0.8,
