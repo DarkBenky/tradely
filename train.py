@@ -136,8 +136,9 @@ def build_model(obs_shape, num_assets, config=None, feature_reducer=None):
     model = Model(inputs=inputs, outputs=[actor_output, confidence_output])
     return model
 
-def collect_batch_data(env, model, batch_size, gamma, current_step, epsilon=0.1, env_reset_probability=0.05, feature_reducer=None):
+def collect_batch_data(env, model, batch_size, gamma, current_step, epsilon=0.1, env_reset_probability=0.05, feature_reducer=None, config=None):
     states, raw_states, actions, rewards, is_random_flags, confidences = [], [], [], [], [], []
+    per_asset_returns = []
     step_logs = []
     
     max_reset_attempts = 3
@@ -204,12 +205,29 @@ def collect_batch_data(env, model, batch_size, gamma, current_step, epsilon=0.1,
         is_rebalancing_step = (env.steps_since_last_rebalance >= env.rebalance_interval or env.last_action is None)
         
         if is_rebalancing_step:
-            # Model makes a NEW prediction - this is a decision point
-            action_probs, confidence = model(state_tensor, training=False)
-            action = action_probs[0].numpy()
-            conf_values = confidence[0].numpy()  # Per-asset confidence array
+            num_samples = config.get('num_stochastic_samples', 16) if config else 16
+            sampled_actions = []
+            sampled_confidences = []
             
-            # Track mean confidence for logging
+            for _ in range(num_samples):
+                action_probs, confidence = model(state_tensor, training=True)
+                sampled_action = tf.random.categorical(tf.math.log(action_probs + 1e-8), 1)
+                sampled_action_onehot = tf.one_hot(sampled_action[0], depth=len(env.asset_names))
+                mixed_action = 0.7 * action_probs[0].numpy() + 0.3 * sampled_action_onehot.numpy()
+                mixed_action = mixed_action / mixed_action.sum()
+                sampled_actions.append(mixed_action)
+                sampled_confidences.append(confidence[0].numpy())
+            
+            sampled_actions = np.array(sampled_actions)
+            sampled_confidences = np.array(sampled_confidences)
+            
+            conf_weights = np.mean(sampled_confidences, axis=1)
+            conf_weights = conf_weights / (conf_weights.sum() + 1e-8)
+            
+            action = np.average(sampled_actions, axis=0, weights=conf_weights)
+            action = action / action.sum()
+            conf_values = np.mean(sampled_confidences, axis=0)
+            
             mean_conf = float(np.mean(conf_values))
 
             print("="*90)
@@ -217,29 +235,13 @@ def collect_batch_data(env, model, batch_size, gamma, current_step, epsilon=0.1,
             print(f"Per-asset confidence: min={np.min(conf_values):.3f}, max={np.max(conf_values):.3f}")
             print("="*90)
             
-            # Modulate allocation based on PER-ASSET confidence (AGGRESSIVE)
-            # For each asset: low confidence -> heavily reduce allocation
-            # High confidence -> amplify model's allocation
             equal_weight = np.ones_like(action) / len(action)
             
-            # Apply AGGRESSIVE per-asset confidence modulation
             for i in range(len(action)):
                 conf = conf_values[i]
-                if conf < 0.4:  # Low confidence for this asset
-                    # Drastically reduce: only 10% of model allocation + 90% equal weight
-                    action[i] = 0.1 * action[i] + 0.9 * equal_weight[i]
-                elif conf < 0.6:  # Medium confidence for this asset
-                    # Moderate reduction: 40% model + 60% equal weight
-                    action[i] = 0.4 * action[i] + 0.6 * equal_weight[i]
-                elif conf < 0.75:  # Medium-high confidence
-                    # Slight boost: use model allocation as-is
-                    action[i] = action[i]
-                else:  # Very high confidence (>= 0.75)
-                    # Amplify: boost model allocation by confidence factor
-                    # Scale up allocation proportionally to confidence
-                    action[i] = action[i] * (1.0 + (conf - 0.75))  # Up to 1.25x boost at conf=1.0
+                blend_factor = 1.0 - conf
+                action[i] = conf * action[i] + blend_factor * equal_weight[i]
             
-            # Re-normalize after blending
             action = action / action.sum()
             
             if np.any(np.isnan(action)):
@@ -278,36 +280,50 @@ def collect_batch_data(env, model, batch_size, gamma, current_step, epsilon=0.1,
 
         env.render()
         
+        if is_rebalancing_step:
+            asset_rewards = np.zeros(len(env.asset_names))
+            portfolio_layout = info.get('portfolio_layout', {})
+            
+            # Ensure action is flat for indexing
+            action_flat = np.array(action).flatten()
+            
+            for idx, symbol in enumerate(env.asset_names):
+                if symbol in env.df:
+                    current_price = env.df[symbol]['close'].iloc[env.step_count - 1]
+                    prev_price = env.df[symbol]['close'].iloc[max(0, env.step_count - 2)]
+                    
+                    if prev_price > 0:
+                        price_change = (current_price - prev_price) / prev_price
+                        allocation = float(action_flat[idx])
+                        asset_rewards[idx] = float(price_change * allocation * 100)
+        else:
+            asset_rewards = np.zeros(len(env.asset_names))
+        
         raw_next_state = next_state.copy()
         
         if feature_reducer is not None:
             next_state = feature_reducer.transform(next_state.reshape(1, -1))[0]
 
-        # CRITICAL FIX: Only append to training data if this was a rebalancing step
-        # During holding periods, we don't want to train on dummy actions
         if is_rebalancing_step:
             states.append(state)
             raw_states.append(raw_state)
-            actions.append(action)
-            rewards.append(reward)
-            confidences.append(conf_values)  # Store per-asset confidence array
-            is_random_flags.append(is_random)
+            actions.append(np.array(action).flatten())
+            rewards.append(float(reward))
+            confidences.append(np.array(conf_values).flatten())
+            is_random_flags.append(bool(is_random))
+            per_asset_returns.append(np.array(asset_rewards).flatten())
         
-        # Calculate current portfolio allocation percentages for logging
-        # This shows ACTUAL current allocation as portfolio drifts
         portfolio_value = info.get('portfolio_value', 1.0)
         current_allocations = {}
         for symbol in env.df.keys():
             holdings = info.get('portfolio_layout', {}).get(symbol, 0)
-            price = env.df[symbol]['close'].iloc[env.step_count - 1]  # Current price (step was already incremented)
+            price = env.df[symbol]['close'].iloc[env.step_count - 1]
             value = holdings * price
             current_allocations[symbol] = value / portfolio_value if portfolio_value > 0 else 0
         
         cash_allocation = info.get('cash_allocation', 0)
         
-        # For logging, use real data during holding periods
         if is_rebalancing_step:
-            # Rebalancing step: log model's decision
             log_confidence = mean_conf
             log_confidence_min = float(np.min(conf_values))
             log_confidence_max = float(np.max(conf_values))
@@ -316,38 +332,39 @@ def collect_batch_data(env, model, batch_size, gamma, current_step, epsilon=0.1,
             log_action_std = np.std(action)
             log_action_max = np.max(action)
             log_per_asset_confidence = conf_values
+            log_per_asset_rewards = asset_rewards
         else:
-            # Holding period: log actual portfolio state, not dummy values
-            log_confidence = None  # No model prediction this step
+            log_confidence = None
             log_confidence_min = None
             log_confidence_max = None
             log_confidence_std = None
-            # Log ACTUAL current allocation percentages (how portfolio drifted)
             allocation_values = list(current_allocations.values()) + [cash_allocation]
             log_action_mean = np.mean(allocation_values) if allocation_values else 0
             log_action_std = np.std(allocation_values) if allocation_values else 0
             log_action_max = np.max(allocation_values) if allocation_values else 0
             log_per_asset_confidence = None
+            log_per_asset_rewards = None
         
         step_log = {
             'step_global': current_step + steps_collected,
             'step_batch': steps_collected,
             'reward': reward,
-            'confidence': log_confidence,  # None during holding periods
+            'confidence': log_confidence,
             'confidence_min': log_confidence_min,
             'confidence_max': log_confidence_max,
             'confidence_std': log_confidence_std,
             'portfolio_value': info.get('portfolio_value', 0),
             'benchmark_value': info.get('benchmark_value', 0),
             'outperformance': info.get('outperformance', 0),
-            'action_mean': log_action_mean,  # Actual allocation % during holding
-            'action_std': log_action_std,    # Allocation spread during holding
-            'action_max': log_action_max,    # Max allocation during holding
+            'action_mean': log_action_mean,
+            'action_std': log_action_std,
+            'action_max': log_action_max,
             'done': done,
             'portfolio_layout': info.get('portfolio_layout', {}),
-            'per_asset_confidence': log_per_asset_confidence,  # None during holding
+            'per_asset_confidence': log_per_asset_confidence,
+            'per_asset_rewards': log_per_asset_rewards,
             'was_rebalancing_step': is_rebalancing_step,
-            'current_allocations': current_allocations,  # REAL allocation percentages
+            'current_allocations': current_allocations,
             'cash_allocation': cash_allocation,
         }
         
@@ -361,8 +378,8 @@ def collect_batch_data(env, model, batch_size, gamma, current_step, epsilon=0.1,
             print(f"  Warning: Episode exceeded 10000 steps, forcing termination")
             break
     
-    # Calculate returns (discounted cumulative rewards)
     returns = np.array([], dtype=np.float32)
+    per_asset_returns_cumulative = []
     
     if steps_collected > 0:
         rewards_array = np.array(rewards, dtype=np.float32)
@@ -373,19 +390,26 @@ def collect_batch_data(env, model, batch_size, gamma, current_step, epsilon=0.1,
             rewards = rewards_array.tolist()
         
         returns = []
+        asset_returns_list = []
         G = 0.0
+        asset_G = np.zeros(len(env.asset_names))
         
-        # Calculate discounted returns (no advantages needed without critic)
         for i in reversed(range(len(rewards))):
             G = rewards[i] + gamma * G
+            asset_G = per_asset_returns[i] + gamma * asset_G
             
             if np.isnan(G) or np.isinf(G):
                 print(f"WARNING: NaN/Inf in return calculation at step {i}, resetting to 0")
                 G = 0.0
             
+            if np.any(np.isnan(asset_G)) or np.any(np.isinf(asset_G)):
+                asset_G = np.nan_to_num(asset_G, nan=0.0, posinf=1.0, neginf=-1.0)
+            
             returns.insert(0, G)
+            asset_returns_list.insert(0, asset_G.copy())
         
         returns = np.array(returns, dtype=np.float32)
+        per_asset_returns_cumulative = np.array(asset_returns_list, dtype=np.float32)
         
         if np.any(np.isnan(returns)):
             print("WARNING: NaN in returns, replacing with zeros")
@@ -397,7 +421,13 @@ def collect_batch_data(env, model, batch_size, gamma, current_step, epsilon=0.1,
 
     if steps_collected > 0 and len(states) > 0:
         with open(os.path.join(train_data_dir, "training_data.pkl"), 'ab') as f:
-            pickle.dump({'states': states, 'actions': actions, 'returns': returns, 'is_random': is_random_flags}, f)
+            pickle.dump({
+                'states': states, 
+                'actions': actions, 
+                'returns': returns, 
+                'is_random': is_random_flags,
+                'per_asset_returns': per_asset_returns_cumulative.tolist() if len(per_asset_returns_cumulative) > 0 else []
+            }, f)
     
     random_count = sum(is_random_flags)
     policy_count = len(is_random_flags) - random_count
@@ -415,8 +445,7 @@ def collect_batch_data(env, model, batch_size, gamma, current_step, epsilon=0.1,
             'policy_actions': 0
         }
     else:
-        # Calculate mean confidence across all steps and assets
-        all_confidences = np.array(confidences)  # Shape: (steps, num_assets)
+        all_confidences = np.array(confidences)
         batch_info = {
             'steps_collected': steps_collected,
             'total_reward': sum(rewards),
@@ -429,19 +458,18 @@ def collect_batch_data(env, model, batch_size, gamma, current_step, epsilon=0.1,
             'policy_actions': policy_count
         }
     
-    return states, raw_states, actions, returns, confidences, is_random_flags, batch_info, step_logs
+    return states, raw_states, actions, returns, confidences, is_random_flags, batch_info, step_logs, per_asset_returns_cumulative
 
 def train_on_batch(model, optimizer, batch_states, batch_raw_states, batch_actions, batch_returns, 
-                   batch_confidences, is_random_flags, batch_num, feature_reducer=None, 
+                   batch_confidences, batch_per_asset_returns, is_random_flags, batch_num, feature_reducer=None, 
                    feature_reducer_optimizer=None, clip_ratio=0.2, train_encoder=True):
     states_batch = np.array(batch_states, dtype=np.float32)
     actions_batch = np.array(batch_actions, dtype=np.float32)
     returns_batch = np.array(batch_returns, dtype=np.float32)
+    per_asset_returns_batch = np.array(batch_per_asset_returns, dtype=np.float32)
     
-    # Keep raw returns for reference
     returns_raw = returns_batch.copy()
     
-    # Normalize returns for stable gradients
     returns_mean = np.mean(returns_batch)
     returns_std = np.std(returns_batch)
     if returns_std > 1e-6 and not np.isnan(returns_std):
@@ -451,38 +479,28 @@ def train_on_batch(model, optimizer, batch_states, batch_raw_states, batch_actio
     
     returns_normalized = np.clip(returns_normalized, -10.0, 10.0)
     
-    # Convert confidences to numpy array (shape: batch_size x num_assets)
     confidences_batch = np.array(batch_confidences, dtype=np.float32)
+    
+    asset_returns_mean = np.mean(per_asset_returns_batch, axis=0)
+    asset_returns_std = np.std(per_asset_returns_batch, axis=0) + 1e-8
+    per_asset_returns_normalized = (per_asset_returns_batch - asset_returns_mean) / asset_returns_std
+    per_asset_returns_normalized = np.clip(per_asset_returns_normalized, -5.0, 5.0)
     
     with tf.GradientTape() as tape:
         action_probs, confidence_pred = model(states_batch, training=True)
         action_probs_clipped = tf.clip_by_value(action_probs, 1e-8, 1.0)
-        # confidence_pred shape: (batch_size, num_assets)
         
-        # REINFORCE loss: maximize log_prob * return (negate for minimization)
         log_probs = tf.reduce_sum(actions_batch * tf.math.log(action_probs_clipped), axis=1)
         actor_loss = -tf.reduce_mean(log_probs * returns_normalized)
         
-        # Per-asset confidence loss: predict high confidence when asset allocation is good
-        # Target: High confidence for assets with large allocation in high-return episodes
-        # Expand returns to match confidence shape: (batch_size, num_assets)
-        returns_expanded = tf.expand_dims(returns_normalized, axis=1)  # (batch_size, 1)
-        
-        # Weight by action allocation - more weight to assets we're actually using
-        action_weight = actions_batch + 0.1  # Add small baseline so we learn for all assets
-        action_weight = action_weight / tf.reduce_sum(action_weight, axis=1, keepdims=True)
-        
-        # Target confidence: high when we allocate to an asset AND get good returns
-        target_confidence = tf.abs(returns_expanded) * action_weight / 10.0
-        target_confidence = tf.clip_by_value(target_confidence, 0.0, 1.0)
+        target_confidence = tf.sigmoid(per_asset_returns_normalized / 2.0)
         target_confidence = tf.cast(target_confidence, confidence_pred.dtype)
         
         confidence_loss = tf.reduce_mean(tf.square(confidence_pred - target_confidence))
         
-        # Entropy bonus to encourage exploration
         entropy = -tf.reduce_mean(tf.reduce_sum(action_probs * tf.math.log(action_probs_clipped), axis=1))
         
-        total_loss = actor_loss + 0.5 * confidence_loss - 0.01 * entropy
+        total_loss = actor_loss + 0.3 * confidence_loss - 0.01 * entropy
     
     grads = tape.gradient(total_loss, model.trainable_variables)
     
@@ -600,6 +618,7 @@ def offline_pretrain(env, model, optimizer, num_episodes=50, gamma=0.99, batch_s
             chunk_states = []
             chunk_actions = []
             chunk_returns = []
+            chunk_per_asset_returns = []
             
             while True:
                 try:
@@ -607,7 +626,6 @@ def offline_pretrain(env, model, optimizer, num_episodes=50, gamma=0.99, batch_s
                     if isinstance(batch_data, dict):
                         states_to_add = batch_data.get('states', [])
                         
-                        # Apply feature reduction if using raw data
                         if not is_compressed and FEATURE_REDUCER is not None:
                             states_to_add = [FEATURE_REDUCER.transform(np.array(s).reshape(1, -1))[0].tolist() 
                                            for s in states_to_add]
@@ -615,6 +633,10 @@ def offline_pretrain(env, model, optimizer, num_episodes=50, gamma=0.99, batch_s
                         chunk_states.extend(states_to_add)
                         chunk_actions.extend(batch_data.get('actions', []))
                         chunk_returns.extend(batch_data.get('returns', []))
+                        
+                        per_asset_ret = batch_data.get('per_asset_returns', [])
+                        if per_asset_ret:
+                            chunk_per_asset_returns.extend(per_asset_ret)
                     
                     if len(chunk_states) >= chunk_size:
                         chunk_num += 1
@@ -624,6 +646,9 @@ def offline_pretrain(env, model, optimizer, num_episodes=50, gamma=0.99, batch_s
                         chunk_actions = chunk_actions[:min_len]
                         chunk_returns = chunk_returns[:min_len]
                         
+                        if chunk_per_asset_returns:
+                            chunk_per_asset_returns = chunk_per_asset_returns[:min_len]
+                        
                         total_samples += len(chunk_states)
                         print(f"  Chunk {chunk_num}: Training on {len(chunk_states)} samples...")
                         
@@ -631,6 +656,14 @@ def offline_pretrain(env, model, optimizer, num_episodes=50, gamma=0.99, batch_s
                         returns_mean = chunk_returns_arr.mean()
                         returns_std = chunk_returns_arr.std()
                         chunk_returns_arr = (chunk_returns_arr - returns_mean) / (returns_std + 1e-8)
+                        
+                        has_per_asset = len(chunk_per_asset_returns) > 0
+                        if has_per_asset:
+                            chunk_per_asset_arr = np.array(chunk_per_asset_returns, dtype=np.float32)
+                            asset_returns_mean = np.mean(chunk_per_asset_arr, axis=0)
+                            asset_returns_std = np.std(chunk_per_asset_arr, axis=0) + 1e-8
+                            chunk_per_asset_normalized = (chunk_per_asset_arr - asset_returns_mean) / asset_returns_std
+                            chunk_per_asset_normalized = np.clip(chunk_per_asset_normalized, -5.0, 5.0)
                         
                         chunk_losses = []
                         chunk_grad_norms = []
@@ -650,19 +683,19 @@ def offline_pretrain(env, model, optimizer, num_episodes=50, gamma=0.99, batch_s
                                 log_probs = tf.reduce_sum(batch_actions * tf.math.log(action_probs_clipped), axis=1)
                                 actor_loss = -tf.reduce_mean(log_probs * batch_returns)
                                 
-                                # Per-asset confidence loss (for pretraining)
-                                returns_expanded = tf.expand_dims(batch_returns, axis=1)
-                                action_weight = batch_actions + 0.1
-                                action_weight = action_weight / tf.reduce_sum(action_weight, axis=1, keepdims=True)
-                                target_confidence = tf.abs(returns_expanded) * action_weight / 10.0
-                                target_confidence = tf.clip_by_value(target_confidence, 0.0, 1.0)
+                                if has_per_asset:
+                                    batch_per_asset = chunk_per_asset_normalized[batch_indices]
+                                    target_confidence = tf.sigmoid(batch_per_asset / 2.0)
+                                else:
+                                    returns_expanded = tf.expand_dims(batch_returns, axis=1)
+                                    target_confidence = tf.sigmoid(returns_expanded / 2.0)
+                                
                                 target_confidence = tf.cast(target_confidence, confidence_pred.dtype)
                                 confidence_loss = tf.reduce_mean(tf.square(confidence_pred - target_confidence))
                                 
-                                # Entropy bonus
                                 entropy = -tf.reduce_mean(tf.reduce_sum(action_probs * tf.math.log(action_probs_clipped), axis=1))
                                 
-                                loss = actor_loss + 0.5 * confidence_loss - 0.01 * entropy
+                                loss = actor_loss + 0.3 * confidence_loss - 0.01 * entropy
                             
                             grads = tape.gradient(loss, model.trainable_variables)
                             grads = [tf.clip_by_norm(g, 1.0) for g in grads]
@@ -698,10 +731,11 @@ def offline_pretrain(env, model, optimizer, num_episodes=50, gamma=0.99, batch_s
                             "pretrain/chunk_returns_std": returns_std,
                         })
                         
-                        del chunk_states, chunk_actions, chunk_returns, chunk_returns_arr
+                        del chunk_states, chunk_actions, chunk_returns, chunk_returns_arr, chunk_per_asset_returns
                         chunk_states = []
                         chunk_actions = []
                         chunk_returns = []
+                        chunk_per_asset_returns = []
                         gc.collect()
                         
                 except EOFError:
@@ -715,6 +749,9 @@ def offline_pretrain(env, model, optimizer, num_episodes=50, gamma=0.99, batch_s
                 chunk_actions = chunk_actions[:min_len]
                 chunk_returns = chunk_returns[:min_len]
                 
+                if chunk_per_asset_returns:
+                    chunk_per_asset_returns = chunk_per_asset_returns[:min_len]
+                
                 total_samples += len(chunk_states)
                 print(f"  Chunk {chunk_num} (final): Training on {len(chunk_states)} samples...")
                 
@@ -722,6 +759,14 @@ def offline_pretrain(env, model, optimizer, num_episodes=50, gamma=0.99, batch_s
                 returns_mean = chunk_returns_arr.mean()
                 returns_std = chunk_returns_arr.std()
                 chunk_returns_arr = (chunk_returns_arr - returns_mean) / (returns_std + 1e-8)
+                
+                has_per_asset = len(chunk_per_asset_returns) > 0
+                if has_per_asset:
+                    chunk_per_asset_arr = np.array(chunk_per_asset_returns, dtype=np.float32)
+                    asset_returns_mean = np.mean(chunk_per_asset_arr, axis=0)
+                    asset_returns_std = np.std(chunk_per_asset_arr, axis=0) + 1e-8
+                    chunk_per_asset_normalized = (chunk_per_asset_arr - asset_returns_mean) / asset_returns_std
+                    chunk_per_asset_normalized = np.clip(chunk_per_asset_normalized, -5.0, 5.0)
                 
                 chunk_losses = []
                 chunk_grad_norms = []
@@ -741,19 +786,19 @@ def offline_pretrain(env, model, optimizer, num_episodes=50, gamma=0.99, batch_s
                         log_probs = tf.reduce_sum(batch_actions * tf.math.log(action_probs_clipped), axis=1)
                         actor_loss = -tf.reduce_mean(log_probs * batch_returns)
                         
-                        # Per-asset confidence loss
-                        returns_expanded = tf.expand_dims(batch_returns, axis=1)
-                        action_weight = batch_actions + 0.1
-                        action_weight = action_weight / tf.reduce_sum(action_weight, axis=1, keepdims=True)
-                        target_confidence = tf.abs(returns_expanded) * action_weight / 10.0
-                        target_confidence = tf.clip_by_value(target_confidence, 0.0, 1.0)
+                        if has_per_asset:
+                            batch_per_asset = chunk_per_asset_normalized[batch_indices]
+                            target_confidence = tf.sigmoid(batch_per_asset / 2.0)
+                        else:
+                            returns_expanded = tf.expand_dims(batch_returns, axis=1)
+                            target_confidence = tf.sigmoid(returns_expanded / 2.0)
+                        
                         target_confidence = tf.cast(target_confidence, confidence_pred.dtype)
                         confidence_loss = tf.reduce_mean(tf.square(confidence_pred - target_confidence))
                         
-                        # Entropy bonus
                         entropy = -tf.reduce_mean(tf.reduce_sum(action_probs * tf.math.log(action_probs_clipped), axis=1))
                         
-                        loss = actor_loss + 0.5 * confidence_loss - 0.01 * entropy
+                        loss = actor_loss + 0.3 * confidence_loss - 0.01 * entropy
                     
                     grads = tape.gradient(loss, model.trainable_variables)
                     grads = [tf.clip_by_norm(g, 1.0) for g in grads]
@@ -790,7 +835,7 @@ def offline_pretrain(env, model, optimizer, num_episodes=50, gamma=0.99, batch_s
                     "pretrain/chunk_returns_std": returns_std,
                 })
                 
-                del chunk_states, chunk_actions, chunk_returns, chunk_returns_arr
+                del chunk_states, chunk_actions, chunk_returns, chunk_returns_arr, chunk_per_asset_returns
                 gc.collect()
         
         epoch_time = time.time() - epoch_start
@@ -832,8 +877,8 @@ if __name__ == "__main__":
         "pretrain_batch_size": 512,
         "pretrain_chunk_size": 512 * 10,
         "online_total_batches": 5000,
-        "rebalance_interval": 12,  # Rebalance every N steps (12 steps = 1 hour with 5min candles)
-        "online_batch_size": 128 * 12, # 512 rebalancing steps per batch
+        "rebalance_interval": 12,
+        "online_batch_size": 32 * 12,
         "gamma": 0.99,
         "lr_patience": 200,
         "lr_decay": 0.8,
@@ -841,7 +886,8 @@ if __name__ == "__main__":
         "epsilon_start": 0.025,
         "epsilon_end": 0.0001,
         "epsilon_decay": 0.9995,
-        "env_reset_probability": 0.5,
+        "env_reset_probability": 0.25,
+        "num_stochastic_samples": 16,
     }
     
     wandb.init(project="portfolio-trading-online-batch", config=config)
@@ -975,8 +1021,8 @@ if __name__ == "__main__":
         print(f"\n--- Batch {batch_count}/{config.online_total_batches} ---")
         
         collect_start = time.time()
-        states, raw_states, actions, returns, confidences, is_random_flags, batch_info, step_logs = collect_batch_data(
-            env, model, config.online_batch_size, config.gamma, global_step, epsilon, config.env_reset_probability, FEATURE_REDUCER
+        states, raw_states, actions, returns, confidences, is_random_flags, batch_info, step_logs, per_asset_returns = collect_batch_data(
+            env, model, config.online_batch_size, config.gamma, global_step, epsilon, config.env_reset_probability, FEATURE_REDUCER, config
         )
         collect_time = time.time() - collect_start
         
@@ -1010,12 +1056,17 @@ if __name__ == "__main__":
                     "step/portfolio_layout": step_log['portfolio_layout']
                 }
                 
-                # Add per-asset confidence values (only if we have them - rebalancing steps only)
                 per_asset_conf = step_log['per_asset_confidence']
                 if per_asset_conf is not None:
                     for asset_idx, conf_val in enumerate(per_asset_conf):
                         asset_name = env.asset_names[asset_idx] if asset_idx < len(env.asset_names) else f"asset_{asset_idx}"
                         log_dict[f"confidence_per_asset/{asset_name}"] = float(conf_val)
+                
+                per_asset_rew = step_log['per_asset_rewards']
+                if per_asset_rew is not None:
+                    for asset_idx, rew_val in enumerate(per_asset_rew):
+                        asset_name = env.asset_names[asset_idx] if asset_idx < len(env.asset_names) else f"asset_{asset_idx}"
+                        log_dict[f"reward_per_asset/{asset_name}"] = float(rew_val)
                 
                 wandb.log(log_dict)
         
@@ -1023,7 +1074,7 @@ if __name__ == "__main__":
         if len(states) > 0:
             batch_metrics = train_on_batch(
                 model, optimizer, states, raw_states, actions, returns, 
-                confidences, is_random_flags, batch_count, None, None,
+                confidences, per_asset_returns, is_random_flags, batch_count, None, None,
                 clip_ratio=0.2, train_encoder=False
             )
             train_time = time.time() - train_start

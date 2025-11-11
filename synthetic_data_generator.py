@@ -221,8 +221,8 @@ class SyntheticDataGenerator:
         actions = []
         rewards = []
         is_random = []
+        per_asset_rewards = []
         
-        # Reset environment to start position
         self.env.reset()
         self.env.current_step = start_idx
         state = self.env.get_observation()
@@ -230,19 +230,29 @@ class SyntheticDataGenerator:
         print(f"Generating {num_samples} synthetic samples starting at index {start_idx} using {method} optimization...")
         
         for i in range(num_samples):
-            # Calculate optimal portfolio allocation
             optimal_action = self.calculate_optimal_portfolio(
                 self.env.current_step, 
                 method=method
             )
             
-            # Take action in environment
             next_state, reward, done, info = self.env.step(optimal_action)
+            
+            asset_rewards = np.zeros(len(self.env.asset_names))
+            for idx, symbol in enumerate(self.env.asset_names):
+                if symbol in self.env.df and self.env.current_step > 0:
+                    current_price = self.env.df[symbol]['close'].iloc[self.env.current_step - 1]
+                    prev_price = self.env.df[symbol]['close'].iloc[max(0, self.env.current_step - 2)]
+                    
+                    if prev_price > 0:
+                        price_change = (current_price - prev_price) / prev_price
+                        allocation = optimal_action[idx]
+                        asset_rewards[idx] = price_change * allocation * 100
             
             states.append(state)
             actions.append(optimal_action)
             rewards.append(reward)
-            is_random.append(False)  # These are optimal, not random
+            is_random.append(False)
+            per_asset_rewards.append(asset_rewards)
             
             state = next_state
             
@@ -253,15 +263,20 @@ class SyntheticDataGenerator:
             if (i + 1) % 100 == 0:
                 print(f"  Generated {i+1}/{num_samples} samples...")
         
-        # Calculate discounted returns
         returns = []
+        per_asset_returns_cumulative = []
         G = 0
-        for r in reversed(rewards):
-            G = r + gamma * G
-            returns.insert(0, G)
+        asset_G = np.zeros(len(self.env.asset_names))
         
-        # Normalize returns
+        for i in reversed(range(len(rewards))):
+            G = rewards[i] + gamma * G
+            asset_G = per_asset_rewards[i] + gamma * asset_G
+            returns.insert(0, G)
+            per_asset_returns_cumulative.insert(0, asset_G.copy())
+        
         returns = np.array(returns, dtype=np.float32)
+        per_asset_returns_cumulative = np.array(per_asset_returns_cumulative, dtype=np.float32)
+        
         if len(returns) > 1:
             returns = (returns - returns.mean()) / (returns.std() + 1e-8)
         
@@ -271,7 +286,8 @@ class SyntheticDataGenerator:
             'states': states,
             'actions': actions,
             'returns': returns,
-            'is_random': is_random
+            'is_random': is_random,
+            'per_asset_returns': per_asset_returns_cumulative.tolist()
         }
     
     def generate_multiple_batches(self, num_batches, samples_per_batch, method='sharpe', gamma=0.99, save_path=None):
@@ -398,7 +414,7 @@ if __name__ == "__main__":
     env = PortfolioEnv(max_records=100_000)
     
     # Create generator with 1-step lookforward (aligned with new reward function)
-    generator = SyntheticDataGenerator(env, lookforward_steps=1)
+    generator = SyntheticDataGenerator(env, lookforward_steps=12)
     
     # Configuration
     num_batches = 1024

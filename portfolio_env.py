@@ -566,12 +566,16 @@ class PortfolioEnv():
         
         # FIXED: Separate crypto and cash allocations
         num_cryptos = len(self.df)
+        
+        # Ensure action is a flat numpy array
+        action = np.array(action).flatten()
+        
         crypto_actions = action[:num_cryptos]
         cash_action = action[num_cryptos] if len(action) > num_cryptos else 0.0
         
-        # Ensure all values are in 0-1 range
-        crypto_actions = [np.clip(a, 0.0, 1.0) for a in crypto_actions]
-        cash_action = np.clip(cash_action, 0.0, 1.0)
+        # Ensure all values are in 0-1 range and convert to scalars
+        crypto_actions = [float(np.clip(float(a), 0.0, 1.0)) for a in crypto_actions]
+        cash_action = float(np.clip(float(cash_action), 0.0, 1.0))
         
         # Normalize to sum to 1.0
         total_allocation = sum(crypto_actions) + cash_action
@@ -813,7 +817,6 @@ class PortfolioEnv():
             
             # Safety check
             if not np.isnan(benchmark_future_return) and not np.isinf(benchmark_future_return):
-                # FIXED: Smaller bonus for outperforming benchmark (reduced from 500 to 50)
                 outperformance = portfolio_future_return - benchmark_future_return
                 reward += outperformance * 50  # Extra reward for beating benchmark
         
@@ -821,7 +824,6 @@ class PortfolioEnv():
         if np.isnan(reward) or np.isinf(reward):
             reward = 0.0
         
-        # FIXED: Tighter clipping to prevent extreme values (±10 instead of ±100)
         reward = reward * (self._calculate_benchmark_outperformance() * 0.1)
         reward = np.clip(reward, -100.0, 100.0)
         
