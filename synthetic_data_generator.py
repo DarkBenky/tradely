@@ -414,7 +414,7 @@ if __name__ == "__main__":
     env = PortfolioEnv(max_records=100_000)
     
     # Create generator with 1-step lookforward (aligned with new reward function)
-    generator = SyntheticDataGenerator(env, lookforward_steps=12)
+    generator = SyntheticDataGenerator(env, lookforward_steps=1)
     
     # Configuration
     num_batches = 1024

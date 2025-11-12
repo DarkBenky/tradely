@@ -738,8 +738,17 @@ def offline_pretrain(env, model, optimizer, num_episodes=50, gamma=0.99, batch_s
                         chunk_per_asset_returns = []
                         gc.collect()
                         
-                except EOFError:
-                    break
+                        # Save model after each chunk
+                        model.save_weights('models/best_model.weights.h5')
+                        print(f"  Model saved after chunk {chunk_num}")
+                        
+                except (pickle.UnpicklingError, EOFError) as e:
+                    if isinstance(e, pickle.UnpicklingError):
+                        print(f"WARNING: Corrupted pickle record encountered, skipping and continuing...")
+                        continue
+                    else:
+                        # EOFError means end of file, normal termination
+                        break
             
             if len(chunk_states) > 0:
                 chunk_num += 1
@@ -837,6 +846,14 @@ def offline_pretrain(env, model, optimizer, num_episodes=50, gamma=0.99, batch_s
                 
                 del chunk_states, chunk_actions, chunk_returns, chunk_returns_arr, chunk_per_asset_returns
                 gc.collect()
+                
+                # Save model after final chunk
+                model.save_weights('models/best_model.weights.h5')
+                print(f"  Model saved after final chunk {chunk_num}")
+                
+                # Save model after final chunk
+                model.save_weights('models/best_model.weights.h5')
+                print(f"  Model saved after final chunk {chunk_num}")
         
         epoch_time = time.time() - epoch_start
         avg_loss = np.mean(epoch_losses) if epoch_losses else 0.0
@@ -873,9 +890,9 @@ if __name__ == "__main__":
         "actor_layers": [512, 512, 512, 512, 512, 256, 128],
         "initial_lr": 0.000175,
         "pretrain_episodes": 10,
-        "pretrain_epochs": 0,
-        "pretrain_batch_size": 512,
-        "pretrain_chunk_size": 512 * 10,
+        "pretrain_epochs": 2,
+        "pretrain_batch_size": 256,
+        "pretrain_chunk_size": 512 * 128,
         "online_total_batches": 5000,
         "rebalance_interval": 12,
         "online_batch_size": 32 * 12,
@@ -887,7 +904,7 @@ if __name__ == "__main__":
         "epsilon_end": 0.0001,
         "epsilon_decay": 0.9995,
         "env_reset_probability": 0.25,
-        "num_stochastic_samples": 16,
+        "num_stochastic_samples": 64,
     }
     
     wandb.init(project="portfolio-trading-online-batch", config=config)
@@ -975,8 +992,11 @@ if __name__ == "__main__":
             break
     
     if has_nan:
-        print("ERROR: Model has NaN weights! Rebuilding...")
-        model = build_model(obs_shape, num_assets, config, FEATURE_REDUCER)
+        print("="*80)
+        print("CRITICAL ERROR: Model has NaN weights after loading!")
+        # print("ERROR: Model has NaN weights! Rebuilding...")
+        print("="*80)
+        # model = build_model(obs_shape, num_assets, config, FEATURE_REDUCER)
     else:
         print("Model weights validated: No NaN detected")
 
