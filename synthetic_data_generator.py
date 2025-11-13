@@ -411,15 +411,16 @@ if __name__ == "__main__":
     
     # Initialize environment
     print("Initializing environment...")
-    env = PortfolioEnv(max_records=100_000)
+    env = PortfolioEnv(max_records=150_000)
     
     # Create generator with 1-step lookforward (aligned with new reward function)
     generator = SyntheticDataGenerator(env, lookforward_steps=1)
     
     # Configuration
-    num_batches = 1024
+    num_batches = 2048
     samples_per_batch = 128
     save_path = "/media/user/HDD 1TB/Data/synthetic_training_data.pkl"
+    # save_path = "/media/user/64e260bf-e154-43ad-a261-1ebf373775e6/Data/synthetic_training_data.pkl"
     num_workers = max(1, int(cpu_count() / 4))  # Use all cores except one
     
     # Generate diverse batches using different optimization methods

@@ -262,8 +262,6 @@ def collect_batch_data(env, model, batch_size, gamma, current_step, epsilon=0.1,
                 action = np.clip(action, 0, 1)
                 action = action / action.sum()
         else:
-            # NOT a rebalancing step - use a dummy action (will be ignored by env)
-            # We don't call the model here to save computation
             action = env.sample()  # Dummy action, won't be used
             is_random = False  # Mark as not random (it's a holding period)
             conf_values = np.zeros(len(env.asset_names))  # Dummy confidence
@@ -577,6 +575,591 @@ def train_on_batch(model, optimizer, batch_states, batch_raw_states, batch_actio
     
     return metrics
 
+def merge_synthetic_data_files(file1, file2, output_file=None, cleanup=True):
+    """
+    Merge two synthetic data files into one, cleaning both in the process.
+    Handles large files without loading to memory - processes in chunks.
+    
+    Args:
+        file1: Path to first synthetic data file
+        file2: Path to second synthetic data file
+        output_file: Path for merged file (default: file1 with '_merged' suffix)
+        cleanup: If True, remove original files after successful merge
+    
+    Returns:
+        Path to merged file, or None if merge failed
+    """
+    print(f"\nMERGING SYNTHETIC DATA FILES")
+    print(f"{'='*80}")
+    print(f"File 1: {file1}")
+    print(f"File 2: {file2}")
+    
+    # Validate input files exist
+    if not os.path.exists(file1):
+        print(f"ERROR: File 1 does not exist: {file1}")
+        return None
+    if not os.path.exists(file2):
+        print(f"ERROR: File 2 does not exist: {file2}")
+        return None
+    
+    # Set output filename
+    if output_file is None:
+        output_file = file1.replace('.pkl', '_merged.pkl')
+    
+    print(f"Output: {output_file}\n")
+    
+    merged_count = 0
+    skipped_count = 0
+    total_batches = 0
+    
+    try:
+        with open(output_file, 'wb') as f_out:
+            # Process file 1
+            print(f"Processing File 1: {file1}")
+            file1_batches = 0
+            try:
+                with open(file1, 'rb') as f_in:
+                    while True:
+                        try:
+                            batch_data = pickle.load(f_in)
+                            total_batches += 1
+                            file1_batches += 1
+                            
+                            if isinstance(batch_data, dict):
+                                # Clean and merge batch
+                                cleaned_batch = _clean_batch_data(batch_data)
+                                if cleaned_batch and cleaned_batch['states']:
+                                    pickle.dump(cleaned_batch, f_out)
+                                    merged_count += len(cleaned_batch['states'])
+                                else:
+                                    skipped_count += len(batch_data.get('states', []))
+                                    
+                        except (pickle.UnpicklingError, EOFError) as e:
+                            if isinstance(e, pickle.UnpicklingError):
+                                print(f"  WARNING: Corrupted record in File 1, skipping...")
+                                skipped_count += 1
+                                continue
+                            else:
+                                break
+            except Exception as e:
+                print(f"ERROR reading File 1: {e}")
+                return None
+            
+            print(f"  File 1: {file1_batches} batches processed\n")
+            
+            # Process file 2
+            print(f"Processing File 2: {file2}")
+            file2_batches = 0
+            try:
+                with open(file2, 'rb') as f_in:
+                    while True:
+                        try:
+                            batch_data = pickle.load(f_in)
+                            total_batches += 1
+                            file2_batches += 1
+                            
+                            if isinstance(batch_data, dict):
+                                # Clean and merge batch
+                                cleaned_batch = _clean_batch_data(batch_data)
+                                if cleaned_batch and cleaned_batch['states']:
+                                    pickle.dump(cleaned_batch, f_out)
+                                    merged_count += len(cleaned_batch['states'])
+                                else:
+                                    skipped_count += len(batch_data.get('states', []))
+                                    
+                        except (pickle.UnpicklingError, EOFError) as e:
+                            if isinstance(e, pickle.UnpicklingError):
+                                print(f"  WARNING: Corrupted record in File 2, skipping...")
+                                skipped_count += 1
+                                continue
+                            else:
+                                break
+            except Exception as e:
+                print(f"ERROR reading File 2: {e}")
+                return None
+            
+            print(f"  File 2: {file2_batches} batches processed\n")
+    
+    except Exception as e:
+        print(f"ERROR writing merged file: {e}")
+        if os.path.exists(output_file):
+            os.remove(output_file)
+        return None
+    
+    # Print merge statistics
+    print(f"{'='*80}")
+    print(f"MERGE STATISTICS")
+    print(f"{'='*80}")
+    print(f"Total batches: {total_batches}")
+    print(f"Clean samples merged: {merged_count}")
+    print(f"Corrupted samples skipped: {skipped_count}")
+    print(f"Output file: {output_file}")
+    
+    # Get file sizes
+    try:
+        file1_size = os.path.getsize(file1) / (1024**2)  # MB
+        file2_size = os.path.getsize(file2) / (1024**2)  # MB
+        output_size = os.path.getsize(output_file) / (1024**2)  # MB
+        print(f"\nFile sizes:")
+        print(f"  File 1: {file1_size:.2f} MB")
+        print(f"  File 2: {file2_size:.2f} MB")
+        print(f"  Total: {file1_size + file2_size:.2f} MB")
+        print(f"  Merged: {output_size:.2f} MB (saved {file1_size + file2_size - output_size:.2f} MB)")
+    except:
+        pass
+    
+    # Cleanup old files if requested
+    if cleanup:
+        try:
+            os.remove(file1)
+            print(f"\nRemoved: {file1}")
+        except:
+            print(f"\nWARNING: Could not remove {file1}")
+        
+        try:
+            os.remove(file2)
+            print(f"Removed: {file2}")
+        except:
+            print(f"WARNING: Could not remove {file2}")
+    
+    print(f"\nMerge complete!\n")
+    return output_file
+
+def truncate_pickle_at_corruption(pkl_file):
+    """
+    Find and truncate a pickle file at the first corrupted record.
+    This prevents infinite loops when reading corrupted files.
+    
+    Args:
+        pkl_file: Path to pickle file to repair
+    
+    Returns:
+        Number of valid batches saved, or -1 if error
+    """
+    print(f"\nREPAIRING CORRUPTED PICKLE FILE: {pkl_file}")
+    print(f"{'='*80}")
+    
+    temp_file = pkl_file + '.repaired'
+    valid_batches = 0
+    
+    try:
+        with open(pkl_file, 'rb') as f_in:
+            with open(temp_file, 'wb') as f_out:
+                while True:
+                    try:
+                        pos = f_in.tell()  # Save position before reading
+                        batch_data = pickle.load(f_in)
+                        # If successful, write it
+                        pickle.dump(batch_data, f_out)
+                        valid_batches += 1
+                    except (pickle.UnpicklingError, EOFError) as e:
+                        if isinstance(e, pickle.UnpicklingError):
+                            print(f"Corruption detected at byte position {pos}")
+                            print(f"Truncating file: keeping {valid_batches} valid batches")
+                            break
+                        else:
+                            # Normal EOF
+                            break
+                    except Exception as e:
+                        print(f"Unexpected error: {e}")
+                        print(f"Truncating file: keeping {valid_batches} valid batches")
+                        break
+        
+        # Replace original with repaired version
+        os.replace(temp_file, pkl_file)
+        file_size = os.path.getsize(pkl_file) / (1024**2)
+        print(f"Repair complete! File size: {file_size:.2f} MB, Valid batches: {valid_batches}")
+        print(f"{'='*80}\n")
+        return valid_batches
+        
+    except Exception as e:
+        print(f"ERROR repairing file: {e}")
+        if os.path.exists(temp_file):
+            os.remove(temp_file)
+        return -1
+
+
+def _clean_batch_data(batch_data):
+    """
+    Helper function to clean a single batch of data.
+    Removes samples with NaN/Inf values.
+    
+    Args:
+        batch_data: Dictionary with 'states', 'actions', 'returns', 'is_random', 'per_asset_returns'
+    
+    Returns:
+        Cleaned batch dictionary, or None if no valid samples
+    """
+    if not isinstance(batch_data, dict):
+        return None
+    
+    states = batch_data.get('states', [])
+    actions = batch_data.get('actions', [])
+    returns = batch_data.get('returns', [])
+    is_random = batch_data.get('is_random', [])
+    per_asset_returns = batch_data.get('per_asset_returns', [])
+    
+    clean_states = []
+    clean_actions = []
+    clean_returns = []
+    clean_is_random = []
+    clean_per_asset = []
+    
+    for i in range(len(states)):
+        state = np.array(states[i], dtype=np.float32)
+        action = np.array(actions[i], dtype=np.float32)
+        ret = returns[i] if i < len(returns) else 0.0
+        is_rand = is_random[i] if i < len(is_random) else False
+        per_asset = per_asset_returns[i] if i < len(per_asset_returns) else np.zeros(10)
+        
+        # Check for NaN/Inf in all fields
+        has_nan_state = np.any(np.isnan(state)) or np.any(np.isinf(state))
+        has_nan_action = np.any(np.isnan(action)) or np.any(np.isinf(action))
+        has_nan_return = np.isnan(ret) or np.isinf(ret)
+        
+        per_asset_arr = np.array(per_asset, dtype=np.float32)
+        has_nan_per_asset = np.any(np.isnan(per_asset_arr)) or np.any(np.isinf(per_asset_arr))
+        
+        # Skip corrupted samples
+        if has_nan_state or has_nan_action or has_nan_return or has_nan_per_asset:
+            continue
+        
+        # Add clean sample to batch
+        clean_states.append(states[i])
+        clean_actions.append(actions[i])
+        clean_returns.append(ret)
+        clean_is_random.append(is_rand)
+        clean_per_asset.append(per_asset)
+    
+    # Return cleaned batch if it has data
+    if clean_states:
+        return {
+            'states': clean_states,
+            'actions': clean_actions,
+            'returns': clean_returns,
+            'is_random': clean_is_random,
+            'per_asset_returns': clean_per_asset
+        }
+    return None
+
+def clean_synthetic_data(pkl_file, chunk_size=10000):
+    """Clean corrupted NaN/Inf values from synthetic data without loading entire file to memory."""
+    print("\nCLEANING SYNTHETIC DATA (removing NaN/Inf values)...")
+    
+    temp_pkl_file = pkl_file + '.clean'
+    cleaned_count = 0
+    skipped_count = 0
+    total_batches = 0
+    
+    with open(pkl_file, 'rb') as f_in:
+        with open(temp_pkl_file, 'wb') as f_out:
+            while True:
+                try:
+                    batch_data = pickle.load(f_in)
+                    total_batches += 1
+                    
+                    if isinstance(batch_data, dict):
+                        states = batch_data.get('states', [])
+                        actions = batch_data.get('actions', [])
+                        returns = batch_data.get('returns', [])
+                        is_random = batch_data.get('is_random', [])
+                        per_asset_returns = batch_data.get('per_asset_returns', [])
+                        
+                        # Filter out samples with NaN/Inf values
+                        clean_states = []
+                        clean_actions = []
+                        clean_returns = []
+                        clean_is_random = []
+                        clean_per_asset = []
+                        
+                        for i in range(len(states)):
+                            state = np.array(states[i], dtype=np.float32)
+                            action = np.array(actions[i], dtype=np.float32)
+                            ret = returns[i] if i < len(returns) else 0.0
+                            is_rand = is_random[i] if i < len(is_random) else False
+                            per_asset = per_asset_returns[i] if i < len(per_asset_returns) else np.zeros(10)
+                            
+                            # Check for NaN/Inf in state, action, return, and per_asset_returns
+                            has_nan_state = np.any(np.isnan(state)) or np.any(np.isinf(state))
+                            has_nan_action = np.any(np.isnan(action)) or np.any(np.isinf(action))
+                            has_nan_return = np.isnan(ret) or np.isinf(ret)
+                            
+                            per_asset_arr = np.array(per_asset, dtype=np.float32)
+                            has_nan_per_asset = np.any(np.isnan(per_asset_arr)) or np.any(np.isinf(per_asset_arr))
+                            
+                            if has_nan_state or has_nan_action or has_nan_return or has_nan_per_asset:
+                                skipped_count += 1
+                                continue
+                            
+                            # Data is clean, add to batch
+                            clean_states.append(states[i])
+                            clean_actions.append(actions[i])
+                            clean_returns.append(ret)
+                            clean_is_random.append(is_rand)
+                            clean_per_asset.append(per_asset)
+                            cleaned_count += 1
+                        
+                        # Only write batch if it has data
+                        if clean_states:
+                            clean_batch = {
+                                'states': clean_states,
+                                'actions': clean_actions,
+                                'returns': clean_returns,
+                                'is_random': clean_is_random,
+                                'per_asset_returns': clean_per_asset
+                            }
+                            pickle.dump(clean_batch, f_out)
+                            
+                except (pickle.UnpicklingError, EOFError) as e:
+                    if isinstance(e, pickle.UnpicklingError):
+                        print(f"  WARNING: Corrupted pickle record at batch {total_batches}, skipping...")
+                        continue
+                    else:
+                        break
+    
+    # Replace original file with cleaned version
+    os.replace(temp_pkl_file, pkl_file)
+    print(f"Data cleaning complete!")
+    print(f"  Total batches processed: {total_batches}")
+    print(f"  Clean samples saved: {cleaned_count}")
+    print(f"  Corrupted samples removed: {skipped_count}")
+    print(f"  File updated: {pkl_file}\n")
+
+def behavior_cloning(pkl_file, model, optimizer, chunk_size=10000, batch_size=256, epochs=2):
+    print("\nBEHAVIOR CLONING (Supervised Action Learning)")
+    print(f"Training action head to imitate synthetic data actions...")
+    print(f"Chunk size: {chunk_size}, Batch size: {batch_size}, epochs: {epochs}")
+    
+    # Freeze confidence head (only train action head)
+    for layer in model.layers:
+        if 'confidence' in layer.name.lower():
+            layer.trainable = False
+    
+    total_samples = 0
+    total_batches = 0
+    rollback_count = 0
+    best_accuracy = 0.0  # Track best accuracy
+    
+    # Create models directory if it doesn't exist
+    import os
+    os.makedirs('models', exist_ok=True)
+    
+    for epoch in range(epochs):
+        print(f"\n  Behavior Cloning Epoch {epoch+1}/{epochs}")
+        epoch_start = time.time()
+        epoch_losses = []
+        epoch_accuracies = []
+        chunk_num = 0
+        
+        with open(pkl_file, 'rb') as f:
+            chunk_states = []
+            chunk_actions = []
+            
+            while True:
+                try:
+                    batch_data = pickle.load(f)
+                    if isinstance(batch_data, dict):
+                        states = batch_data.get('states', [])
+                        actions = batch_data.get('actions', [])
+                        chunk_states.extend(states)
+                        chunk_actions.extend(actions)
+                    
+                    # Process chunk when it reaches target size
+                    if len(chunk_states) >= chunk_size:
+                        chunk_num += 1
+                        min_len = min(len(chunk_states), len(chunk_actions))
+                        chunk_states_arr = np.array(chunk_states[:min_len], dtype=np.float32)
+                        chunk_actions_arr = np.array(chunk_actions[:min_len], dtype=np.float32)
+                        
+                        total_samples += len(chunk_states_arr)
+                        print(f"    Chunk {chunk_num}: Training on {len(chunk_states_arr)} samples...")
+                        
+                        # Dummy confidence targets (not used)
+                        dummy_confidence = np.zeros((len(chunk_states_arr), chunk_actions_arr.shape[1]), dtype=np.float32)
+                        
+                        # Train on this chunk using .fit()
+                        try:
+                            # Save weights before training (for rollback)
+                            weights_backup = [w.numpy().copy() for w in model.trainable_variables]
+                            
+                            # Custom loss for action head only
+                            def action_loss(y_true, y_pred):
+                                y_pred_clipped = tf.clip_by_value(y_pred, 1e-8, 1.0)
+                                return -tf.reduce_mean(tf.reduce_sum(y_true * tf.math.log(y_pred_clipped), axis=1))
+                            
+                            # Compile model (only needs to be done once, but .fit() requires it)
+                            model.compile(
+                                optimizer=optimizer,
+                                loss=[action_loss, 'mse'],
+                                loss_weights=[1.0, 0.0],
+                                metrics=[['accuracy'], []]
+                            )
+                            
+                            # Train on chunk
+                            history = model.fit(
+                                chunk_states_arr,
+                                [chunk_actions_arr, dummy_confidence],
+                                batch_size=batch_size,
+                                epochs=1,
+                                verbose=1,
+                                shuffle=True
+                            )
+                            
+                            # Check for NaN in weights after training
+                            has_nan = False
+                            for var in model.trainable_variables:
+                                if tf.reduce_any(tf.math.is_nan(var)):
+                                    has_nan = True
+                                    break
+                            
+                            if has_nan:
+                                print(f"      WARNING: NaN detected in weights! Rolling back...")
+                                # Restore weights
+                                for var, backup in zip(model.trainable_variables, weights_backup):
+                                    var.assign(backup)
+                                rollback_count += 1
+                            else:
+                                # Success - record metrics
+                                chunk_loss = history.history['portfolio_allocation_loss'][0]
+                                chunk_acc = history.history['portfolio_allocation_accuracy'][0]
+                                epoch_losses.append(chunk_loss)
+                                epoch_accuracies.append(chunk_acc)
+                                total_batches += 1
+
+                                # Check if this is the best accuracy so far
+                                if chunk_acc > best_accuracy:
+                                    best_accuracy = chunk_acc
+                                    model.save_weights('models/best_model.weights.h5')
+                                    print(f"New best accuracy: {chunk_acc:.2%}! Model saved.")
+
+                                wandb.log({
+                                    'behavior_cloning/chunk_loss': chunk_loss,
+                                    'behavior_cloning/chunk_accuracy': chunk_acc,
+                                    'behavior_cloning/best_accuracy': best_accuracy,
+                                    'behavior_cloning/epoch': epoch + 1,
+                                    'behavior_cloning/chunk_num': chunk_num,
+                                })
+
+                                print(f"Loss: {chunk_loss:.4f}, Accuracy: {chunk_acc:.2%}")
+                            
+                            del weights_backup
+                            
+                        except Exception as e:
+                            print(f"      ERROR training on chunk: {e}")
+                            print(f"      Skipping this chunk...")
+                        
+                        # Clear chunk
+                        chunk_states = []
+                        chunk_actions = []
+                        del chunk_states_arr, chunk_actions_arr, dummy_confidence
+                        gc.collect()
+                
+                except (pickle.UnpicklingError, EOFError):
+                    break
+        
+        # Process final chunk if it exists
+        if len(chunk_states) > 0:
+            chunk_num += 1
+            min_len = min(len(chunk_states), len(chunk_actions))
+            chunk_states_arr = np.array(chunk_states[:min_len], dtype=np.float32)
+            chunk_actions_arr = np.array(chunk_actions[:min_len], dtype=np.float32)
+            
+            total_samples += len(chunk_states_arr)
+            print(f"    Chunk {chunk_num} (final): Training on {len(chunk_states_arr)} samples...")
+            
+            dummy_confidence = np.zeros((len(chunk_states_arr), chunk_actions_arr.shape[1]), dtype=np.float32)
+            
+            try:
+                weights_backup = [w.numpy().copy() for w in model.trainable_variables]
+                
+                def action_loss(y_true, y_pred):
+                    y_pred_clipped = tf.clip_by_value(y_pred, 1e-8, 1.0)
+                    return -tf.reduce_mean(tf.reduce_sum(y_true * tf.math.log(y_pred_clipped), axis=1))
+                
+                model.compile(
+                    optimizer=optimizer,
+                    loss=[action_loss, 'mse'],
+                    loss_weights=[1.0, 0.0],
+                    metrics=[['accuracy'], []]
+                )
+                
+                history = model.fit(
+                    chunk_states_arr,
+                    [chunk_actions_arr, dummy_confidence],
+                    batch_size=batch_size,
+                    epochs=1,
+                    verbose=0,
+                    shuffle=True
+                )
+                
+                has_nan = False
+                for var in model.trainable_variables:
+                    if tf.reduce_any(tf.math.is_nan(var)):
+                        has_nan = True
+                        break
+                
+                if has_nan:
+                    print(f"      WARNING: NaN detected in weights! Rolling back...")
+                    for var, backup in zip(model.trainable_variables, weights_backup):
+                        var.assign(backup)
+                    rollback_count += 1
+                else:
+                    chunk_loss = history.history['portfolio_allocation_loss'][0]
+                    chunk_acc = history.history['portfolio_allocation_accuracy'][0]
+                    epoch_losses.append(chunk_loss)
+                    epoch_accuracies.append(chunk_acc)
+                    wandb.log({
+                        'behavior_cloning/chunk_loss': chunk_loss,
+                        'behavior_cloning/chunk_accuracy': chunk_acc,
+                        'behavior_cloning/best_accuracy': best_accuracy,
+                        'behavior_cloning/epoch': epoch + 1,
+                        'behavior_cloning/chunk_num': chunk_num,
+                    })
+                    total_batches += 1
+                    
+                    # Check if this is the best accuracy so far
+                    if chunk_acc > best_accuracy:
+                        best_accuracy = chunk_acc
+                        model.save_weights('models/best_model.weights.h5')
+                        print(f"New best accuracy: {chunk_acc:.2%}! Model saved.")
+                    
+                    print(f"Loss: {chunk_loss:.4f}, Accuracy: {chunk_acc:.2%}")
+                
+                del weights_backup
+                
+            except Exception as e:
+                print(f"ERROR training on final chunk: {e}")
+            
+            del chunk_states_arr, chunk_actions_arr, dummy_confidence
+            gc.collect()
+        
+        epoch_time = time.time() - epoch_start
+        avg_loss = np.mean(epoch_losses) if epoch_losses else 0.0
+        avg_accuracy = np.mean(epoch_accuracies) if epoch_accuracies else 0.0
+        
+        print(f"    Epoch {epoch+1} Summary:")
+        print(f"      Loss: {avg_loss:.4f}, Accuracy: {avg_accuracy:.2%}")
+        print(f"      Best Accuracy: {best_accuracy:.2%}")
+        print(f"      Time: {epoch_time:.1f}s, Samples: {total_samples}")
+        print(f"      Rollbacks: {rollback_count}")
+        
+        gc.collect()
+    
+    # Unfreeze confidence head for later training
+    for layer in model.layers:
+        layer.trainable = True
+    
+    print(f"\n  Behavior cloning complete!")
+    print(f"  Total batches: {total_batches}, Total rollbacks: {rollback_count}")
+    print(f"  Best accuracy achieved: {best_accuracy:.2%}")
+    print(f"  Best model saved to: models/best_model.weights.h5")
+    print(f"  Model can now imitate synthetic actions.\n")
+    
+    gc.collect()
+
+DISABLE_CHECKING = True
+
+
 def offline_pretrain(env, model, optimizer, num_episodes=50, gamma=0.99, batch_size=256, epochs=20, chunk_size=10000):
     print("\nOFFLINE PRETRAINING (MEMORY OPTIMIZED)")
     
@@ -595,13 +1178,43 @@ def offline_pretrain(env, model, optimizer, num_episodes=50, gamma=0.99, batch_s
         print("No pretraining data found, skipping pretraining")
         return
     
+    # Phase 0: Repair any corrupted pickle file BEFORE cleaning/training
+    if not DISABLE_CHECKING:
+        print(f"\n{'='*80}")
+        print(f"PHASE 0: PICKLE FILE REPAIR (checking for corruption)")
+        print(f"{'='*80}")
+        truncate_pickle_at_corruption(pkl_file)
+    else:
+        print("\nPICKLE FILE REPAIR DISABLED, SKIPPING...\n")
+    
+    # Phase 1: Clean synthetic data first (if epochs > 0)
+    if not DISABLE_CHECKING:
+        if epochs > 0:
+            print(f"\n{'='*80}")
+            print(f"PHASE 1: DATA CLEANING (removing NaN/Inf values)")
+            print(f"{'='*80}")
+            clean_synthetic_data(pkl_file, chunk_size)
+    else:
+        print("\nDATA CLEANING DISABLED, SKIPPING...\n")
+    
+    # Phase 1.5: Behavior Cloning (supervised learning on actions)
+    print(f"\n{'='*80}")
+    print(f"PHASE 1.5: BEHAVIOR CLONING (imitation learning from synthetic data)")
+    print(f"{'='*80}")
+    behavior_cloning(pkl_file, model, optimizer, chunk_size, batch_size, epochs=2)
+    
+    # Phase 2: Train on cleaned data
+    print(f"{'='*80}")
+    print(f"PHASE 2: OFFLINE PRETRAINING (training on clean data)")
+    print(f"{'='*80}")
+    
     is_compressed = 'compressed' in pkl_file
     print(f"Loading data from {pkl_file} ({'compressed' if is_compressed else 'raw'})...")
     
     if not is_compressed and FEATURE_REDUCER is None:
         print("Warning: Using raw data but no feature reducer available!")
     
-    print(f"Loading data from {pkl_file} in chunks of {chunk_size} samples...")
+    print(f"Loading data in chunks of {chunk_size} samples...\n")
     
     global_batch_num = 0
     
@@ -695,12 +1308,38 @@ def offline_pretrain(env, model, optimizer, num_episodes=50, gamma=0.99, batch_s
                                 
                                 entropy = -tf.reduce_mean(tf.reduce_sum(action_probs * tf.math.log(action_probs_clipped), axis=1))
                                 
-                                loss = actor_loss + 0.3 * confidence_loss - 0.01 * entropy
+                                # Use lower confidence loss weight for synthetic data (reduce gradient explosion risk)
+                                confidence_weight = 0.1  # Much lower than online training
+                                loss = actor_loss + confidence_weight * confidence_loss - 0.01 * entropy
+                                
+                                # Clip loss to prevent extreme values
+                                loss = tf.clip_by_value(loss, -100.0, 100.0)
+                                
+                                # Check for NaN before gradient computation
+                                if tf.math.is_nan(loss):
+                                    loss = tf.constant(0.0, dtype=loss.dtype)
                             
                             grads = tape.gradient(loss, model.trainable_variables)
-                            grads = [tf.clip_by_norm(g, 1.0) for g in grads]
-                            grad_norm = tf.linalg.global_norm(grads).numpy()
-                            optimizer.apply_gradients(zip(grads, model.trainable_variables))
+                            
+                            # Replace NaN/Inf gradients with zeros
+                            grads = [tf.where(tf.math.is_nan(g) | tf.math.is_inf(g), tf.zeros_like(g), g) 
+                                    if g is not None else None for g in grads]
+                            
+                            # Check if all gradients are zeros (skip update if so)
+                            has_nonzero_grads = any(tf.reduce_any(g != 0.0).numpy() for g in grads if g is not None)
+                            
+                            if has_nonzero_grads:
+                                # Clip individual gradients before norm clipping
+                                grads = [tf.clip_by_value(g, -10.0, 10.0) if g is not None else None for g in grads]
+                                
+                                # Apply aggressive global norm clipping
+                                grads = [tf.clip_by_norm(g, 0.5) if g is not None else None for g in grads]
+                                
+                                grad_norm = tf.linalg.global_norm(grads).numpy()
+                                optimizer.apply_gradients(zip(grads, model.trainable_variables))
+                            else:
+                                print(f"    WARNING: All gradients are zero (NaN/Inf data), skipping batch update")
+                                grad_norm = 0.0
                             
                             chunk_losses.append(loss.numpy())
                             chunk_grad_norms.append(grad_norm)
@@ -744,8 +1383,11 @@ def offline_pretrain(env, model, optimizer, num_episodes=50, gamma=0.99, batch_s
                         
                 except (pickle.UnpicklingError, EOFError) as e:
                     if isinstance(e, pickle.UnpicklingError):
-                        print(f"WARNING: Corrupted pickle record encountered, skipping and continuing...")
-                        continue
+                        # Corrupted record - we can't recover from this position
+                        # We need to break the loop and process what we have
+                        print(f"WARNING: Corrupted pickle record encountered")
+                        print(f"Breaking out of file read loop to process remaining data...")
+                        break
                     else:
                         # EOFError means end of file, normal termination
                         break
@@ -807,12 +1449,38 @@ def offline_pretrain(env, model, optimizer, num_episodes=50, gamma=0.99, batch_s
                         
                         entropy = -tf.reduce_mean(tf.reduce_sum(action_probs * tf.math.log(action_probs_clipped), axis=1))
                         
-                        loss = actor_loss + 0.3 * confidence_loss - 0.01 * entropy
+                        # Use lower confidence loss weight for synthetic data (reduce gradient explosion risk)
+                        confidence_weight = 0.1  # Much lower than online training
+                        loss = actor_loss + confidence_weight * confidence_loss - 0.01 * entropy
+                        
+                        # Clip loss to prevent extreme values
+                        loss = tf.clip_by_value(loss, -100.0, 100.0)
+                        
+                        # Check for NaN before gradient computation
+                        if tf.math.is_nan(loss):
+                            loss = tf.constant(0.0, dtype=loss.dtype)
                     
                     grads = tape.gradient(loss, model.trainable_variables)
-                    grads = [tf.clip_by_norm(g, 1.0) for g in grads]
-                    grad_norm = tf.linalg.global_norm(grads).numpy()
-                    optimizer.apply_gradients(zip(grads, model.trainable_variables))
+                    
+                    # Replace NaN/Inf gradients with zeros
+                    grads = [tf.where(tf.math.is_nan(g) | tf.math.is_inf(g), tf.zeros_like(g), g) 
+                            if g is not None else None for g in grads]
+                    
+                    # Check if all gradients are zeros (skip update if so)
+                    has_nonzero_grads = any(tf.reduce_any(g != 0.0).numpy() for g in grads if g is not None)
+                    
+                    if has_nonzero_grads:
+                        # Clip individual gradients before norm clipping
+                        grads = [tf.clip_by_value(g, -10.0, 10.0) if g is not None else None for g in grads]
+                        
+                        # Apply aggressive global norm clipping
+                        grads = [tf.clip_by_norm(g, 0.5) if g is not None else None for g in grads]
+                        
+                        grad_norm = tf.linalg.global_norm(grads).numpy()
+                        optimizer.apply_gradients(zip(grads, model.trainable_variables))
+                    else:
+                        print(f"    WARNING: All gradients are zero (NaN/Inf data), skipping batch update")
+                        grad_norm = 0.0
                     
                     chunk_losses.append(loss.numpy())
                     chunk_grad_norms.append(grad_norm)
@@ -882,22 +1550,22 @@ if __name__ == "__main__":
     
     config = {
         "architecture": "dense_residual",
-        "dropout_rate": 0.15,
+        "dropout_rate": 0.2,
         "compression_layers": [4096, 4096, 2048, 2048],
         "compression_dropout": 0.1,
-        "shared_layers": [2024, 2024, 2024, 2048, 1024, 512, 512],
-        "residual_connections": [True, True, True, True, True, False],
-        "actor_layers": [512, 512, 512, 512, 512, 256, 128],
-        "initial_lr": 0.000175,
+        "shared_layers": [2048, 2048, 2048, 2048, 2048, 1024, 1024, 512, 512],
+        "residual_connections": [True, True, True, True, True, True, True, True, False],
+        "actor_layers": [512, 512, 512, 512, 512, 512, 512, 256, 128],
+        "initial_lr": 0.00005,  # Much lower for synthetic data stability
         "pretrain_episodes": 10,
-        "pretrain_epochs": 2,
-        "pretrain_batch_size": 256,
-        "pretrain_chunk_size": 512 * 128,
+        "pretrain_epochs": 1,
+        "pretrain_batch_size": 32,  # Smaller batches for stability
+        "pretrain_chunk_size": 1024,
         "online_total_batches": 5000,
         "rebalance_interval": 12,
         "online_batch_size": 32 * 12,
         "gamma": 0.99,
-        "lr_patience": 200,
+        "lr_patience": 10,
         "lr_decay": 0.8,
         "log_step_frequency": 1,
         "epsilon_start": 0.025,
@@ -905,6 +1573,7 @@ if __name__ == "__main__":
         "epsilon_decay": 0.9995,
         "env_reset_probability": 0.25,
         "num_stochastic_samples": 64,
+        "pretrain_confidence_loss_weight": 0.1,  # Much lower for synthetic data
     }
     
     wandb.init(project="portfolio-trading-online-batch", config=config)
@@ -1007,7 +1676,7 @@ if __name__ == "__main__":
         print("No pretraining data found, skipping pretraining")
         ENABLE_PRETRAINING = False
     
-    if ENABLE_PRETRAINING:
+    if ENABLE_PRETRAINING and config.pretrain_epochs > 0:
         offline_pretrain(env, model, optimizer, 
                         num_episodes=config.pretrain_episodes, 
                         gamma=config.gamma,

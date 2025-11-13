@@ -542,19 +542,7 @@ class PortfolioEnv():
 
     
     def _rebalance_portfolio(self, action):
-        """
-        Rebalance portfolio based on action.
-        Action is a list with target percentages for each asset including cash.
-        Example: [0.3, 0.2, 0.1, ..., 0.15] for ['BTCUSDT', 'ETHUSDT', ..., 'cash']
-        
-        Only rebalances when the allocation difference exceeds a threshold.
-        NOW: Only rebalances every rebalance_interval steps (e.g., every 12 steps = 1 hour)
-        """
-        # NEW: Check if it's time to rebalance
         if self.steps_since_last_rebalance < self.rebalance_interval and self.last_action is not None:
-            # Not time to rebalance yet - DO NOTHING, just return 0 fees
-            # Portfolio holds whatever quantities it has and lets prices drift naturally
-            # NO trading, NO rebalancing, NO trying to maintain allocation percentages
             return 0.0
         
         # Reset counter and store this action
@@ -630,13 +618,6 @@ class PortfolioEnv():
                     total_cost = trade_value + fee
                     pending_buys.append((symbol, trade_value, fee, current_price, allocation_diff))
                 else:  # Sell
-                    # FIXED: When selling, we want to REDUCE our holdings by trade_value worth
-                    # But we need to account for the fee. If we sell X worth of assets:
-                    # - We get: X - (X * fee_rate) = X * (1 - fee_rate) in cash
-                    # - We need to sell: X / current_price quantity
-                    # The fee is deducted from the proceeds, not added to the quantity
-                    
-                    # CRITICAL FIX: Validate we have enough to sell!
                     max_sellable_value = current_holdings * current_price
                     actual_sell_value = min(trade_value, max_sellable_value)
                     
@@ -667,8 +648,6 @@ class PortfolioEnv():
                     if DEBUG:
                         print(f"SELL {symbol}: ${actual_sell_value:.2f} -> ${net_proceeds:.2f} after fee (allocation diff: {allocation_diff:.3f})")
         
-        # FIXED: Process buy orders in order of allocation difference (most important first)
-        # Sort by allocation difference (descending) to prioritize most important trades
         pending_buys.sort(key=lambda x: x[4], reverse=True)
         
         available_cash = self.portfolio['cash']
@@ -702,11 +681,6 @@ class PortfolioEnv():
                 if DEBUG:
                     print(f"BUY {symbol}: ${trade_value:.2f} (allocation diff: {allocation_diff:.3f})")
             else:
-                # FIXED: If not enough cash, buy what we can afford
-                # available_cash = trade_value + fee
-                # We want to find max trade_value where: trade_value + (trade_value * fee_rate) <= available_cash
-                # => trade_value * (1 + fee_rate) <= available_cash
-                # => trade_value <= available_cash / (1 + fee_rate)
                 if available_cash > 0.10:  # Need at least $0.10 to make a trade
                     affordable_trade_value = available_cash / (1 + self.fee_rate)
                     if affordable_trade_value > 1.0:  # Only trade if meaningful amount
@@ -738,12 +712,8 @@ class PortfolioEnv():
             if DEBUG:
                 print(f"CASH allocation diff: {cash_allocation_diff:.3f}")
         
-        # FIXED: Only apply cash inflation if we actually hold significant cash AND made trades
-        # This prevents unfair penalty when not trading (benchmark never pays this)
-        # Only apply if: (1) we have cash, (2) we made trades this step (total_fees > 0)
+
         if total_fees > 0 and self.portfolio['cash'] > 1.0:
-            # Apply cash inflation only on the cash portion (opportunity cost)
-            # Rate is very small per 5-minute interval: 0.004 / (365 * 288) ≈ 0.000000038 per step
             self.portfolio['cash'] *= (1 - self.cash_inflation_rate / (365 * 288))
         
         # FIXED: Ensure cash doesn't go negative due to rounding errors
@@ -755,14 +725,6 @@ class PortfolioEnv():
         return total_fees
     
     def _calculate_reward(self) -> float:
-        """
-        Simple, focused reward: MAXIMIZE ACTUAL FUTURE PROFIT
-        
-        The agent should learn to hold positions that will go up in the NEXT step
-        and avoid/short positions that will go down.
-        
-        Reward = Portfolio-weighted actual return in next step
-        """
         # Get ACTUAL next-step returns for each asset
         future_profits = self._calculate_future_profit()
         
@@ -793,15 +755,8 @@ class PortfolioEnv():
         if np.isnan(portfolio_future_return) or np.isinf(portfolio_future_return):
             portfolio_future_return = 0.0
         
-        # Cash earns nothing (actually loses to inflation, but simplified)
-        # This naturally penalizes holding too much cash
-        
-        # FIXED: Much more conservative reward scaling to prevent instability
-        # A 1% portfolio return gives reward of 1.0 (reduced from 10)
         reward = portfolio_future_return * 100
         
-        # Add benchmark comparison bonus
-        # Reward beating the passive buy-and-hold strategy
         benchmark_future_return = 0.0
         benchmark_value = self._update_benchmark_value()
         
@@ -830,13 +785,6 @@ class PortfolioEnv():
         return float(reward)
     
     def step(self, action):
-        """
-        Execute one step in the environment.
-        Action: list with target allocation percentages for each asset INCLUDING cash
-        Returns: observation, reward, done, info
-        """
-        # Check if we've reached the end of data
-        # Need enough space for multi-timeframe lookahead (max is 288*30 for next_month)
         max_lookahead = 288 * 30  # 30 days
         if self.step_count >= len(self.df['BTCUSDT']) - max_lookahead - 10:
             return self.get_observation(), 0, True, {'reason': 'end_of_data'}
@@ -912,15 +860,11 @@ class PortfolioEnv():
         benchmark_value = self._update_benchmark_value()
         outperformance = self._calculate_benchmark_outperformance()
         
-        # Determine if this is a new prediction or following previous prediction
-        # After rebalancing, steps_since_last_rebalance is incremented to 1
-        # So we check if it's 1 (just rebalanced) or > 1 (following)
         is_new_prediction = (self.steps_since_last_rebalance == 1)
         steps_remaining = self.rebalance_interval - self.steps_since_last_rebalance + 1
         
         print(f"\n{'='*90}")
         
-        # Color coding: Green for new prediction, Red for following
         if is_new_prediction:
             status_color = "\033[92m"  # Green
             status_text = "NEW PREDICTION - Model just decided allocation for next hour"
@@ -987,16 +931,9 @@ class PortfolioEnv():
         print(f"{'='*90}\n")
 
     def reset(self):
-        """
-        Reset the environment to initial state.
-        Returns: initial observation
-        """
         # Calculate safe bounds for step_count
         total_length = len(self.df['BTCUSDT'])
         
-        # Need enough lookback for observation (lookback_window_size = 48)
-        # Need enough lookforward for higher timeframes (max is 288 for 1d with count of 3)
-        # Need enough space for multi-timeframe reward lookahead (max is 288*30 for next_month)
         max_lookahead = 288 * 30  # 30 days
         min_step = max(2000, self.lookback_window_size + 288 * 3)
         max_step = total_length - max_lookahead - 100  # Reserve space for lookahead + buffer
@@ -1052,7 +989,6 @@ class PortfolioEnv():
                 else:
                     self.average_prices[symbol] = 1.0
         
-        # NEW: Reset rebalancing tracking
         self.steps_since_last_rebalance = 0
         self.last_action = None
         
