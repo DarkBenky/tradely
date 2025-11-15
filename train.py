@@ -430,6 +430,19 @@ def collect_batch_data(env, model, batch_size, gamma, current_step, epsilon=0.1,
     random_count = sum(is_random_flags)
     policy_count = len(is_random_flags) - random_count
     
+    wandb.log({
+        'batch/steps_collected': steps_collected,
+        'batch/random_actions_count': random_count,
+        'batch/policy_actions_count': policy_count,
+        'batch/total_reward': sum(rewards) if rewards else 0.0,
+        'batch/mean_reward': np.mean(rewards) if rewards else 0.0,
+        'batch/std_reward': np.std(rewards) if rewards else 0.0,
+        'batch/min_reward': np.min(rewards) if rewards else 0.0,
+        'batch/max_reward': np.max(rewards) if rewards else 0.0,
+        'batch/mean_return': float(np.mean(returns)) if len(returns) > 0 else 0.0,
+        'batch/std_return': float(np.std(returns)) if len(returns) > 0 else 0.0,
+    })
+    
     if steps_collected == 0:
         batch_info = {
             'steps_collected': 0,
@@ -558,8 +571,22 @@ def train_on_batch(model, optimizer, batch_states, batch_raw_states, batch_actio
             'gradients/abs_mean': float(np.mean(np.abs(all_grads))),
         })
         
-        if batch_num % 1 == 0:  # Log every batch
+        if batch_num % 1 == 0:
             metrics['gradients/histogram'] = wandb.Histogram(all_grads)
+    
+    weight_values = [w.numpy() for w in model.trainable_variables]
+    if weight_values:
+        all_weights = np.concatenate([w.flatten() for w in weight_values])
+        metrics.update({
+            'weights/mean': float(np.mean(all_weights)),
+            'weights/std': float(np.std(all_weights)),
+            'weights/min': float(np.min(all_weights)),
+            'weights/max': float(np.max(all_weights)),
+            'weights/abs_mean': float(np.mean(np.abs(all_weights))),
+        })
+        
+        if batch_num % 1 == 0:
+            metrics['weights/histogram'] = wandb.Histogram(all_weights)
     
     if batch_num % 1 == 0:  # Log every batch
         metrics['action_probs/histogram'] = wandb.Histogram(action_probs_np.flatten())
@@ -927,165 +954,205 @@ def clean_synthetic_data(pkl_file, chunk_size=10000):
 
 def behavior_cloning(pkl_file, model, optimizer, chunk_size=10000, batch_size=256, epochs=2):
     print("\nBEHAVIOR CLONING (Supervised Action Learning)")
-    print(f"Training action head to imitate synthetic data actions...")
+    print(f"Training whole model to imitate synthetic data actions...")
     print(f"Chunk size: {chunk_size}, Batch size: {batch_size}, epochs: {epochs}")
-    
-    # Freeze confidence head (only train action head)
-    for layer in model.layers:
-        if 'confidence' in layer.name.lower():
-            layer.trainable = False
     
     total_samples = 0
     total_batches = 0
     rollback_count = 0
-    best_accuracy = 0.0  # Track best accuracy
+    best_accuracy = 0.0
+    best_loss = float('inf')
+    batches_without_improvement = 0
+    plateau_patience = 10
+    lr_reduction_factor = 0.75
+    current_lr = optimizer.learning_rate.numpy()
     
     # Create models directory if it doesn't exist
     import os
     os.makedirs('models', exist_ok=True)
     
-    for epoch in range(epochs):
-        print(f"\n  Behavior Cloning Epoch {epoch+1}/{epochs}")
-        epoch_start = time.time()
-        epoch_losses = []
-        epoch_accuracies = []
-        chunk_num = 0
+    def action_loss(y_true, y_pred):
+        y_pred_clipped = tf.clip_by_value(y_pred, 1e-8, 1.0)
+        return -tf.reduce_mean(tf.reduce_sum(y_true * tf.math.log(y_pred_clipped), axis=1))
+    
+    def confidence_loss(y_true, y_pred):
+        return tf.reduce_mean(tf.square(y_pred - y_true))
+    
+    model.compile(
+        optimizer=optimizer,
+        loss=[action_loss, confidence_loss],
+        loss_weights=[2.5, 0.1],
+        metrics=[['accuracy'], ['mae']]
+    )
+    
+    start_time = time.time()
+    chunk_num = 0
+    
+    with open(pkl_file, 'rb') as f:
+        chunk_states = []
+        chunk_actions = []
+        chunk_per_asset_returns = []
         
-        with open(pkl_file, 'rb') as f:
-            chunk_states = []
-            chunk_actions = []
-            
-            while True:
-                try:
-                    batch_data = pickle.load(f)
-                    if isinstance(batch_data, dict):
-                        states = batch_data.get('states', [])
-                        actions = batch_data.get('actions', [])
-                        chunk_states.extend(states)
-                        chunk_actions.extend(actions)
+        while True:
+            try:
+                batch_data = pickle.load(f)
+                if isinstance(batch_data, dict):
+                    states = batch_data.get('states', [])
+                    actions = batch_data.get('actions', [])
+                    per_asset_returns = batch_data.get('per_asset_returns', [])
+                    chunk_states.extend(states)
+                    chunk_actions.extend(actions)
+                    chunk_per_asset_returns.extend(per_asset_returns)
+                
+                if len(chunk_states) >= chunk_size:
+                    chunk_num += 1
+                    min_len = min(len(chunk_states), len(chunk_actions), len(chunk_per_asset_returns))
+                    chunk_states_arr = np.array(chunk_states[:min_len], dtype=np.float32)
+                    chunk_actions_arr = np.array(chunk_actions[:min_len], dtype=np.float32)
+                    chunk_per_asset_arr = np.array(chunk_per_asset_returns[:min_len], dtype=np.float32)
                     
-                    # Process chunk when it reaches target size
-                    if len(chunk_states) >= chunk_size:
-                        chunk_num += 1
-                        min_len = min(len(chunk_states), len(chunk_actions))
-                        chunk_states_arr = np.array(chunk_states[:min_len], dtype=np.float32)
-                        chunk_actions_arr = np.array(chunk_actions[:min_len], dtype=np.float32)
+                    total_samples += len(chunk_states_arr)
+                    print(f"    Chunk {chunk_num}: Training on {len(chunk_states_arr)} samples...")
+                    
+                    asset_returns_mean = np.mean(chunk_per_asset_arr, axis=0)
+                    asset_returns_std = np.std(chunk_per_asset_arr, axis=0) + 1e-8
+                    per_asset_normalized = (chunk_per_asset_arr - asset_returns_mean) / asset_returns_std
+                    per_asset_normalized = np.clip(per_asset_normalized, -5.0, 5.0)
+                    chunk_confidence = 1.0 / (1.0 + np.exp(-per_asset_normalized / 2.0))
+                    
+                    try:
+                        weights_backup = [w.numpy().copy() for w in model.trainable_variables]
                         
-                        total_samples += len(chunk_states_arr)
-                        print(f"    Chunk {chunk_num}: Training on {len(chunk_states_arr)} samples...")
+                        history = model.fit(
+                            chunk_states_arr,
+                            [chunk_actions_arr, chunk_confidence],
+                            batch_size=batch_size,
+                            epochs=epochs,
+                            verbose=1,
+                            shuffle=True
+                        )
                         
-                        # Dummy confidence targets (not used)
-                        dummy_confidence = np.zeros((len(chunk_states_arr), chunk_actions_arr.shape[1]), dtype=np.float32)
+                        # Check for NaN in weights after training
+                        has_nan = False
+                        for var in model.trainable_variables:
+                            if tf.reduce_any(tf.math.is_nan(var)):
+                                has_nan = True
+                                break
                         
-                        # Train on this chunk using .fit()
-                        try:
-                            # Save weights before training (for rollback)
-                            weights_backup = [w.numpy().copy() for w in model.trainable_variables]
+                        if has_nan:
+                            print(f"      WARNING: NaN detected in weights! Rolling back...")
+                            for var, backup in zip(model.trainable_variables, weights_backup):
+                                var.assign(backup)
+                            rollback_count += 1
+                            wandb.log({
+                                'behavior_cloning/rollback_count': rollback_count,
+                                'behavior_cloning/chunk_num': chunk_num,
+                            })
+                        else:
+                            chunk_loss = history.history['portfolio_allocation_loss'][-1]
+                            chunk_acc = history.history['portfolio_allocation_accuracy'][-1]
+                            chunk_conf_loss = history.history['confidence_loss'][-1]
+                            chunk_conf_mae = history.history['confidence_mae'][-1]
+                            total_batches += 1
+
+                            improved = False
+                            if chunk_acc > best_accuracy:
+                                best_accuracy = chunk_acc
+                                model.save_weights('models/best_model.weights.h5')
+                                print(f"New best accuracy: {chunk_acc:.2%}! Model saved.")
+                                improved = True
+
+                            if chunk_loss < best_loss:
+                                best_loss = chunk_loss
+                                model.save_weights('models/best_model.weights.h5')
+                                print(f"New best loss: {chunk_loss:.4f}! Model saved.")
+                                improved = True
                             
-                            # Custom loss for action head only
-                            def action_loss(y_true, y_pred):
-                                y_pred_clipped = tf.clip_by_value(y_pred, 1e-8, 1.0)
-                                return -tf.reduce_mean(tf.reduce_sum(y_true * tf.math.log(y_pred_clipped), axis=1))
-                            
-                            # Compile model (only needs to be done once, but .fit() requires it)
-                            model.compile(
-                                optimizer=optimizer,
-                                loss=[action_loss, 'mse'],
-                                loss_weights=[1.0, 0.0],
-                                metrics=[['accuracy'], []]
-                            )
-                            
-                            # Train on chunk
-                            history = model.fit(
-                                chunk_states_arr,
-                                [chunk_actions_arr, dummy_confidence],
-                                batch_size=batch_size,
-                                epochs=1,
-                                verbose=1,
-                                shuffle=True
-                            )
-                            
-                            # Check for NaN in weights after training
-                            has_nan = False
-                            for var in model.trainable_variables:
-                                if tf.reduce_any(tf.math.is_nan(var)):
-                                    has_nan = True
-                                    break
-                            
-                            if has_nan:
-                                print(f"      WARNING: NaN detected in weights! Rolling back...")
-                                # Restore weights
-                                for var, backup in zip(model.trainable_variables, weights_backup):
-                                    var.assign(backup)
-                                rollback_count += 1
+                            if improved:
+                                batches_without_improvement = 0
                             else:
-                                # Success - record metrics
-                                chunk_loss = history.history['portfolio_allocation_loss'][0]
-                                chunk_acc = history.history['portfolio_allocation_accuracy'][0]
-                                epoch_losses.append(chunk_loss)
-                                epoch_accuracies.append(chunk_acc)
-                                total_batches += 1
-
-                                # Check if this is the best accuracy so far
-                                if chunk_acc > best_accuracy:
-                                    best_accuracy = chunk_acc
-                                    model.save_weights('models/best_model.weights.h5')
-                                    print(f"New best accuracy: {chunk_acc:.2%}! Model saved.")
-
+                                batches_without_improvement += 1
+                            
+                            if batches_without_improvement >= plateau_patience:
+                                current_lr *= lr_reduction_factor
+                                optimizer.learning_rate.assign(current_lr)
+                                print(f"\n{'='*80}")
+                                print(f"LEARNING RATE REDUCED ON PLATEAU")
+                                print(f"No improvement for {plateau_patience} batches")
+                                print(f"New learning rate: {current_lr:.6f} (reduced by {(1-lr_reduction_factor)*100:.0f}%)")
+                                print(f"{'='*80}\n")
+                                batches_without_improvement = 0
+                                
                                 wandb.log({
-                                    'behavior_cloning/chunk_loss': chunk_loss,
-                                    'behavior_cloning/chunk_accuracy': chunk_acc,
-                                    'behavior_cloning/best_accuracy': best_accuracy,
-                                    'behavior_cloning/epoch': epoch + 1,
-                                    'behavior_cloning/chunk_num': chunk_num,
+                                    'behavior_cloning/lr_reduction': 1,
+                                    'behavior_cloning/learning_rate': current_lr,
+                                    'behavior_cloning/batches_without_improvement': batches_without_improvement,
                                 })
 
-                                print(f"Loss: {chunk_loss:.4f}, Accuracy: {chunk_acc:.2%}")
                             
-                            del weights_backup
+                            log_dict = {
+                                'behavior_cloning/chunk_loss': chunk_loss,
+                                'behavior_cloning/chunk_accuracy': chunk_acc,
+                                'behavior_cloning/chunk_confidence_loss': chunk_conf_loss,
+                                'behavior_cloning/chunk_confidence_mae': chunk_conf_mae,
+                                'behavior_cloning/best_accuracy': best_accuracy,
+                                'behavior_cloning/best_loss': best_loss,
+                                'behavior_cloning/chunk_num': chunk_num,
+                                'behavior_cloning/total_batches': total_batches,
+                                'behavior_cloning/samples_processed': total_samples,
+                                'behavior_cloning/learning_rate': current_lr,
+                                'behavior_cloning/batches_without_improvement': batches_without_improvement,
+                            }
                             
-                        except Exception as e:
-                            print(f"      ERROR training on chunk: {e}")
-                            print(f"      Skipping this chunk...")
+                            if total_batches % 25 == 0:
+                                weight_vals = [w.numpy() for w in model.trainable_variables]
+                                all_weights = np.concatenate([w.flatten() for w in weight_vals])
+                                log_dict['behavior_cloning/weights_histogram'] = wandb.Histogram(all_weights)
+                                log_dict['behavior_cloning/weights_mean'] = float(np.mean(all_weights)),
+                                log_dict['behavior_cloning/weights_std'] = float(np.std(all_weights)),
+                            
+                            wandb.log(log_dict)
+
+                            print(f"Loss: {chunk_loss:.4f}, Accuracy: {chunk_acc:.2%}, Conf Loss: {chunk_conf_loss:.4f}")
                         
-                        # Clear chunk
-                        chunk_states = []
-                        chunk_actions = []
-                        del chunk_states_arr, chunk_actions_arr, dummy_confidence
-                        gc.collect()
-                
-                except (pickle.UnpicklingError, EOFError):
-                    break
+                        del weights_backup
+                        
+                    except Exception as e:
+                        print(f"      ERROR training on chunk: {e}")
+                        print(f"      Skipping this chunk...")
+                    
+                    chunk_states = []
+                    chunk_actions = []
+                    chunk_per_asset_returns = []
+                    del chunk_states_arr, chunk_actions_arr, chunk_confidence, chunk_per_asset_arr
+                    gc.collect()
+            
+            except (pickle.UnpicklingError, EOFError):
+                break
         
         # Process final chunk if it exists
         if len(chunk_states) > 0:
             chunk_num += 1
-            min_len = min(len(chunk_states), len(chunk_actions))
+            min_len = min(len(chunk_states), len(chunk_actions), len(chunk_per_asset_returns))
             chunk_states_arr = np.array(chunk_states[:min_len], dtype=np.float32)
             chunk_actions_arr = np.array(chunk_actions[:min_len], dtype=np.float32)
+            chunk_per_asset_arr = np.array(chunk_per_asset_returns[:min_len], dtype=np.float32)
             
             total_samples += len(chunk_states_arr)
             print(f"    Chunk {chunk_num} (final): Training on {len(chunk_states_arr)} samples...")
             
-            dummy_confidence = np.zeros((len(chunk_states_arr), chunk_actions_arr.shape[1]), dtype=np.float32)
+            asset_returns_mean = np.mean(chunk_per_asset_arr, axis=0)
+            asset_returns_std = np.std(chunk_per_asset_arr, axis=0) + 1e-8
+            per_asset_normalized = (chunk_per_asset_arr - asset_returns_mean) / asset_returns_std
+            per_asset_normalized = np.clip(per_asset_normalized, -5.0, 5.0)
+            chunk_confidence = 1.0 / (1.0 + np.exp(-per_asset_normalized / 2.0))
             
             try:
                 weights_backup = [w.numpy().copy() for w in model.trainable_variables]
                 
-                def action_loss(y_true, y_pred):
-                    y_pred_clipped = tf.clip_by_value(y_pred, 1e-8, 1.0)
-                    return -tf.reduce_mean(tf.reduce_sum(y_true * tf.math.log(y_pred_clipped), axis=1))
-                
-                model.compile(
-                    optimizer=optimizer,
-                    loss=[action_loss, 'mse'],
-                    loss_weights=[1.0, 0.0],
-                    metrics=[['accuracy'], []]
-                )
-                
                 history = model.fit(
                     chunk_states_arr,
-                    [chunk_actions_arr, dummy_confidence],
+                    [chunk_actions_arr, chunk_confidence],
                     batch_size=batch_size,
                     epochs=1,
                     verbose=0,
@@ -1103,62 +1170,117 @@ def behavior_cloning(pkl_file, model, optimizer, chunk_size=10000, batch_size=25
                     for var, backup in zip(model.trainable_variables, weights_backup):
                         var.assign(backup)
                     rollback_count += 1
-                else:
-                    chunk_loss = history.history['portfolio_allocation_loss'][0]
-                    chunk_acc = history.history['portfolio_allocation_accuracy'][0]
-                    epoch_losses.append(chunk_loss)
-                    epoch_accuracies.append(chunk_acc)
                     wandb.log({
-                        'behavior_cloning/chunk_loss': chunk_loss,
-                        'behavior_cloning/chunk_accuracy': chunk_acc,
-                        'behavior_cloning/best_accuracy': best_accuracy,
-                        'behavior_cloning/epoch': epoch + 1,
+                        'behavior_cloning/rollback_count': rollback_count,
                         'behavior_cloning/chunk_num': chunk_num,
                     })
+                else:
+                    chunk_loss = history.history['portfolio_allocation_loss'][-1]
+                    chunk_acc = history.history['portfolio_allocation_accuracy'][-1]
+                    chunk_conf_loss = history.history['confidence_loss'][-1]
+                    chunk_conf_mae = history.history['confidence_mae'][-1]
                     total_batches += 1
                     
-                    # Check if this is the best accuracy so far
+                    improved = False
                     if chunk_acc > best_accuracy:
                         best_accuracy = chunk_acc
                         model.save_weights('models/best_model.weights.h5')
                         print(f"New best accuracy: {chunk_acc:.2%}! Model saved.")
+                        improved = True
+
+                    if chunk_loss < best_loss:
+                        best_loss = chunk_loss
+                        model.save_weights('models/best_model.weights.h5')
+                        print(f"New best loss: {chunk_loss:.4f}! Model saved.")
+                        improved = True
                     
-                    print(f"Loss: {chunk_loss:.4f}, Accuracy: {chunk_acc:.2%}")
+                    if improved:
+                        batches_without_improvement = 0
+                    else:
+                        batches_without_improvement += 1
+                    
+                    if batches_without_improvement >= plateau_patience:
+                        current_lr *= lr_reduction_factor
+                        optimizer.learning_rate.assign(current_lr)
+                        print(f"\n{'='*80}")
+                        print(f"LEARNING RATE REDUCED ON PLATEAU")
+                        print(f"No improvement for {plateau_patience} batches")
+                        print(f"New learning rate: {current_lr:.6f} (reduced by {(1-lr_reduction_factor)*100:.0f}%)")
+                        print(f"{'='*80}\n")
+                        batches_without_improvement = 0
+                        
+                        wandb.log({
+                            'behavior_cloning/lr_reduction': 1,
+                            'behavior_cloning/learning_rate': current_lr,
+                            'behavior_cloning/batches_without_improvement': batches_without_improvement,
+                        })
+
+                    weight_vals = [w.numpy() for w in model.trainable_variables]
+                    all_weights = np.concatenate([w.flatten() for w in weight_vals])
+                    
+                    log_dict = {
+                        'behavior_cloning/chunk_loss': chunk_loss,
+                        'behavior_cloning/chunk_accuracy': chunk_acc,
+                        'behavior_cloning/chunk_confidence_loss': chunk_conf_loss,
+                        'behavior_cloning/chunk_confidence_mae': chunk_conf_mae,
+                        'behavior_cloning/best_accuracy': best_accuracy,
+                        'behavior_cloning/best_loss': best_loss,
+                        'behavior_cloning/chunk_num': chunk_num,
+                        'behavior_cloning/weights_mean': float(np.mean(all_weights)),
+                        'behavior_cloning/weights_std': float(np.std(all_weights)),
+                        'behavior_cloning/total_batches': total_batches,
+                        'behavior_cloning/samples_processed': total_samples,
+                        'behavior_cloning/learning_rate': current_lr,
+                        'behavior_cloning/batches_without_improvement': batches_without_improvement,
+                    }
+                    
+                    if total_batches % 25 == 0:
+                        log_dict['behavior_cloning/weights_histogram'] = wandb.Histogram(all_weights)
+                    
+                    wandb.log(log_dict)
+                    
+                    print(f"Loss: {chunk_loss:.4f}, Accuracy: {chunk_acc:.2%}, Conf Loss: {chunk_conf_loss:.4f}")
                 
                 del weights_backup
                 
             except Exception as e:
                 print(f"ERROR training on final chunk: {e}")
             
-            del chunk_states_arr, chunk_actions_arr, dummy_confidence
+            del chunk_states_arr, chunk_actions_arr, chunk_confidence, chunk_per_asset_arr
             gc.collect()
-        
-        epoch_time = time.time() - epoch_start
-        avg_loss = np.mean(epoch_losses) if epoch_losses else 0.0
-        avg_accuracy = np.mean(epoch_accuracies) if epoch_accuracies else 0.0
-        
-        print(f"    Epoch {epoch+1} Summary:")
-        print(f"      Loss: {avg_loss:.4f}, Accuracy: {avg_accuracy:.2%}")
-        print(f"      Best Accuracy: {best_accuracy:.2%}")
-        print(f"      Time: {epoch_time:.1f}s, Samples: {total_samples}")
-        print(f"      Rollbacks: {rollback_count}")
-        
-        gc.collect()
     
-    # Unfreeze confidence head for later training
-    for layer in model.layers:
-        layer.trainable = True
+    total_time = time.time() - start_time
+    
+    print(f"\n{'='*80}")
+    print(f"BEHAVIOR CLONING SUMMARY")
+    print(f"{'='*80}")
+    print(f"Total time: {total_time:.1f}s")
+    print(f"Total samples: {total_samples}")
+    print(f"Total chunks: {chunk_num}")
+    print(f"Best accuracy: {best_accuracy:.2%}")
+    print(f"Best loss: {best_loss:.4f}")
+    print(f"Rollbacks: {rollback_count}")
+    print(f"{'='*80}")
+    
+    gc.collect()
     
     print(f"\n  Behavior cloning complete!")
     print(f"  Total batches: {total_batches}, Total rollbacks: {rollback_count}")
     print(f"  Best accuracy achieved: {best_accuracy:.2%}")
     print(f"  Best model saved to: models/best_model.weights.h5")
-    print(f"  Model can now imitate synthetic actions.\n")
+    print(f"  Model trained end-to-end with actions as confidence targets.\n")
+    
+    wandb.log({
+        'behavior_cloning/final_best_accuracy': best_accuracy,
+        'behavior_cloning/final_best_loss': best_loss,
+        'behavior_cloning/final_total_batches': total_batches,
+        'behavior_cloning/final_total_rollbacks': rollback_count,
+        'behavior_cloning/final_epochs': epochs,
+    })
     
     gc.collect()
 
-DISABLE_CHECKING = True
-
+DISABLE_CHECKING = False
 
 def offline_pretrain(env, model, optimizer, num_episodes=50, gamma=0.99, batch_size=256, epochs=20, chunk_size=10000):
     print("\nOFFLINE PRETRAINING (MEMORY OPTIMIZED)")
@@ -1201,12 +1323,14 @@ def offline_pretrain(env, model, optimizer, num_episodes=50, gamma=0.99, batch_s
     print(f"\n{'='*80}")
     print(f"PHASE 1.5: BEHAVIOR CLONING (imitation learning from synthetic data)")
     print(f"{'='*80}")
-    behavior_cloning(pkl_file, model, optimizer, chunk_size, batch_size, epochs=2)
+    behavior_cloning(pkl_file, model, optimizer, chunk_size, batch_size, epochs=epochs)
     
-    # Phase 2: Train on cleaned data
     print(f"{'='*80}")
     print(f"PHASE 2: OFFLINE PRETRAINING (training on clean data)")
     print(f"{'='*80}")
+    
+    pretrain_optimizer = tf.keras.optimizers.Adam(learning_rate=optimizer.learning_rate.numpy())
+    print(f"Created fresh optimizer for offline pretraining with LR: {pretrain_optimizer.learning_rate.numpy():.6f}")
     
     is_compressed = 'compressed' in pkl_file
     print(f"Loading data from {pkl_file} ({'compressed' if is_compressed else 'raw'})...")
@@ -1325,18 +1449,14 @@ def offline_pretrain(env, model, optimizer, num_episodes=50, gamma=0.99, batch_s
                             grads = [tf.where(tf.math.is_nan(g) | tf.math.is_inf(g), tf.zeros_like(g), g) 
                                     if g is not None else None for g in grads]
                             
-                            # Check if all gradients are zeros (skip update if so)
                             has_nonzero_grads = any(tf.reduce_any(g != 0.0).numpy() for g in grads if g is not None)
                             
                             if has_nonzero_grads:
-                                # Clip individual gradients before norm clipping
                                 grads = [tf.clip_by_value(g, -10.0, 10.0) if g is not None else None for g in grads]
-                                
-                                # Apply aggressive global norm clipping
                                 grads = [tf.clip_by_norm(g, 0.5) if g is not None else None for g in grads]
                                 
                                 grad_norm = tf.linalg.global_norm(grads).numpy()
-                                optimizer.apply_gradients(zip(grads, model.trainable_variables))
+                                pretrain_optimizer.apply_gradients(zip(grads, model.trainable_variables))
                             else:
                                 print(f"    WARNING: All gradients are zero (NaN/Inf data), skipping batch update")
                                 grad_norm = 0.0
@@ -1466,18 +1586,14 @@ def offline_pretrain(env, model, optimizer, num_episodes=50, gamma=0.99, batch_s
                     grads = [tf.where(tf.math.is_nan(g) | tf.math.is_inf(g), tf.zeros_like(g), g) 
                             if g is not None else None for g in grads]
                     
-                    # Check if all gradients are zeros (skip update if so)
                     has_nonzero_grads = any(tf.reduce_any(g != 0.0).numpy() for g in grads if g is not None)
                     
                     if has_nonzero_grads:
-                        # Clip individual gradients before norm clipping
                         grads = [tf.clip_by_value(g, -10.0, 10.0) if g is not None else None for g in grads]
-                        
-                        # Apply aggressive global norm clipping
                         grads = [tf.clip_by_norm(g, 0.5) if g is not None else None for g in grads]
                         
                         grad_norm = tf.linalg.global_norm(grads).numpy()
-                        optimizer.apply_gradients(zip(grads, model.trainable_variables))
+                        pretrain_optimizer.apply_gradients(zip(grads, model.trainable_variables))
                     else:
                         print(f"    WARNING: All gradients are zero (NaN/Inf data), skipping batch update")
                         grad_norm = 0.0
@@ -1528,6 +1644,9 @@ def offline_pretrain(env, model, optimizer, num_episodes=50, gamma=0.99, batch_s
         avg_grad_norm = np.mean(epoch_grad_norms) if epoch_grad_norms else 0.0
         avg_entropy = np.mean(epoch_entropies) if epoch_entropies else 0.0
         
+        weight_vals = [w.numpy() for w in model.trainable_variables]
+        all_weights = np.concatenate([w.flatten() for w in weight_vals])
+        
         wandb.log({
             "pretrain/epoch": epoch + 1,
             "pretrain/epoch_loss": avg_loss,
@@ -1537,6 +1656,10 @@ def offline_pretrain(env, model, optimizer, num_episodes=50, gamma=0.99, batch_s
             "pretrain/epoch_samples": total_samples,
             "pretrain/epoch_chunks": chunk_num,
             "pretrain/epoch_batches": global_batch_num,
+            "pretrain/epoch_weights_mean": float(np.mean(all_weights)),
+            "pretrain/epoch_weights_std": float(np.std(all_weights)),
+            "pretrain/epoch_weights_min": float(np.min(all_weights)),
+            "pretrain/epoch_weights_max": float(np.max(all_weights)),
         })
         
         print(f"Epoch {epoch+1}/{epochs} - Loss: {avg_loss:.4f} - Entropy: {avg_entropy:.4f} - Samples: {total_samples} - Time: {epoch_time:.1f}s")
@@ -1556,14 +1679,14 @@ if __name__ == "__main__":
         "shared_layers": [2048, 2048, 2048, 2048, 2048, 1024, 1024, 512, 512],
         "residual_connections": [True, True, True, True, True, True, True, True, False],
         "actor_layers": [512, 512, 512, 512, 512, 512, 512, 256, 128],
-        "initial_lr": 0.00005,  # Much lower for synthetic data stability
+        "initial_lr": 0.000175,  # Much lower for synthetic data stability
         "pretrain_episodes": 10,
-        "pretrain_epochs": 1,
-        "pretrain_batch_size": 32,  # Smaller batches for stability
-        "pretrain_chunk_size": 1024,
+        "pretrain_epochs": 3,
+        "pretrain_batch_size": 24,  # Smaller batches for stability
+        "pretrain_chunk_size": 3072,
         "online_total_batches": 5000,
         "rebalance_interval": 12,
-        "online_batch_size": 32 * 12,
+        "online_batch_size": 24 * 12,
         "gamma": 0.99,
         "lr_patience": 10,
         "lr_decay": 0.8,
@@ -1571,7 +1694,7 @@ if __name__ == "__main__":
         "epsilon_start": 0.025,
         "epsilon_end": 0.0001,
         "epsilon_decay": 0.9995,
-        "env_reset_probability": 0.25,
+        "env_reset_probability": 0.125,
         "num_stochastic_samples": 64,
         "pretrain_confidence_loss_weight": 0.1,  # Much lower for synthetic data
     }

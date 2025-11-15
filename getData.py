@@ -95,12 +95,63 @@ if __name__ == "__main__":
     
     for i, symbol in enumerate(symbols, 1):
         print(f"\n[{i}/{len(symbols)}] {symbol}")
-        result = process_symbol_individually(symbol, interval, years=2, window_size=12*4, multiple_returns=5)
+        result = process_symbol_individually(symbol, interval, years=3, window_size=12*4, multiple_returns=5)
         
         if result:
             successful.append(result)
         else:
             failed.append(symbol)
+    
+    print("\n" + "="*60)
+    print("Aligning timestamps across all assets...")
+    print("="*60)
+    
+    if len(successful) > 1:
+        print("Finding common timestamps...")
+        common_timestamps = None
+        
+        for symbol in successful:
+            filename = f"data/{symbol}_combined_data.csv"
+            df = pd.read_csv(filename, usecols=['timestamp'])
+            timestamps_set = set(df['timestamp'].values)
+            
+            if common_timestamps is None:
+                common_timestamps = timestamps_set
+            else:
+                common_timestamps = common_timestamps.intersection(timestamps_set)
+            
+            del df
+            gc.collect()
+        
+        common_timestamps = sorted(list(common_timestamps))
+        print(f"Found {len(common_timestamps)} common timestamps across all assets")
+        
+        print("\nAligning each asset to common timestamps...")
+        for symbol in successful:
+            filename = f"data/{symbol}_combined_data.csv"
+            df = pd.read_csv(filename)
+            
+            original_len = len(df)
+            df = df[df['timestamp'].isin(common_timestamps)]
+            df = df.sort_values('timestamp').reset_index(drop=True)
+            
+            df.to_csv(filename, index=False)
+            print(f"{symbol}: {original_len} -> {len(df)} rows")
+            
+            complete_filename = f"data/{symbol}_complete_data.csv"
+            df.to_csv(complete_filename, index=True)
+            
+            ohlcv_cols = ['timestamp', 'open', 'high', 'low', 'close', 'volume', 
+                         'close_time', 'quote_asset_volume', 'number_of_trades',
+                         'taker_buy_base_asset_volume', 'taker_buy_quote_asset_volume']
+            if all(col in df.columns for col in ohlcv_cols):
+                raw_filename = f"data/{symbol}_5min_data.csv"
+                df[ohlcv_cols].to_csv(raw_filename, index=False)
+            
+            del df
+            gc.collect()
+        
+        print(f"\nAll assets aligned to {len(common_timestamps)} common timestamps")
     
     print("\n" + "="*60)
     print("Calculating inter-symbol correlations...")
