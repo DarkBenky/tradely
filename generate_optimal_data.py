@@ -4,14 +4,22 @@ import os
 from portfolio_env import PortfolioEnv
 import matplotlib.pyplot as plt
 from tqdm import tqdm
+import threading
+import time
+import random
+import string
 
 DEBUG = True
-DEBUG_SAMPLES = 128
+DEBUG_SAMPLES = 4096
 N_SAMPLES = 1000
-N_CANDIDATES = 16
+N_CANDIDATES = 24
 N_REFINEMENT_ITERATIONS = 5
-REFINEMENT_SAMPLES_PER_ITERATION = 8
-OUTPUT_FILE = 'optimal_dataset.pkl'
+REFINEMENT_SAMPLES_PER_ITERATION = 12
+NUM_OF_THREADS = 2
+OUTPUT_FOLDER = "syntheticData"
+
+def generate_random_string(length=8):
+    return ''.join(random.choices(string.ascii_lowercase + string.ascii_uppercase + string.digits, k=length))
 
 class GradientOptimalActionFinder:
     def __init__(self, env, n_candidates=16, n_refinement_iterations=3, refinement_samples=8):
@@ -146,29 +154,37 @@ def load_all_samples(filepath):
     return samples
 
 
-def generate_optimal_dataset(n_samples=N_SAMPLES, output_file=OUTPUT_FILE, debug=DEBUG, n_candidates=N_CANDIDATES, n_refinement_iterations=N_REFINEMENT_ITERATIONS, refinement_samples=REFINEMENT_SAMPLES_PER_ITERATION):
+def generate_optimal_dataset(n_samples=N_SAMPLES, output_file=None, debug=DEBUG, n_candidates=N_CANDIDATES, n_refinement_iterations=N_REFINEMENT_ITERATIONS, refinement_samples=REFINEMENT_SAMPLES_PER_ITERATION, thread_id=None):
+    if output_file is None:
+        if not os.path.exists(OUTPUT_FOLDER):
+            os.makedirs(OUTPUT_FOLDER)
+        random_str = generate_random_string()
+        output_file = os.path.join(OUTPUT_FOLDER, f'data_{random_str}.pkl')
+    
+    thread_prefix = f"[Thread {thread_id}] " if thread_id is not None else ""
+    
     if debug:
         n_samples = DEBUG_SAMPLES
-        print(f"DEBUG MODE: Generating only {n_samples} samples")
+        print(f"{thread_prefix}DEBUG MODE: Generating only {n_samples} samples")
     
     env = PortfolioEnv()
     optimizer = GradientOptimalActionFinder(env, n_candidates=n_candidates, n_refinement_iterations=n_refinement_iterations, refinement_samples=refinement_samples)
     
     if os.path.exists(output_file):
         existing_samples = load_all_samples(output_file)
-        print(f"Found {len(existing_samples)} existing samples in {output_file}")
+        print(f"{thread_prefix}Found {len(existing_samples)} existing samples in {output_file}")
         start_idx = len(existing_samples)
     else:
         start_idx = 0
-        print(f"Creating new dataset: {output_file}")
+        print(f"{thread_prefix}Creating new dataset: {output_file}")
     
     rewards_history = []
     portfolio_values = []
     
     total_evaluations = n_candidates + (n_refinement_iterations * refinement_samples)
-    print(f"\nGenerating {n_samples} optimal action samples...")
-    print(f"Each sample: {n_candidates} initial candidates + {n_refinement_iterations} refinement iterations ({refinement_samples} samples each)")
-    print(f"Total evaluations per sample: {total_evaluations}")
+    print(f"\n{thread_prefix}Generating {n_samples} optimal action samples...")
+    print(f"{thread_prefix}Each sample: {n_candidates} initial candidates + {n_refinement_iterations} refinement iterations ({refinement_samples} samples each)")
+    print(f"{thread_prefix}Total evaluations per sample: {total_evaluations}")
     
     for i in tqdm(range(n_samples)):
         obs = env.reset()
@@ -193,16 +209,17 @@ def generate_optimal_dataset(n_samples=N_SAMPLES, output_file=OUTPUT_FILE, debug
         portfolio_values.append(info['portfolio_value'])
         
         if debug and (i + 1) % 10 == 0:
+            thread_prefix = f"[Thread {thread_id}] " if thread_id is not None else ""
             avg_reward = np.mean(rewards_history[-10:])
-            print(f"\nSample {i+1}/{n_samples}: Reward={actual_reward:.2f}, Avg(10)={avg_reward:.2f}")
+            print(f"\n{thread_prefix}Sample {i+1}/{n_samples}: Reward={actual_reward:.2f}, Avg(10)={avg_reward:.2f}")
     
-    print(f"\n✓ Generated {n_samples} samples")
-    print(f"✓ Saved to {output_file}")
-    print(f"  Total samples in file: {start_idx + n_samples}")
-    print(f"  Average reward: ${np.mean(rewards_history):.2f}")
-    print(f"  Min reward: ${np.min(rewards_history):.2f}")
-    print(f"  Max reward: ${np.max(rewards_history):.2f}")
-    print(f"  Std reward: ${np.std(rewards_history):.2f}")
+    print(f"\n{thread_prefix} Generated {n_samples} samples")
+    print(f"{thread_prefix} Saved to {output_file}")
+    print(f"{thread_prefix}  Total samples in file: {start_idx + n_samples}")
+    print(f"{thread_prefix}  Average reward: ${np.mean(rewards_history):.2f}")
+    print(f"{thread_prefix}  Min reward: ${np.min(rewards_history):.2f}")
+    print(f"{thread_prefix}  Max reward: ${np.max(rewards_history):.2f}")
+    print(f"{thread_prefix}  Std reward: ${np.std(rewards_history):.2f}")
     
     if debug:
         plot_debug_statistics(rewards_history, portfolio_values, output_file)
@@ -272,7 +289,7 @@ def plot_debug_statistics(rewards_history, portfolio_values, output_file):
     
     plot_filename = output_file.replace('.pkl', '_debug_plot.png')
     plt.savefig(plot_filename, dpi=150, bbox_inches='tight')
-    print(f"\n✓ Saved visualization to {plot_filename}")
+    print(f"\n Saved visualization to {plot_filename}")
     
     print("\nStrategy Statistics:")
     print(f"  Win Rate: {win_rate:.2f}%")
@@ -283,16 +300,52 @@ def plot_debug_statistics(rewards_history, portfolio_values, output_file):
     print(f"  Sharpe Ratio (approx): {np.mean(rewards_history) / (np.std(rewards_history) + 1e-8):.3f}")
     
     if final_cumulative > 0:
-        print(f"\n✓ STRATEGY IS PROFITABLE (${final_cumulative:.2f} cumulative)")
+        print(f"\n STRATEGY IS PROFITABLE (${final_cumulative:.2f} cumulative)")
     else:
-        print(f"\n✗ STRATEGY IS NOT PROFITABLE (${final_cumulative:.2f} cumulative)")
+        print(f"\n STRATEGY IS NOT PROFITABLE (${final_cumulative:.2f} cumulative)")
     
     plt.show()
 
 
+def thread_worker(thread_id, n_samples):
+    print(f"[Thread {thread_id}] Starting...")
+    rewards, portfolio_values = generate_optimal_dataset(
+        n_samples=n_samples,
+        thread_id=thread_id
+    )
+    print(f"[Thread {thread_id}] Completed!")
+    return rewards, portfolio_values
+
+
 if __name__ == "__main__":
-    rewards, portfolio_values = generate_optimal_dataset()
-    
-    print("\n" + "="*60)
-    print("Dataset generation complete!")
-    print("="*60)
+    if NUM_OF_THREADS > 1:
+        if not os.path.exists(OUTPUT_FOLDER):
+            os.makedirs(OUTPUT_FOLDER)
+        
+        samples_per_thread = N_SAMPLES // NUM_OF_THREADS
+        threads = []
+        
+        print(f"\nStarting {NUM_OF_THREADS} threads, {samples_per_thread} samples each...")
+        print(f"Total samples: {NUM_OF_THREADS * samples_per_thread}")
+        print(f"Output folder: {OUTPUT_FOLDER}\n")
+        
+        start_time = time.time()
+        
+        for i in range(NUM_OF_THREADS):
+            thread = threading.Thread(target=thread_worker, args=(i, samples_per_thread))
+            threads.append(thread)
+            thread.start()
+        
+        for thread in threads:
+            thread.join()
+        
+        elapsed_time = time.time() - start_time
+        print(f"\n{'='*60}")
+        print(f"All threads completed in {elapsed_time:.2f} seconds")
+        print(f"{'='*60}")
+    else:
+        rewards, portfolio_values = generate_optimal_dataset()
+        
+        print("\n" + "="*60)
+        print("Dataset generation complete!")
+        print("="*60)
