@@ -1,0 +1,298 @@
+import numpy as np
+import pickle
+import os
+from portfolio_env import PortfolioEnv
+import matplotlib.pyplot as plt
+from tqdm import tqdm
+
+DEBUG = True
+DEBUG_SAMPLES = 128
+N_SAMPLES = 1000
+N_CANDIDATES = 16
+N_REFINEMENT_ITERATIONS = 5
+REFINEMENT_SAMPLES_PER_ITERATION = 8
+OUTPUT_FILE = 'optimal_dataset.pkl'
+
+class GradientOptimalActionFinder:
+    def __init__(self, env, n_candidates=16, n_refinement_iterations=3, refinement_samples=8):
+        self.env = env
+        self.n_candidates = n_candidates
+        self.n_refinement_iterations = n_refinement_iterations
+        self.refinement_samples = refinement_samples
+        self.action_dim = len(env.asset_names)
+    
+    def normalize_action(self, action):
+        action = np.clip(action, 0.0, 1.0)
+        total = np.sum(action)
+        if total > 0:
+            action = action / total
+        else:
+            action = np.ones(self.action_dim) / self.action_dim
+        return action
+    
+    def find_optimal_action(self, obs):
+        candidates = []
+        rewards = []
+        
+        for _ in range(self.n_candidates):
+            action = np.random.dirichlet(np.ones(self.action_dim))
+            
+            self.env.portfolio = self.env._saved_portfolio.copy()
+            self.env.portfolio_value = self.env._saved_portfolio_value
+            self.env.step_count = self.env._saved_step_count
+            self.env.prev_reward = self.env._saved_prev_reward.copy()
+            
+            reward = self.env.step_fast(action)
+            
+            candidates.append(action)
+            rewards.append(reward)
+        
+        best_idx = np.argmax(rewards)
+        best_action = candidates[best_idx]
+        best_reward = rewards[best_idx]
+        
+        for iteration in range(self.n_refinement_iterations):
+            noise_scale = 0.2 / (iteration + 1)
+            
+            for _ in range(self.refinement_samples):
+                noise = np.random.randn(self.action_dim) * noise_scale
+                perturbed_action = self.normalize_action(best_action + noise)
+                
+                self.env.portfolio = self.env._saved_portfolio.copy()
+                self.env.portfolio_value = self.env._saved_portfolio_value
+                self.env.step_count = self.env._saved_step_count
+                self.env.prev_reward = self.env._saved_prev_reward.copy()
+                
+                reward = self.env.step_fast(perturbed_action)
+                
+                candidates.append(perturbed_action)
+                rewards.append(reward)
+                
+                if reward > best_reward:
+                    best_action = perturbed_action
+                    best_reward = reward
+        
+        confidence = self._calculate_confidence(candidates, rewards)
+        
+        return best_action, best_reward, confidence
+    
+    def _calculate_confidence(self, candidates, rewards):
+        candidates = np.array(candidates)
+        rewards = np.array(rewards)
+        
+        min_reward = np.min(rewards)
+        max_reward = np.max(rewards)
+        
+        if max_reward - min_reward < 1e-6:
+            weights = np.ones(len(rewards)) / len(rewards)
+        else:
+            normalized_rewards = (rewards - min_reward) / (max_reward - min_reward)
+            exp_rewards = np.exp(normalized_rewards * 5)
+            weights = exp_rewards / np.sum(exp_rewards)
+        
+        weighted_allocations = np.zeros(self.action_dim)
+        for i, candidate in enumerate(candidates):
+            weighted_allocations += candidate * weights[i]
+        
+        confidence = np.zeros(self.action_dim)
+        for i in range(self.action_dim):
+            asset_allocations = candidates[:, i]
+            
+            high_reward_mask = rewards > np.percentile(rewards, 50)
+            low_reward_mask = rewards < np.percentile(rewards, 50)
+            
+            if np.any(high_reward_mask):
+                avg_high = np.mean(asset_allocations[high_reward_mask])
+            else:
+                avg_high = 0.5
+            
+            if np.any(low_reward_mask):
+                avg_low = np.mean(asset_allocations[low_reward_mask])
+            else:
+                avg_low = 0.5
+            
+            confidence[i] = 0.5 + (avg_high - avg_low)
+            confidence[i] = np.clip(confidence[i], 0.0, 1.0)
+        
+        return confidence
+
+
+def save_sample_incremental(filepath, obs, action, reward, confidence):
+    sample = {
+        'obs': obs,
+        'action': action,
+        'reward': reward,
+        'confidence': confidence
+    }
+    
+    mode = 'ab' if os.path.exists(filepath) else 'wb'
+    with open(filepath, mode) as f:
+        pickle.dump(sample, f)
+
+
+def load_all_samples(filepath):
+    if not os.path.exists(filepath):
+        return []
+    
+    samples = []
+    with open(filepath, 'rb') as f:
+        while True:
+            try:
+                sample = pickle.load(f)
+                samples.append(sample)
+            except EOFError:
+                break
+    
+    return samples
+
+
+def generate_optimal_dataset(n_samples=N_SAMPLES, output_file=OUTPUT_FILE, debug=DEBUG, n_candidates=N_CANDIDATES, n_refinement_iterations=N_REFINEMENT_ITERATIONS, refinement_samples=REFINEMENT_SAMPLES_PER_ITERATION):
+    if debug:
+        n_samples = DEBUG_SAMPLES
+        print(f"DEBUG MODE: Generating only {n_samples} samples")
+    
+    env = PortfolioEnv()
+    optimizer = GradientOptimalActionFinder(env, n_candidates=n_candidates, n_refinement_iterations=n_refinement_iterations, refinement_samples=refinement_samples)
+    
+    if os.path.exists(output_file):
+        existing_samples = load_all_samples(output_file)
+        print(f"Found {len(existing_samples)} existing samples in {output_file}")
+        start_idx = len(existing_samples)
+    else:
+        start_idx = 0
+        print(f"Creating new dataset: {output_file}")
+    
+    rewards_history = []
+    portfolio_values = []
+    
+    total_evaluations = n_candidates + (n_refinement_iterations * refinement_samples)
+    print(f"\nGenerating {n_samples} optimal action samples...")
+    print(f"Each sample: {n_candidates} initial candidates + {n_refinement_iterations} refinement iterations ({refinement_samples} samples each)")
+    print(f"Total evaluations per sample: {total_evaluations}")
+    
+    for i in tqdm(range(n_samples)):
+        obs = env.reset()
+        
+        env._saved_portfolio = env.portfolio.copy()
+        env._saved_portfolio_value = env.portfolio_value
+        env._saved_step_count = env.step_count
+        env._saved_prev_reward = env.prev_reward.copy()
+        
+        optimal_action, expected_reward, confidence = optimizer.find_optimal_action(obs)
+        
+        env.portfolio = env._saved_portfolio.copy()
+        env.portfolio_value = env._saved_portfolio_value
+        env.step_count = env._saved_step_count
+        env.prev_reward = env._saved_prev_reward.copy()
+        
+        _, actual_reward, _, info = env.step(optimal_action)
+        
+        save_sample_incremental(output_file, obs, optimal_action, actual_reward, confidence)
+        
+        rewards_history.append(actual_reward)
+        portfolio_values.append(info['portfolio_value'])
+        
+        if debug and (i + 1) % 10 == 0:
+            avg_reward = np.mean(rewards_history[-10:])
+            print(f"\nSample {i+1}/{n_samples}: Reward={actual_reward:.2f}, Avg(10)={avg_reward:.2f}")
+    
+    print(f"\n✓ Generated {n_samples} samples")
+    print(f"✓ Saved to {output_file}")
+    print(f"  Total samples in file: {start_idx + n_samples}")
+    print(f"  Average reward: ${np.mean(rewards_history):.2f}")
+    print(f"  Min reward: ${np.min(rewards_history):.2f}")
+    print(f"  Max reward: ${np.max(rewards_history):.2f}")
+    print(f"  Std reward: ${np.std(rewards_history):.2f}")
+    
+    if debug:
+        plot_debug_statistics(rewards_history, portfolio_values, output_file)
+    
+    return rewards_history, portfolio_values
+
+
+def plot_debug_statistics(rewards_history, portfolio_values, output_file):
+    print("\n" + "="*60)
+    print("DEBUG: Generating visualizations...")
+    print("="*60)
+    
+    fig, axes = plt.subplots(2, 2, figsize=(15, 10))
+    
+    axes[0, 0].plot(rewards_history, alpha=0.7, linewidth=1)
+    axes[0, 0].axhline(y=0, color='r', linestyle='--', alpha=0.5)
+    axes[0, 0].set_title('Reward per Sample', fontsize=14, fontweight='bold')
+    axes[0, 0].set_xlabel('Sample Index')
+    axes[0, 0].set_ylabel('Reward ($)')
+    axes[0, 0].grid(True, alpha=0.3)
+    
+    window = 20
+    if len(rewards_history) >= window:
+        moving_avg = np.convolve(rewards_history, np.ones(window)/window, mode='valid')
+        axes[0, 0].plot(range(window-1, len(rewards_history)), moving_avg, 
+                       color='red', linewidth=2, label=f'MA({window})')
+        axes[0, 0].legend()
+    
+    axes[0, 1].hist(rewards_history, bins=30, alpha=0.7, edgecolor='black')
+    axes[0, 1].axvline(x=np.mean(rewards_history), color='r', linestyle='--', 
+                      linewidth=2, label=f'Mean: ${np.mean(rewards_history):.2f}')
+    axes[0, 1].axvline(x=np.median(rewards_history), color='g', linestyle='--', 
+                      linewidth=2, label=f'Median: ${np.median(rewards_history):.2f}')
+    axes[0, 1].set_title('Reward Distribution', fontsize=14, fontweight='bold')
+    axes[0, 1].set_xlabel('Reward ($)')
+    axes[0, 1].set_ylabel('Frequency')
+    axes[0, 1].legend()
+    axes[0, 1].grid(True, alpha=0.3)
+    
+    cumulative_rewards = np.cumsum(rewards_history)
+    axes[1, 0].plot(cumulative_rewards, linewidth=2, color='green')
+    axes[1, 0].set_title('Cumulative Rewards', fontsize=14, fontweight='bold')
+    axes[1, 0].set_xlabel('Sample Index')
+    axes[1, 0].set_ylabel('Cumulative Reward ($)')
+    axes[1, 0].grid(True, alpha=0.3)
+    
+    final_cumulative = cumulative_rewards[-1]
+    axes[1, 0].text(0.05, 0.95, f'Total: ${final_cumulative:.2f}', 
+                   transform=axes[1, 0].transAxes, fontsize=12,
+                   verticalalignment='top', bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.5))
+    
+    portfolio_returns = [(pv / 10000 - 1) * 100 for pv in portfolio_values]
+    axes[1, 1].scatter(range(len(portfolio_returns)), portfolio_returns, alpha=0.5, s=20)
+    axes[1, 1].axhline(y=0, color='r', linestyle='--', alpha=0.5)
+    axes[1, 1].set_title('Portfolio Returns per Sample', fontsize=14, fontweight='bold')
+    axes[1, 1].set_xlabel('Sample Index')
+    axes[1, 1].set_ylabel('Return (%)')
+    axes[1, 1].grid(True, alpha=0.3)
+    
+    positive_rewards = sum(1 for r in rewards_history if r > 0)
+    win_rate = (positive_rewards / len(rewards_history)) * 100
+    axes[1, 1].text(0.05, 0.95, f'Win Rate: {win_rate:.1f}%', 
+                   transform=axes[1, 1].transAxes, fontsize=12,
+                   verticalalignment='top', bbox=dict(boxstyle='round', facecolor='lightblue', alpha=0.5))
+    
+    plt.tight_layout()
+    
+    plot_filename = output_file.replace('.pkl', '_debug_plot.png')
+    plt.savefig(plot_filename, dpi=150, bbox_inches='tight')
+    print(f"\n✓ Saved visualization to {plot_filename}")
+    
+    print("\nStrategy Statistics:")
+    print(f"  Win Rate: {win_rate:.2f}%")
+    print(f"  Loss Rate: {100-win_rate:.2f}%")
+    print(f"  Avg Winning Trade: ${np.mean([r for r in rewards_history if r > 0]):.2f}")
+    print(f"  Avg Losing Trade: ${np.mean([r for r in rewards_history if r < 0]):.2f}")
+    print(f"  Profit Factor: {abs(sum([r for r in rewards_history if r > 0]) / sum([r for r in rewards_history if r < 0])):.2f}")
+    print(f"  Sharpe Ratio (approx): {np.mean(rewards_history) / (np.std(rewards_history) + 1e-8):.3f}")
+    
+    if final_cumulative > 0:
+        print(f"\n✓ STRATEGY IS PROFITABLE (${final_cumulative:.2f} cumulative)")
+    else:
+        print(f"\n✗ STRATEGY IS NOT PROFITABLE (${final_cumulative:.2f} cumulative)")
+    
+    plt.show()
+
+
+if __name__ == "__main__":
+    rewards, portfolio_values = generate_optimal_dataset()
+    
+    print("\n" + "="*60)
+    print("Dataset generation complete!")
+    print("="*60)
