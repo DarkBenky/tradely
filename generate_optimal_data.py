@@ -1,7 +1,7 @@
 import numpy as np
 import pickle
 import os
-from portfolio_env import PortfolioEnv
+from portfolio_env import PortfolioEnv, ModelType
 import matplotlib.pyplot as plt
 from tqdm import tqdm
 import threading
@@ -10,13 +10,14 @@ import random
 import string
 
 DEBUG = True
-DEBUG_SAMPLES = 8096
-N_SAMPLES = 1000
-N_CANDIDATES = 24
-N_REFINEMENT_ITERATIONS = 5
+DEBUG_SAMPLES = 1024
+N_CANDIDATES = 32
+N_REFINEMENT_ITERATIONS = 3
 REFINEMENT_SAMPLES_PER_ITERATION = 12
-NUM_OF_THREADS = 2
+NUM_OF_THREADS = 4
+N_SAMPLES = NUM_OF_THREADS * 4096
 OUTPUT_FOLDER = "syntheticData"
+OBS_SHAPE = ModelType.TRANSFORMER_SHAPE
 
 def generate_random_string(length=8):
     return ''.join(random.choices(string.ascii_lowercase + string.ascii_uppercase + string.digits, k=length))
@@ -154,7 +155,7 @@ def load_all_samples(filepath):
     return samples
 
 
-def generate_optimal_dataset(n_samples=N_SAMPLES, output_file=None, debug=DEBUG, n_candidates=N_CANDIDATES, n_refinement_iterations=N_REFINEMENT_ITERATIONS, refinement_samples=REFINEMENT_SAMPLES_PER_ITERATION, thread_id=None):
+def generate_optimal_dataset(n_samples=N_SAMPLES, output_file=None, debug=DEBUG, n_candidates=N_CANDIDATES, n_refinement_iterations=N_REFINEMENT_ITERATIONS, refinement_samples=REFINEMENT_SAMPLES_PER_ITERATION, thread_id=None, obs_shape=OBS_SHAPE):
     if output_file is None:
         if not os.path.exists(OUTPUT_FOLDER):
             os.makedirs(OUTPUT_FOLDER)
@@ -167,7 +168,7 @@ def generate_optimal_dataset(n_samples=N_SAMPLES, output_file=None, debug=DEBUG,
         n_samples = DEBUG_SAMPLES
         print(f"{thread_prefix}DEBUG MODE: Generating only {n_samples} samples")
     
-    env = PortfolioEnv()
+    env = PortfolioEnv(obs_shape=obs_shape)
     optimizer = GradientOptimalActionFinder(env, n_candidates=n_candidates, n_refinement_iterations=n_refinement_iterations, refinement_samples=refinement_samples)
     
     if os.path.exists(output_file):

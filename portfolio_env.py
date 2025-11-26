@@ -3,6 +3,7 @@ import pandas as pd
 import os
 import random
 from collections import deque
+from enum import Enum
 
 DEBUG = False
 
@@ -42,8 +43,13 @@ def load_and_align_data(data_dir='data', max_records=None):
     
     return aligned_data
 
+class ModelType(Enum):
+    TRANSFORMER_SHAPE = "transformer_shape"
+    FLAT_SHAPE = "flatte"
+    THREE_D_SHAPE = "3d"
+
 class PortfolioEnv():
-    def __init__(self, data_dir='data', max_records=None, rebalancing_interval=12, previous_env_reward=12, previous_reward_to_current_ration=0.25):
+    def __init__(self, data_dir='data', max_records=None, rebalancing_interval=12, previous_env_reward=12, previous_reward_to_current_ration=0.25, obs_shape=ModelType.TRANSFORMER_SHAPE):
         self.initial_account_balance = 10000.0
         self.rebalance_interval = rebalancing_interval
         self.reset_value = self.initial_account_balance // 2
@@ -51,6 +57,7 @@ class PortfolioEnv():
         self.asset_names = list(self.df.keys()) + ['cash']
         self.prev_reward = deque(maxlen=previous_env_reward)
         self.previous_reward_to_current_ration = previous_reward_to_current_ration
+        self.obs_shape = obs_shape
         
         total_length = len(self.df['BTCUSDT'])
         self.lookback_window_size = 24
@@ -103,7 +110,7 @@ class PortfolioEnv():
         return action
         
 
-    def get_observation(self):
+    def get_observation(self, type='transformer'):
         total_length = len(self.df['BTCUSDT'])
         if self.step_count < 0 or self.step_count >= total_length - 2:
             self.step_count = max(1000, self.lookback_window_size + 288)
@@ -119,6 +126,8 @@ class PortfolioEnv():
         sample_symbol = list(self.df.keys())[0]
         all_available_cols = [col for col in self.df[sample_symbol].columns 
                              if col not in exclude_cols]
+        
+        num_features = len(all_available_cols)
         
         for i, symbol in enumerate(self.df.keys()):
             symbol_data = self.df[symbol]
@@ -198,22 +207,88 @@ class PortfolioEnv():
         benchmark_ratio = benchmark_value / self.initial_account_balance
         portfolio_state.append(benchmark_ratio)
         
-        for i in range(len(self.df)):
-            obs[i].append(np.array(portfolio_state))
+        portfolio_state_array = np.array(portfolio_state, dtype=float)
         
-        flattened_obs = []
-        for i in range(len(self.df)):
-            for obs_part in obs[i]:
-                if obs_part.size > 0:
-                    flattened_obs.append(obs_part.flatten())
+        if self.obs_shape == ModelType.FLAT_SHAPE:
+            for i in range(len(self.df)):
+                obs[i].append(portfolio_state_array)
+            
+            flattened_obs = []
+            for i in range(len(self.df)):
+                for obs_part in obs[i]:
+                    if obs_part.size > 0:
+                        flattened_obs.append(obs_part.flatten())
+            
+            if flattened_obs:
+                final_obs = np.concatenate(flattened_obs)
+            else:
+                final_obs = np.array([])
+            
+            final_obs = np.nan_to_num(final_obs, nan=0.0, posinf=1.0, neginf=0.0)
+            return final_obs
         
-        if flattened_obs:
-            final_obs = np.concatenate(flattened_obs)
+        elif self.obs_shape == ModelType.THREE_D_SHAPE:
+            total_timesteps = self.lookback_window_size + sum(self.high_timeframes_count)
+            num_assets = len(self.df)
+            
+            result = np.zeros((total_timesteps, num_features, num_assets), dtype=float)
+            
+            timestep_offset = 0
+            for i, symbol in enumerate(self.df.keys()):
+                base_candles = obs[i][0]
+                if base_candles.size > 0:
+                    for t in range(min(base_candles.shape[0], self.lookback_window_size)):
+                        result[t, :, i] = base_candles[t, :]
+            
+            timestep_offset = self.lookback_window_size
+            
+            for tf_idx, candles_count in enumerate(self.high_timeframes_count):
+                for i, symbol in enumerate(self.df.keys()):
+                    tf_candles = obs[i][tf_idx + 1]
+                    if tf_candles.size > 0:
+                        for t in range(min(tf_candles.shape[0], candles_count)):
+                            result[timestep_offset + t, :, i] = tf_candles[t, :]
+                timestep_offset += candles_count
+            
+            result = np.nan_to_num(result, nan=0.0, posinf=1.0, neginf=0.0)
+            return result
+        
+        elif self.obs_shape == ModelType.TRANSFORMER_SHAPE:
+            total_timesteps = self.lookback_window_size + sum(self.high_timeframes_count)
+            num_assets = len(self.df)
+            features_per_timestep = num_features * num_assets + len(portfolio_state_array)
+            
+            result = np.zeros((total_timesteps, features_per_timestep), dtype=float)
+            
+            for t in range(self.lookback_window_size):
+                feature_offset = 0
+                for i, symbol in enumerate(self.df.keys()):
+                    base_candles = obs[i][0]
+                    if base_candles.size > 0 and t < base_candles.shape[0]:
+                        result[t, feature_offset:feature_offset + num_features] = base_candles[t, :]
+                    feature_offset += num_features
+                
+                result[t, feature_offset:] = portfolio_state_array
+            
+            timestep_offset = self.lookback_window_size
+            for tf_idx, candles_count in enumerate(self.high_timeframes_count):
+                for t in range(candles_count):
+                    feature_offset = 0
+                    for i, symbol in enumerate(self.df.keys()):
+                        tf_candles = obs[i][tf_idx + 1]
+                        if tf_candles.size > 0 and t < tf_candles.shape[0]:
+                            result[timestep_offset + t, feature_offset:feature_offset + num_features] = tf_candles[t, :]
+                        feature_offset += num_features
+                    
+                    result[timestep_offset + t, feature_offset:] = portfolio_state_array
+                timestep_offset += candles_count
+            
+            result = np.nan_to_num(result, nan=0.0, posinf=1.0, neginf=0.0)
+            return result
+        
         else:
-            final_obs = np.array([])
+            raise ValueError(f"Unknown obs_shape: {self.obs_shape}")
         
-        final_obs = np.nan_to_num(final_obs, nan=0.0, posinf=1.0, neginf=0.0)
-        return final_obs
     def _rebalance_portfolio(self, action):
         current_value = self._portfolio_portfolio_value()
         
