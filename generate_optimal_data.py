@@ -10,11 +10,11 @@ import random
 import string
 
 DEBUG = True
-DEBUG_SAMPLES = 1024
-N_CANDIDATES = 32
-N_REFINEMENT_ITERATIONS = 3
-REFINEMENT_SAMPLES_PER_ITERATION = 12
-NUM_OF_THREADS = 4
+NUM_OF_THREADS = 6
+DEBUG_SAMPLES = 1024 * NUM_OF_THREADS
+N_CANDIDATES = 12
+N_REFINEMENT_ITERATIONS = 8
+REFINEMENT_SAMPLES_PER_ITERATION = 6
 N_SAMPLES = NUM_OF_THREADS * 4096
 OUTPUT_FOLDER = "syntheticData"
 OBS_SHAPE = ModelType.TRANSFORMER_SHAPE
@@ -155,7 +155,62 @@ def load_all_samples(filepath):
     return samples
 
 
-def generate_optimal_dataset(n_samples=N_SAMPLES, output_file=None, debug=DEBUG, n_candidates=N_CANDIDATES, n_refinement_iterations=N_REFINEMENT_ITERATIONS, refinement_samples=REFINEMENT_SAMPLES_PER_ITERATION, thread_id=None, obs_shape=OBS_SHAPE):
+def add_observation_noise(obs, noise_level=0.0125, noise_type='gaussian'):
+    """
+    Add noise to observation to prevent overfitting and encourage pattern learning.
+    
+    Args:
+        obs: observation array
+        noise_level: standard deviation of noise relative to data scale
+        noise_type: 'gaussian', 'uniform', or 'mixed'
+    
+    Returns:
+        noised observation
+    """
+    if obs.size == 0:
+        return obs
+    
+    noised_obs = obs.copy()
+    
+    if noise_type == 'gaussian':
+        # Gaussian noise proportional to the data scale
+        data_std = np.std(obs, axis=0, keepdims=True)
+        data_std = np.where(data_std == 0, 1.0, data_std)
+        noise = np.random.normal(0, noise_level, obs.shape) * data_std
+        noised_obs = obs + noise
+        
+    elif noise_type == 'uniform':
+        # Uniform noise proportional to data range
+        data_range = np.ptp(obs, axis=0, keepdims=True)
+        data_range = np.where(data_range == 0, 1.0, data_range)
+        noise = np.random.uniform(-noise_level, noise_level, obs.shape) * data_range
+        noised_obs = obs + noise
+        
+    elif noise_type == 'mixed':
+        # Combination of gaussian and uniform noise
+        data_std = np.std(obs, axis=0, keepdims=True)
+        data_std = np.where(data_std == 0, 1.0, data_std)
+        
+        gaussian_noise = np.random.normal(0, noise_level * 0.7, obs.shape) * data_std
+        uniform_noise = np.random.uniform(-noise_level * 0.3, noise_level * 0.3, obs.shape) * data_std
+        
+        noised_obs = obs + gaussian_noise + uniform_noise
+    
+    # Ensure no NaN or Inf values after adding noise
+    noised_obs = np.nan_to_num(noised_obs, nan=0.0, posinf=1.0, neginf=0.0)
+    
+    return noised_obs
+
+def generate_optimal_dataset(n_samples=N_SAMPLES, output_file=None, debug=DEBUG, 
+                            n_candidates=N_CANDIDATES, n_refinement_iterations=N_REFINEMENT_ITERATIONS, 
+                            refinement_samples=REFINEMENT_SAMPLES_PER_ITERATION, thread_id=None, 
+                            obs_shape=OBS_SHAPE, add_noise=True, noise_level=0.02, noise_type='mixed'):
+    """
+    noise parameters:
+        add_noise: whether to add noise to observations
+        noise_level: amount of noise (0.01 = 1% of data scale, 0.02 = 2%, etc.)
+        noise_type: 'gaussian', 'uniform', or 'mixed'
+    """
     if output_file is None:
         if not os.path.exists(OUTPUT_FOLDER):
             os.makedirs(OUTPUT_FOLDER)
@@ -168,8 +223,13 @@ def generate_optimal_dataset(n_samples=N_SAMPLES, output_file=None, debug=DEBUG,
         n_samples = DEBUG_SAMPLES
         print(f"{thread_prefix}DEBUG MODE: Generating only {n_samples} samples")
     
+    if add_noise:
+        print(f"{thread_prefix}Adding {noise_type} noise (level={noise_level}) to observations")
+    
     env = PortfolioEnv(obs_shape=obs_shape)
-    optimizer = GradientOptimalActionFinder(env, n_candidates=n_candidates, n_refinement_iterations=n_refinement_iterations, refinement_samples=refinement_samples)
+    optimizer = GradientOptimalActionFinder(env, n_candidates=n_candidates, 
+                                           n_refinement_iterations=n_refinement_iterations, 
+                                           refinement_samples=refinement_samples)
     
     if os.path.exists(output_file):
         existing_samples = load_all_samples(output_file)
@@ -190,6 +250,12 @@ def generate_optimal_dataset(n_samples=N_SAMPLES, output_file=None, debug=DEBUG,
     for i in tqdm(range(n_samples)):
         obs = env.reset()
         
+        # Add noise to observation for training robustness
+        if add_noise:
+            noised_obs = add_observation_noise(obs, noise_level=noise_level, noise_type=noise_type)
+        else:
+            noised_obs = obs
+        
         env._saved_portfolio = env.portfolio.copy()
         env._saved_portfolio_value = env.portfolio_value
         env._saved_step_count = env.step_count
@@ -204,7 +270,8 @@ def generate_optimal_dataset(n_samples=N_SAMPLES, output_file=None, debug=DEBUG,
         
         _, actual_reward, _, info = env.step(optimal_action)
         
-        save_sample_incremental(output_file, obs, optimal_action, actual_reward, confidence)
+        # Save the NOISED observation with optimal action
+        save_sample_incremental(output_file, noised_obs, optimal_action, actual_reward, confidence)
         
         rewards_history.append(actual_reward)
         portfolio_values.append(info['portfolio_value'])
@@ -215,7 +282,7 @@ def generate_optimal_dataset(n_samples=N_SAMPLES, output_file=None, debug=DEBUG,
             print(f"\n{thread_prefix}Sample {i+1}/{n_samples}: Reward={actual_reward:.2f}, Avg(10)={avg_reward:.2f}")
     
     print(f"\n{thread_prefix} Generated {n_samples} samples")
-    print(f"{thread_prefix} Saved to {output_file}")
+    print(f"{thread_prefix}  Saved to {output_file}")
     print(f"{thread_prefix}  Total samples in file: {start_idx + n_samples}")
     print(f"{thread_prefix}  Average reward: ${np.mean(rewards_history):.2f}")
     print(f"{thread_prefix}  Min reward: ${np.min(rewards_history):.2f}")
@@ -308,11 +375,15 @@ def plot_debug_statistics(rewards_history, portfolio_values, output_file):
     plt.show()
 
 
-def thread_worker(thread_id, n_samples):
-    print(f"[Thread {thread_id}] Starting...")
+def thread_worker(thread_id, n_samples, noise_level=0.0125, noise_type='mixed'):
+    """Modified thread worker to support noise parameters."""
+    print(f"[Thread {thread_id}] Starting with noise_level={noise_level}, noise_type={noise_type}...")
     rewards, portfolio_values = generate_optimal_dataset(
         n_samples=n_samples,
-        thread_id=thread_id
+        thread_id=thread_id,
+        add_noise=True,
+        noise_level=noise_level,
+        noise_type=noise_type
     )
     print(f"[Thread {thread_id}] Completed!")
     return rewards, portfolio_values

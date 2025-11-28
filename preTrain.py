@@ -1,3 +1,5 @@
+# TODO: Use mixed precision training for speedup and memory savings
+
 import tensorflow as tf
 from tensorflow import keras
 from tensorflow.keras import layers
@@ -5,17 +7,16 @@ import numpy as np
 import pickle
 import os
 import wandb
-from pathlib import Path
 import json
 
 D_MODEL = 256
 NHEAD = 8
 NUM_ENCODER_LAYERS = 2
-DIM_FEEDFORWARD = 512
+DIM_FEEDFORWARD = 256
 DROPOUT = 0.1
 LEARNING_RATE = 0.0001
 BATCH_SIZE = 32
-SAMPLES_PER_FILE = 1000
+SAMPLES_PER_FILE = 512
 BEST_MODEL_PATH = "models/best_pretrain_transformer.h5"
 CONFIG_PATH = "models/model_config.json"
 DATA_FOLDER = "syntheticData"
@@ -308,6 +309,8 @@ def train():
     dummy_input = tf.random.normal((1, sequence_length, features_per_timestep))
     _ = model(dummy_input, training=False)
     
+    model.summary()
+
     num_params = model.count_parameters()
     model_size_mb = num_params * 4 / (1024 * 1024)
     
