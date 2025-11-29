@@ -16,12 +16,13 @@ DIM_FEEDFORWARD = 256
 DROPOUT = 0.1
 LEARNING_RATE = 0.0001
 BATCH_SIZE = 32
-SAMPLES_PER_FILE = 512
-BEST_MODEL_PATH = "models/best_pretrain_transformer.h5"
+SAMPLES_PER_FILE = 2048
+BEST_MODEL_PATH = "models/best_pretrain_transformer.weights.h5"
 CONFIG_PATH = "models/model_config.json"
 DATA_FOLDER = "syntheticData"
 LOG_INTERVAL = 10
 WANDB_PROJECT = "portfolio-pretrain"
+EPOCHS_PER_CHUNK = 5
 
 
 def get_data_specs_from_file(filepath):
@@ -142,17 +143,20 @@ class PortfolioTransformer(keras.Model):
         return sum([tf.size(w).numpy() for w in self.trainable_weights])
 
 
-def load_samples_from_file(filepath, max_samples=None):
+def load_samples_from_file(filepath, offset=0, max_samples=None):
     samples = []
     with open(filepath, 'rb') as f:
         count = 0
+        loaded = 0
         while True:
-            if max_samples and count >= max_samples:
-                break
             try:
                 sample = pickle.load(f)
-                samples.append(sample)
+                if count >= offset and (max_samples is None or loaded < max_samples):
+                    samples.append(sample)
+                    loaded += 1
                 count += 1
+                if max_samples and loaded >= max_samples:
+                    break
             except EOFError:
                 break
     return samples
@@ -182,19 +186,30 @@ def compute_loss(model, obs_batch, action_batch, confidence_batch, training=True
     
     confidence_loss = tf.reduce_mean(tf.square(pred_confidence - confidence_batch))
     
+    epsilon = 1e-7
+    action_batch_safe = tf.clip_by_value(action_batch, epsilon, 1.0)
+    pred_allocation_safe = tf.clip_by_value(pred_allocation, epsilon, 1.0)
     kl_loss = tf.reduce_mean(
-        tf.keras.losses.kl_divergence(action_batch, pred_allocation)
+        tf.reduce_sum(action_batch_safe * (tf.math.log(action_batch_safe) - tf.math.log(pred_allocation_safe)), axis=1)
     )
     
     total_loss = allocation_loss + 0.5 * confidence_loss + 0.3 * kl_loss
     
-    return total_loss, allocation_loss, confidence_loss, kl_loss
+    pred_allocation_argmax = tf.argmax(pred_allocation, axis=1)
+    action_batch_argmax = tf.argmax(action_batch, axis=1)
+    allocation_accuracy = tf.reduce_mean(tf.cast(tf.equal(pred_allocation_argmax, action_batch_argmax), tf.float32))
+    
+    confidence_threshold = 0.5
+    pred_confidence_binary = tf.cast(pred_confidence > confidence_threshold, tf.float32)
+    confidence_accuracy = tf.reduce_mean(tf.cast(tf.equal(pred_confidence_binary, confidence_batch), tf.float32))
+    
+    return total_loss, allocation_loss, confidence_loss, kl_loss, allocation_accuracy, confidence_accuracy
 
 
 @tf.function
 def train_step(model, optimizer, obs_batch, action_batch, confidence_batch):
     with tf.GradientTape() as tape:
-        total_loss, allocation_loss, confidence_loss, kl_loss = compute_loss(
+        total_loss, allocation_loss, confidence_loss, kl_loss, allocation_accuracy, confidence_accuracy = compute_loss(
             model, obs_batch, action_batch, confidence_batch, training=True
         )
     
@@ -202,7 +217,7 @@ def train_step(model, optimizer, obs_batch, action_batch, confidence_batch):
     gradients, _ = tf.clip_by_global_norm(gradients, 1.0)
     optimizer.apply_gradients(zip(gradients, model.trainable_weights))
     
-    return total_loss, allocation_loss, confidence_loss, kl_loss
+    return total_loss, allocation_loss, confidence_loss, kl_loss, allocation_accuracy, confidence_accuracy
 
 
 def save_model_and_config(model, sequence_length, features_per_timestep, num_assets, filepath, config_path):
@@ -268,7 +283,10 @@ def train():
         'dropout': DROPOUT,
         'learning_rate': LEARNING_RATE,
         'batch_size': BATCH_SIZE,
-        'num_assets': num_assets
+        'num_assets': num_assets,
+        'samples_per_file': SAMPLES_PER_FILE,
+        'epochs_per_chunk': EPOCHS_PER_CHUNK,
+        'log_interval': LOG_INTERVAL
     }
     
     wandb.init(project=WANDB_PROJECT, config=config)
@@ -339,78 +357,88 @@ def train():
         
         for file_idx, filename in enumerate(data_files):
             filepath = os.path.join(DATA_FOLDER, filename)
-            print(f"\nLoading {filename} ({file_idx + 1}/{len(data_files)})")
+            print(f"\nProcessing {filename} ({file_idx + 1}/{len(data_files)})")
             
-            samples = load_samples_from_file(filepath, max_samples=SAMPLES_PER_FILE)
-            if not samples:
-                print(f"No samples in {filename}, skipping")
-                continue
+            chunk_offset = 0
+            chunk_num = 0
             
-            print(f"Loaded {len(samples)} samples")
-            
-            backup_weights = [w.numpy() for w in model.trainable_weights]
-            
-            num_batches = len(samples) // BATCH_SIZE
-            epoch_loss = 0.0
-            nan_detected = False
-            
-            for batch_idx in range(num_batches):
-                batch_samples = samples[batch_idx * BATCH_SIZE:(batch_idx + 1) * BATCH_SIZE]
+            while True:
+                samples = load_samples_from_file(filepath, offset=chunk_offset, max_samples=SAMPLES_PER_FILE)
+                if not samples:
+                    break
                 
-                try:
-                    obs_batch, action_batch, confidence_batch = create_batch(batch_samples)
+                chunk_num += 1
+                chunk_offset += len(samples)
+                print(f"  Chunk {chunk_num}: Loaded {len(samples)} samples (offset: {chunk_offset - len(samples)})")
+                
+                for chunk_epoch in range(EPOCHS_PER_CHUNK):
+                    backup_weights = [w.numpy() for w in model.trainable_weights]
                     
-                    total_loss, allocation_loss, confidence_loss, kl_loss = train_step(
-                        model, optimizer, obs_batch, action_batch, confidence_batch
-                    )
+                    num_batches = len(samples) // BATCH_SIZE
+                    epoch_loss = 0.0
+                    nan_detected = False
                     
-                    if tf.math.is_nan(total_loss) or tf.math.is_inf(total_loss):
-                        print(f"\nNaN/Inf detected in loss at step {global_step}!")
-                        print("Rolling back to previous state...")
-                        for w, backup in zip(model.trainable_weights, backup_weights):
-                            w.assign(backup)
-                        nan_detected = True
+                    for batch_idx in range(num_batches):
+                        batch_samples = samples[batch_idx * BATCH_SIZE:(batch_idx + 1) * BATCH_SIZE]
+                        
+                        try:
+                            obs_batch, action_batch, confidence_batch = create_batch(batch_samples)
+                            
+                            total_loss, allocation_loss, confidence_loss, kl_loss, allocation_accuracy, confidence_accuracy = train_step(
+                                model, optimizer, obs_batch, action_batch, confidence_batch
+                            )
+                            
+                            if tf.math.is_nan(total_loss) or tf.math.is_inf(total_loss):
+                                print(f"\n    NaN/Inf detected in loss at step {global_step}!")
+                                print("    Rolling back to previous state...")
+                                for w, backup in zip(model.trainable_weights, backup_weights):
+                                    w.assign(backup)
+                                nan_detected = True
+                                break
+                            
+                            epoch_loss += total_loss.numpy()
+                            global_step += 1
+                            
+                            if global_step % LOG_INTERVAL == 0:
+                                wandb.log({
+                                    'loss': total_loss.numpy(),
+                                    'allocation_loss': allocation_loss.numpy(),
+                                    'confidence_loss': confidence_loss.numpy(),
+                                    'kl_loss': kl_loss.numpy(),
+                                    'allocation_accuracy': allocation_accuracy.numpy(),
+                                    'confidence_accuracy': confidence_accuracy.numpy(),
+                                    'step': global_step
+                                })
+                                
+                                print(f"  Step {global_step}: Loss={total_loss.numpy():.6f}, "
+                                      f"Alloc={allocation_loss.numpy():.6f}, "
+                                      f"Conf={confidence_loss.numpy():.6f}, "
+                                      f"KL={kl_loss.numpy():.6f}, "
+                                      f"AllocAcc={allocation_accuracy.numpy():.4f}, "
+                                      f"ConfAcc={confidence_accuracy.numpy():.4f}")
+                        
+                        except Exception as e:
+                            print(f"\n  Error during training at step {global_step}: {e}")
+                            print("  Rolling back to previous state...")
+                            for w, backup in zip(model.trainable_weights, backup_weights):
+                                w.assign(backup)
+                            nan_detected = True
+                            break
+                    
+                    if nan_detected:
+                        print(f"  Skipping to next chunk due to NaN/error")
                         break
                     
-                    epoch_loss += total_loss.numpy()
-                    global_step += 1
-                    
-                    if global_step % LOG_INTERVAL == 0:
-                        wandb.log({
-                            'loss': total_loss.numpy(),
-                            'allocation_loss': allocation_loss.numpy(),
-                            'confidence_loss': confidence_loss.numpy(),
-                            'kl_loss': kl_loss.numpy(),
-                            'step': global_step
-                        })
+                    if num_batches > 0:
+                        avg_loss = epoch_loss / num_batches
+                        print(f"  Chunk {chunk_num} Epoch {chunk_epoch + 1}/{EPOCHS_PER_CHUNK}: Avg loss={avg_loss:.6f}")
                         
-                        print(f"Step {global_step}: Loss={total_loss.numpy():.6f}, "
-                              f"Alloc={allocation_loss.numpy():.6f}, "
-                              f"Conf={confidence_loss.numpy():.6f}, "
-                              f"KL={kl_loss.numpy():.6f}")
-                
-                except Exception as e:
-                    print(f"\nError during training at step {global_step}: {e}")
-                    print("Rolling back to previous state...")
-                    for w, backup in zip(model.trainable_weights, backup_weights):
-                        w.assign(backup)
-                    nan_detected = True
-                    break
-            
-            if nan_detected:
-                print(f"Skipping to next file due to NaN/error")
-                continue
-            
-            if num_batches > 0:
-                avg_loss = epoch_loss / num_batches
-                print(f"Average loss for {filename}: {avg_loss:.6f}")
-                
-                if avg_loss < best_loss:
-                    best_loss = avg_loss
-                    save_model_and_config(model, sequence_length, features_per_timestep, 
-                                        num_assets, BEST_MODEL_PATH, CONFIG_PATH)
-                    print(f"New best model saved! Loss: {best_loss:.6f}")
-                    wandb.log({'best_loss': best_loss, 'step': global_step})
+                        if avg_loss < best_loss:
+                            best_loss = avg_loss
+                            save_model_and_config(model, sequence_length, features_per_timestep, 
+                                                num_assets, BEST_MODEL_PATH, CONFIG_PATH)
+                            print(f"    New best model saved! Loss: {best_loss:.6f}")
+                            wandb.log({'best_loss': best_loss, 'step': global_step})
     
     wandb.finish()
     print("\nTraining completed!")
