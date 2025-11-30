@@ -1,5 +1,3 @@
-# TODO: Use mixed precision training for speedup and memory savings
-
 import tensorflow as tf
 from tensorflow import keras
 from tensorflow.keras import layers
@@ -8,6 +6,7 @@ import pickle
 import os
 import wandb
 import json
+from wandb.integration.keras import WandbMetricsLogger
 
 D_MODEL = 512
 NHEAD = 8
@@ -16,12 +15,11 @@ DIM_FEEDFORWARD = 512
 DROPOUT = 0.1
 LEARNING_RATE = 0.0001
 BATCH_SIZE = 32
-SAMPLES_PER_FILE = 2048
+SAMPLES_PER_FILE = 4096
 BEST_MODEL_PATH = "models/best_pretrain_transformer.weights.h5"
 CONFIG_PATH = "models/model_config.json"
 NORM_STATS_PATH = "models/normalization_stats.json"
 DATA_FOLDER = "syntheticData"
-LOG_INTERVAL = 1
 WANDB_PROJECT = "portfolio-pretrain"
 EPOCHS_PER_CHUNK = 5
 
@@ -83,8 +81,6 @@ def get_data_specs_from_file(filepath):
     num_assets = len(sample['action'])
     
     if len(obs_shape) == 1:
-        print(f"Warning: Flat observation shape detected {obs_shape}")
-        print("Model expects transformer shape (sequence_length, features_per_timestep)")
         raise ValueError("Data must be in TRANSFORMER_SHAPE format")
     
     sequence_length = obs_shape[0]
@@ -110,8 +106,13 @@ def scan_data_folder(data_folder):
 
 
 class TransformerEncoderBlock(layers.Layer):
-    def __init__(self, d_model, num_heads, dim_feedforward, dropout_rate):
-        super(TransformerEncoderBlock, self).__init__()
+    def __init__(self, d_model, num_heads, dim_feedforward, dropout_rate, **kwargs):
+        super(TransformerEncoderBlock, self).__init__(**kwargs)
+        self.d_model = d_model
+        self.num_heads = num_heads
+        self.dim_feedforward = dim_feedforward
+        self.dropout_rate = dropout_rate
+        
         self.mha = layers.MultiHeadAttention(num_heads=num_heads, key_dim=d_model)
         self.ffn = keras.Sequential([
             layers.Dense(dim_feedforward, activation='relu'),
@@ -133,64 +134,48 @@ class TransformerEncoderBlock(layers.Layer):
         out2 = self.layernorm2(out1 + ffn_output)
         
         return out2
+    
+    def get_config(self):
+        config = super().get_config()
+        config.update({
+            'd_model': self.d_model,
+            'num_heads': self.num_heads,
+            'dim_feedforward': self.dim_feedforward,
+            'dropout_rate': self.dropout_rate
+        })
+        return config
 
 
-class PortfolioTransformer(keras.Model):
-    def __init__(self, sequence_length, features_per_timestep, d_model=D_MODEL, 
-                 num_heads=NHEAD, num_layers=NUM_ENCODER_LAYERS, 
-                 dim_feedforward=DIM_FEEDFORWARD, dropout_rate=DROPOUT, num_assets=11):
-        super(PortfolioTransformer, self).__init__()
-        
-        self.d_model = d_model
-        self.num_assets = num_assets
-        self.sequence_length = sequence_length
-        self.features_per_timestep = features_per_timestep
-        
-        self.input_projection = layers.Dense(d_model)
-        
-        self.pos_encoding = self.add_weight(
-            name='pos_encoding',
-            shape=(1, sequence_length, d_model),
-            initializer='random_normal',
-            trainable=True
-        )
-        
-        self.encoder_layers = [
-            TransformerEncoderBlock(d_model, num_heads, dim_feedforward, dropout_rate)
-            for _ in range(num_layers)
-        ]
-        
-        self.global_pool = layers.GlobalAveragePooling1D()
-        
-        self.allocation_head = keras.Sequential([
-            layers.Dense(dim_feedforward // 2, activation='relu'),
-            layers.Dropout(dropout_rate),
-            layers.Dense(num_assets),
-            layers.Softmax()
-        ])
-        
-        self.confidence_head = keras.Sequential([
-            layers.Dense(dim_feedforward // 2, activation='relu'),
-            layers.Dropout(dropout_rate),
-            layers.Dense(num_assets, activation='sigmoid')
-        ])
+def build_model(sequence_length, features_per_timestep, num_assets, d_model=D_MODEL, 
+                num_heads=NHEAD, num_layers=NUM_ENCODER_LAYERS, 
+                dim_feedforward=DIM_FEEDFORWARD, dropout_rate=DROPOUT):
     
-    def call(self, x, training=False):
-        x = self.input_projection(x)
-        x = x + self.pos_encoding
-        
-        for encoder_layer in self.encoder_layers:
-            x = encoder_layer(x, training=training)
-        
-        pooled = self.global_pool(x)
-        
-        allocation = self.allocation_head(pooled)
-        confidence = self.confidence_head(pooled)
-        
-        return allocation, confidence
+    inputs = layers.Input(shape=(sequence_length, features_per_timestep))
     
-    def count_parameters(self):
-        return sum([tf.size(w).numpy() for w in self.trainable_weights])
+    x = layers.Dense(d_model)(inputs)
+    
+    pos_encoding = tf.Variable(
+        tf.random.normal([1, sequence_length, d_model], stddev=0.02),
+        trainable=True, name='pos_encoding'
+    )
+    x = x + pos_encoding
+    
+    for i in range(num_layers):
+        x = TransformerEncoderBlock(d_model, num_heads, dim_feedforward, dropout_rate, name=f'encoder_{i}')(x)
+    
+    x = layers.GlobalAveragePooling1D()(x)
+    
+    alloc_hidden = layers.Dense(dim_feedforward // 2, activation='relu')(x)
+    alloc_hidden = layers.Dropout(dropout_rate)(alloc_hidden)
+    allocation_output = layers.Dense(num_assets, activation='softmax', name='allocation')(alloc_hidden)
+    
+    conf_hidden = layers.Dense(dim_feedforward // 2, activation='relu')(x)
+    conf_hidden = layers.Dropout(dropout_rate)(conf_hidden)
+    confidence_output = layers.Dense(num_assets, activation='sigmoid', name='confidence')(conf_hidden)
+    
+    model = keras.Model(inputs=inputs, outputs=[allocation_output, confidence_output])
+    
+    return model
 
 
 def load_samples_from_file(filepath, offset=0, max_samples=None):
@@ -212,7 +197,7 @@ def load_samples_from_file(filepath, offset=0, max_samples=None):
     return samples
 
 
-def create_batch(samples):
+def prepare_data(samples, normalizer):
     obs_list = []
     action_list = []
     confidence_list = []
@@ -226,65 +211,57 @@ def create_batch(samples):
     action_batch = np.array(action_list, dtype=np.float32)
     confidence_batch = np.array(confidence_list, dtype=np.float32)
     
-    assert len(obs_batch.shape) == 3, f"obs_batch should be 3D (batch, seq, features), got shape {obs_batch.shape}"
-    assert len(action_batch.shape) == 2, f"action_batch should be 2D (batch, num_assets), got shape {action_batch.shape}"
-    assert len(confidence_batch.shape) == 2, f"confidence_batch should be 2D (batch, num_assets), got shape {confidence_batch.shape}"
+    normalizer.update(obs_batch)
+    obs_batch_norm = normalizer.normalize(obs_batch).astype(np.float32)
     
-    return obs_batch, action_batch, confidence_batch
+    return obs_batch_norm, action_batch, confidence_batch
 
 
-def compute_loss(model, obs_batch, action_batch, confidence_batch, training=True):
-    pred_allocation, pred_confidence = model(obs_batch, training=training)
+class TopKAccuracy(keras.metrics.Metric):
+    def __init__(self, k=3, name='top_k_accuracy', **kwargs):
+        super().__init__(name=name, **kwargs)
+        self.k = k
+        self.total = self.add_weight(name='total', initializer='zeros')
+        self.count = self.add_weight(name='count', initializer='zeros')
     
-    assert pred_allocation.shape == action_batch.shape, f"pred_allocation shape {pred_allocation.shape} != action_batch shape {action_batch.shape}"
-    assert pred_confidence.shape == confidence_batch.shape, f"pred_confidence shape {pred_confidence.shape} != confidence_batch shape {confidence_batch.shape}"
+    def update_state(self, y_true, y_pred, sample_weight=None):
+        true_top = tf.argsort(y_true, axis=-1, direction='DESCENDING')[:, :self.k]
+        pred_top = tf.argsort(y_pred, axis=-1, direction='DESCENDING')[:, :self.k]
+        
+        matches = tf.reduce_sum(tf.cast(
+            tf.equal(tf.expand_dims(pred_top, 2), tf.expand_dims(true_top, 1)), tf.float32
+        ), axis=[1, 2])
+        accuracy = matches / tf.cast(self.k, tf.float32)
+        
+        self.total.assign_add(tf.reduce_sum(accuracy))
+        self.count.assign_add(tf.cast(tf.shape(y_true)[0], tf.float32))
     
-    allocation_loss = tf.reduce_mean(tf.square(pred_allocation - action_batch))
+    def result(self):
+        return self.total / (self.count + 1e-7)
     
-    confidence_loss = tf.reduce_mean(tf.square(pred_confidence - confidence_batch))
+    def reset_state(self):
+        self.total.assign(0.)
+        self.count.assign(0.)
+
+
+def allocation_loss(y_true, y_pred):
+    mse = tf.reduce_mean(tf.square(y_pred - y_true))
     
     epsilon = 1e-7
-    pred_allocation_safe = tf.clip_by_value(pred_allocation, epsilon, 1.0 - epsilon)
-    action_batch_safe = tf.clip_by_value(action_batch, epsilon, 1.0 - epsilon)
-    
-    ce_loss = -tf.reduce_mean(tf.reduce_sum(action_batch_safe * tf.math.log(pred_allocation_safe), axis=1))
+    y_pred_safe = tf.clip_by_value(y_pred, epsilon, 1.0 - epsilon)
+    y_true_safe = tf.clip_by_value(y_true, epsilon, 1.0 - epsilon)
+    ce = -tf.reduce_mean(tf.reduce_sum(y_true_safe * tf.math.log(y_pred_safe), axis=1))
     
     top_k = 3
-    _, target_top_indices = tf.nn.top_k(action_batch, k=top_k)
-    pred_at_target_tops = tf.gather(pred_allocation, target_top_indices, batch_dims=1)
-    target_at_target_tops = tf.gather(action_batch, target_top_indices, batch_dims=1)
-    top_k_loss = tf.reduce_mean(tf.square(pred_at_target_tops - target_at_target_tops))
+    _, target_top_indices = tf.nn.top_k(y_true, k=top_k)
+    pred_at_tops = tf.gather(y_pred, target_top_indices, batch_dims=1)
+    true_at_tops = tf.gather(y_true, target_top_indices, batch_dims=1)
+    top_k_loss = tf.reduce_mean(tf.square(pred_at_tops - true_at_tops))
     
-    total_loss = allocation_loss + 0.5 * confidence_loss + 0.3 * ce_loss + 0.5 * top_k_loss
-    
-    pred_allocation_argmax = tf.argmax(pred_allocation, axis=1)
-    action_batch_argmax = tf.argmax(action_batch, axis=1)
-    allocation_accuracy = tf.reduce_mean(tf.cast(tf.equal(pred_allocation_argmax, action_batch_argmax), tf.float32))
-    
-    pred_confidence_argmax = tf.argmax(pred_confidence, axis=1)
-    confidence_batch_argmax = tf.argmax(confidence_batch, axis=1)
-    confidence_accuracy = tf.reduce_mean(tf.cast(tf.equal(pred_confidence_argmax, confidence_batch_argmax), tf.float32))
-    
-    return total_loss, allocation_loss, confidence_loss, ce_loss, top_k_loss, allocation_accuracy, confidence_accuracy
+    return mse + 0.3 * ce + 0.5 * top_k_loss
 
 
-@tf.function
-def train_step(model, optimizer, obs_batch, action_batch, confidence_batch):
-    with tf.GradientTape() as tape:
-        total_loss, allocation_loss, confidence_loss, ce_loss, top_k_loss, allocation_accuracy, confidence_accuracy = compute_loss(
-            model, obs_batch, action_batch, confidence_batch, training=True
-        )
-    
-    gradients = tape.gradient(total_loss, model.trainable_weights)
-    gradients, _ = tf.clip_by_global_norm(gradients, 1.0)
-    optimizer.apply_gradients(zip(gradients, model.trainable_weights))
-    
-    return total_loss, allocation_loss, confidence_loss, ce_loss, top_k_loss, allocation_accuracy, confidence_accuracy
-
-
-def save_model_and_config(model, sequence_length, features_per_timestep, num_assets, filepath, config_path):
-    model.save_weights(filepath)
-    
+def save_model_config(sequence_length, features_per_timestep, num_assets, config_path):
     config = {
         'sequence_length': int(sequence_length),
         'features_per_timestep': int(features_per_timestep),
@@ -295,32 +272,8 @@ def save_model_and_config(model, sequence_length, features_per_timestep, num_ass
         'dim_feedforward': DIM_FEEDFORWARD,
         'dropout_rate': DROPOUT
     }
-    
     with open(config_path, 'w') as f:
         json.dump(config, f, indent=2)
-
-
-def load_model_from_config(config_path, weights_path):
-    with open(config_path, 'r') as f:
-        config = json.load(f)
-    
-    model = PortfolioTransformer(
-        sequence_length=config['sequence_length'],
-        features_per_timestep=config['features_per_timestep'],
-        d_model=config['d_model'],
-        num_heads=config['num_heads'],
-        num_layers=config['num_layers'],
-        dim_feedforward=config['dim_feedforward'],
-        dropout_rate=config['dropout_rate'],
-        num_assets=config['num_assets']
-    )
-    
-    dummy_input = tf.random.normal((1, config['sequence_length'], config['features_per_timestep']))
-    _ = model(dummy_input, training=False)
-    
-    model.load_weights(weights_path)
-    
-    return model, config
 
 
 def train():
@@ -335,7 +288,7 @@ def train():
     print(f"\nScanning data folder: {DATA_FOLDER}")
     sequence_length, features_per_timestep, num_assets, data_files = scan_data_folder(DATA_FOLDER)
     
-    config = {
+    wandb.init(project=WANDB_PROJECT, config={
         'sequence_length': sequence_length,
         'features_per_timestep': features_per_timestep,
         'd_model': D_MODEL,
@@ -347,79 +300,72 @@ def train():
         'batch_size': BATCH_SIZE,
         'num_assets': num_assets,
         'samples_per_file': SAMPLES_PER_FILE,
-        'epochs_per_chunk': EPOCHS_PER_CHUNK,
-        'log_interval': LOG_INTERVAL
-    }
+        'epochs_per_chunk': EPOCHS_PER_CHUNK
+    })
     
-    wandb.init(project=WANDB_PROJECT, config=config)
+    model = build_model(sequence_length, features_per_timestep, num_assets)
     
-    if os.path.exists(CONFIG_PATH) and os.path.exists(BEST_MODEL_PATH):
-        print(f"\nLoading best model from {BEST_MODEL_PATH}")
-        model, loaded_config = load_model_from_config(CONFIG_PATH, BEST_MODEL_PATH)
-        
-        if (loaded_config['sequence_length'] != sequence_length or 
-            loaded_config['features_per_timestep'] != features_per_timestep or
-            loaded_config['num_assets'] != num_assets):
-            print("WARNING: Data specs changed! Creating new model...")
-            model = PortfolioTransformer(
-                sequence_length=sequence_length,
-                features_per_timestep=features_per_timestep,
-                d_model=D_MODEL,
-                num_heads=NHEAD,
-                num_layers=NUM_ENCODER_LAYERS,
-                dim_feedforward=DIM_FEEDFORWARD,
-                dropout_rate=DROPOUT,
-                num_assets=num_assets
-            )
-        else:
-            print("Model loaded successfully!")
-    else:
-        print("\nCreating new model...")
-        model = PortfolioTransformer(
-            sequence_length=sequence_length,
-            features_per_timestep=features_per_timestep,
-            d_model=D_MODEL,
-            num_heads=NHEAD,
-            num_layers=NUM_ENCODER_LAYERS,
-            dim_feedforward=DIM_FEEDFORWARD,
-            dropout_rate=DROPOUT,
-            num_assets=num_assets
-        )
-    
-    dummy_input = tf.random.normal((1, sequence_length, features_per_timestep))
-    _ = model(dummy_input, training=False)
+    if os.path.exists(BEST_MODEL_PATH):
+        print(f"\nLoading weights from {BEST_MODEL_PATH}")
+        try:
+            model.load_weights(BEST_MODEL_PATH)
+            print("Weights loaded successfully!")
+        except Exception as e:
+            print(f"Could not load weights: {e}")
     
     model.summary()
-
-    num_params = model.count_parameters()
-    model_size_mb = num_params * 4 / (1024 * 1024)
     
-    print(f"Model parameters: {num_params:,}")
-    print(f"Model size: {model_size_mb:.2f} MB (assuming float32)")
+    optimizer = keras.optimizers.AdamW(learning_rate=LEARNING_RATE, weight_decay=0.01)
     
-    wandb.config.update({
-        'num_parameters': num_params,
-        'model_size_mb': model_size_mb
-    })
+    model.compile(
+        optimizer=optimizer,
+        loss={
+            'allocation': allocation_loss,
+            'confidence': 'mse'
+        },
+        loss_weights={
+            'allocation': 1.0,
+            'confidence': 0.5
+        },
+        metrics={
+            'allocation': ['mae', TopKAccuracy(k=1, name='top1_acc'), TopKAccuracy(k=3, name='top3_acc')],
+            'confidence': ['mae']
+        }
+    )
     
     normalizer = ObservationNormalizer(features_per_timestep)
     if normalizer.load(NORM_STATS_PATH):
-        print(f"Loaded normalization stats from {NORM_STATS_PATH} (count: {normalizer.count})")
+        print(f"Loaded normalization stats (count: {normalizer.count})")
     else:
         print("Starting with fresh normalization statistics")
     
-    optimizer = tf.keras.optimizers.AdamW(learning_rate=LEARNING_RATE, weight_decay=0.01)
-    
     os.makedirs("models", exist_ok=True)
     
-    best_loss = float('inf')
-    best_allocation_accuracy = 0.0
-    best_confidence_accuracy = 0.0
+    callbacks = [
+        keras.callbacks.ModelCheckpoint(
+            BEST_MODEL_PATH,
+            monitor='loss',
+            save_best_only=True,
+            save_weights_only=True,
+            verbose=1
+        ),
+        keras.callbacks.ReduceLROnPlateau(
+            monitor='loss',
+            factor=0.5,
+            patience=3,
+            min_lr=1e-6,
+            verbose=1
+        ),
+        keras.callbacks.EarlyStopping(
+            monitor='loss',
+            patience=10,
+            restore_best_weights=True,
+            verbose=1
+        ),
+        WandbMetricsLogger()
+    ]
     
-    print(f"Found {len(data_files)} data files")
-    
-    global_step = 0
-    first_batch_logged = False
+    print(f"\nFound {len(data_files)} data files")
     
     for epoch in range(1000):
         print(f"\n{'='*60}")
@@ -440,112 +386,25 @@ def train():
                 
                 chunk_num += 1
                 chunk_offset += len(samples)
-                print(f"  Chunk {chunk_num}: Loaded {len(samples)} samples (offset: {chunk_offset - len(samples)})")
+                print(f"  Chunk {chunk_num}: {len(samples)} samples")
                 
-                for chunk_epoch in range(EPOCHS_PER_CHUNK):
-                    backup_weights = [w.numpy() for w in model.trainable_weights]
-                    
-                    num_batches = len(samples) // BATCH_SIZE
-                    epoch_loss = 0.0
-                    epoch_alloc_acc = 0.0
-                    epoch_conf_acc = 0.0
-                    nan_detected = False
-                    
-                    for batch_idx in range(num_batches):
-                        batch_samples = samples[batch_idx * BATCH_SIZE:(batch_idx + 1) * BATCH_SIZE]
-                        
-                        try:
-                            obs_batch, action_batch, confidence_batch = create_batch(batch_samples)
-                            
-                            normalizer.update(obs_batch)
-                            obs_batch_norm = normalizer.normalize(obs_batch).astype(np.float32)
-                            
-                            if not first_batch_logged:
-                                print(f"\n  First batch shapes:")
-                                print(f"    obs_batch: {obs_batch.shape}")
-                                print(f"    action_batch: {action_batch.shape}")
-                                print(f"    confidence_batch: {confidence_batch.shape}")
-                                print(f"    obs_batch raw stats: min={obs_batch.min():.4f}, max={obs_batch.max():.4f}, mean={obs_batch.mean():.4f}")
-                                print(f"    obs_batch norm stats: min={obs_batch_norm.min():.4f}, max={obs_batch_norm.max():.4f}, mean={obs_batch_norm.mean():.4f}")
-                                first_batch_logged = True
-                            
-                            total_loss, allocation_loss, confidence_loss, ce_loss, top_k_loss, allocation_accuracy, confidence_accuracy = train_step(
-                                model, optimizer, obs_batch_norm, action_batch, confidence_batch
-                            )
-                            
-                            if tf.math.is_nan(total_loss) or tf.math.is_inf(total_loss):
-                                print(f"\n    NaN/Inf detected in loss at step {global_step}!")
-                                print("    Rolling back to previous state...")
-                                for w, backup in zip(model.trainable_weights, backup_weights):
-                                    w.assign(backup)
-                                nan_detected = True
-                                break
-                            
-                            epoch_loss += total_loss.numpy()
-                            epoch_alloc_acc += allocation_accuracy.numpy()
-                            epoch_conf_acc += confidence_accuracy.numpy()
-                            global_step += 1
-                            
-                            if global_step % LOG_INTERVAL == 0:
-                                wandb.log({
-                                    'loss': total_loss.numpy(),
-                                    'allocation_loss': allocation_loss.numpy(),
-                                    'confidence_loss': confidence_loss.numpy(),
-                                    'ce_loss': ce_loss.numpy(),
-                                    'top_k_loss': top_k_loss.numpy(),
-                                    'allocation_accuracy': allocation_accuracy.numpy(),
-                                    'confidence_accuracy': confidence_accuracy.numpy(),
-                                    'step': global_step
-                                })
-                                
-                                print(f"  Step {global_step}: Loss={total_loss.numpy():.6f}, "
-                                      f"Alloc={allocation_loss.numpy():.6f}, "
-                                      f"Conf={confidence_loss.numpy():.6f}, "
-                                      f"CE={ce_loss.numpy():.6f}, "
-                                      f"TopK={top_k_loss.numpy():.6f}, "
-                                      f"AllocAcc={allocation_accuracy.numpy():.4f}, "
-                                      f"ConfAcc={confidence_accuracy.numpy():.4f}")
-                        
-                        except Exception as e:
-                            print(f"\n  Error during training at step {global_step}: {e}")
-                            print("  Rolling back to previous state...")
-                            for w, backup in zip(model.trainable_weights, backup_weights):
-                                w.assign(backup)
-                            nan_detected = True
-                            break
-                    
-                    if nan_detected:
-                        print(f"  Skipping to next chunk due to NaN/error")
-                        break
-                    
-                    if num_batches > 0:
-                        avg_loss = epoch_loss / num_batches
-                        avg_alloc_acc = epoch_alloc_acc / num_batches
-                        avg_conf_acc = epoch_conf_acc / num_batches
-                        print(f"  Chunk {chunk_num} Epoch {chunk_epoch + 1}/{EPOCHS_PER_CHUNK}: Avg loss={avg_loss:.6f}, AllocAcc={avg_alloc_acc:.4f}, ConfAcc={avg_conf_acc:.4f}")
-                        
-                        model_improved = False
-                        
-                        if avg_loss < best_loss:
-                            best_loss = avg_loss
-                            model_improved = True
-                        
-                        if avg_alloc_acc > best_allocation_accuracy:
-                            best_allocation_accuracy = avg_alloc_acc
-                            model_improved = True
-                        
-                        if avg_conf_acc > best_confidence_accuracy:
-                            best_confidence_accuracy = avg_conf_acc
-                            model_improved = True
-                        
-                        if model_improved:
-                            save_model_and_config(model, sequence_length, features_per_timestep, 
-                                                num_assets, BEST_MODEL_PATH, CONFIG_PATH)
-                            normalizer.save(NORM_STATS_PATH)
-                            print(f"    New best model saved! Loss: {best_loss:.6f}, AllocAcc: {best_allocation_accuracy:.4f}, ConfAcc: {best_confidence_accuracy:.4f}")
-                            wandb.log({'best_loss': best_loss, 'best_allocation_accuracy': best_allocation_accuracy, 'best_confidence_accuracy': best_confidence_accuracy, 'step': global_step})
+                X, y_alloc, y_conf = prepare_data(samples, normalizer)
+                
+                if chunk_num == 1 and file_idx == 0 and epoch == 0:
+                    print(f"    X shape: {X.shape}, stats: min={X.min():.2f}, max={X.max():.2f}, mean={X.mean():.2f}")
+                
+                model.fit(
+                    X,
+                    {'allocation': y_alloc, 'confidence': y_conf},
+                    batch_size=BATCH_SIZE,
+                    epochs=EPOCHS_PER_CHUNK,
+                    callbacks=callbacks,
+                    verbose=1
+                )
+                
+                normalizer.save(NORM_STATS_PATH)
+                save_model_config(sequence_length, features_per_timestep, num_assets, CONFIG_PATH)
     
-    normalizer.save(NORM_STATS_PATH)
     wandb.finish()
     print("\nTraining completed!")
 
