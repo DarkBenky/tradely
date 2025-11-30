@@ -9,20 +9,70 @@ import os
 import wandb
 import json
 
-D_MODEL = 256
+D_MODEL = 512
 NHEAD = 8
-NUM_ENCODER_LAYERS = 2
-DIM_FEEDFORWARD = 256
+NUM_ENCODER_LAYERS = 5
+DIM_FEEDFORWARD = 512
 DROPOUT = 0.1
 LEARNING_RATE = 0.0001
 BATCH_SIZE = 32
 SAMPLES_PER_FILE = 2048
 BEST_MODEL_PATH = "models/best_pretrain_transformer.weights.h5"
 CONFIG_PATH = "models/model_config.json"
+NORM_STATS_PATH = "models/normalization_stats.json"
 DATA_FOLDER = "syntheticData"
-LOG_INTERVAL = 10
+LOG_INTERVAL = 1
 WANDB_PROJECT = "portfolio-pretrain"
 EPOCHS_PER_CHUNK = 5
+
+
+class ObservationNormalizer:
+    def __init__(self, features_per_timestep):
+        self.features_per_timestep = features_per_timestep
+        self.mean = np.zeros(features_per_timestep, dtype=np.float64)
+        self.var = np.ones(features_per_timestep, dtype=np.float64)
+        self.count = 0
+        self.epsilon = 1e-8
+    
+    def update(self, obs_batch):
+        batch_mean = np.mean(obs_batch, axis=(0, 1))
+        batch_var = np.var(obs_batch, axis=(0, 1))
+        batch_count = obs_batch.shape[0] * obs_batch.shape[1]
+        
+        delta = batch_mean - self.mean
+        total_count = self.count + batch_count
+        
+        self.mean = self.mean + delta * batch_count / total_count
+        
+        m_a = self.var * self.count
+        m_b = batch_var * batch_count
+        M2 = m_a + m_b + delta**2 * self.count * batch_count / total_count
+        self.var = M2 / total_count
+        
+        self.count = total_count
+    
+    def normalize(self, obs_batch):
+        std = np.sqrt(self.var + self.epsilon)
+        return (obs_batch - self.mean) / std
+    
+    def save(self, filepath):
+        stats = {
+            'mean': self.mean.tolist(),
+            'var': self.var.tolist(),
+            'count': int(self.count)
+        }
+        with open(filepath, 'w') as f:
+            json.dump(stats, f)
+    
+    def load(self, filepath):
+        if os.path.exists(filepath):
+            with open(filepath, 'r') as f:
+                stats = json.load(f)
+            self.mean = np.array(stats['mean'], dtype=np.float64)
+            self.var = np.array(stats['var'], dtype=np.float64)
+            self.count = stats['count']
+            return True
+        return False
 
 
 def get_data_specs_from_file(filepath):
@@ -176,40 +226,52 @@ def create_batch(samples):
     action_batch = np.array(action_list, dtype=np.float32)
     confidence_batch = np.array(confidence_list, dtype=np.float32)
     
+    assert len(obs_batch.shape) == 3, f"obs_batch should be 3D (batch, seq, features), got shape {obs_batch.shape}"
+    assert len(action_batch.shape) == 2, f"action_batch should be 2D (batch, num_assets), got shape {action_batch.shape}"
+    assert len(confidence_batch.shape) == 2, f"confidence_batch should be 2D (batch, num_assets), got shape {confidence_batch.shape}"
+    
     return obs_batch, action_batch, confidence_batch
 
 
 def compute_loss(model, obs_batch, action_batch, confidence_batch, training=True):
     pred_allocation, pred_confidence = model(obs_batch, training=training)
     
+    assert pred_allocation.shape == action_batch.shape, f"pred_allocation shape {pred_allocation.shape} != action_batch shape {action_batch.shape}"
+    assert pred_confidence.shape == confidence_batch.shape, f"pred_confidence shape {pred_confidence.shape} != confidence_batch shape {confidence_batch.shape}"
+    
     allocation_loss = tf.reduce_mean(tf.square(pred_allocation - action_batch))
     
     confidence_loss = tf.reduce_mean(tf.square(pred_confidence - confidence_batch))
     
     epsilon = 1e-7
-    action_batch_safe = tf.clip_by_value(action_batch, epsilon, 1.0)
-    pred_allocation_safe = tf.clip_by_value(pred_allocation, epsilon, 1.0)
-    kl_loss = tf.reduce_mean(
-        tf.reduce_sum(action_batch_safe * (tf.math.log(action_batch_safe) - tf.math.log(pred_allocation_safe)), axis=1)
-    )
+    pred_allocation_safe = tf.clip_by_value(pred_allocation, epsilon, 1.0 - epsilon)
+    action_batch_safe = tf.clip_by_value(action_batch, epsilon, 1.0 - epsilon)
     
-    total_loss = allocation_loss + 0.5 * confidence_loss + 0.3 * kl_loss
+    ce_loss = -tf.reduce_mean(tf.reduce_sum(action_batch_safe * tf.math.log(pred_allocation_safe), axis=1))
+    
+    top_k = 3
+    _, target_top_indices = tf.nn.top_k(action_batch, k=top_k)
+    pred_at_target_tops = tf.gather(pred_allocation, target_top_indices, batch_dims=1)
+    target_at_target_tops = tf.gather(action_batch, target_top_indices, batch_dims=1)
+    top_k_loss = tf.reduce_mean(tf.square(pred_at_target_tops - target_at_target_tops))
+    
+    total_loss = allocation_loss + 0.5 * confidence_loss + 0.3 * ce_loss + 0.5 * top_k_loss
     
     pred_allocation_argmax = tf.argmax(pred_allocation, axis=1)
     action_batch_argmax = tf.argmax(action_batch, axis=1)
     allocation_accuracy = tf.reduce_mean(tf.cast(tf.equal(pred_allocation_argmax, action_batch_argmax), tf.float32))
     
-    confidence_threshold = 0.5
-    pred_confidence_binary = tf.cast(pred_confidence > confidence_threshold, tf.float32)
-    confidence_accuracy = tf.reduce_mean(tf.cast(tf.equal(pred_confidence_binary, confidence_batch), tf.float32))
+    pred_confidence_argmax = tf.argmax(pred_confidence, axis=1)
+    confidence_batch_argmax = tf.argmax(confidence_batch, axis=1)
+    confidence_accuracy = tf.reduce_mean(tf.cast(tf.equal(pred_confidence_argmax, confidence_batch_argmax), tf.float32))
     
-    return total_loss, allocation_loss, confidence_loss, kl_loss, allocation_accuracy, confidence_accuracy
+    return total_loss, allocation_loss, confidence_loss, ce_loss, top_k_loss, allocation_accuracy, confidence_accuracy
 
 
 @tf.function
 def train_step(model, optimizer, obs_batch, action_batch, confidence_batch):
     with tf.GradientTape() as tape:
-        total_loss, allocation_loss, confidence_loss, kl_loss, allocation_accuracy, confidence_accuracy = compute_loss(
+        total_loss, allocation_loss, confidence_loss, ce_loss, top_k_loss, allocation_accuracy, confidence_accuracy = compute_loss(
             model, obs_batch, action_batch, confidence_batch, training=True
         )
     
@@ -217,7 +279,7 @@ def train_step(model, optimizer, obs_batch, action_batch, confidence_batch):
     gradients, _ = tf.clip_by_global_norm(gradients, 1.0)
     optimizer.apply_gradients(zip(gradients, model.trainable_weights))
     
-    return total_loss, allocation_loss, confidence_loss, kl_loss, allocation_accuracy, confidence_accuracy
+    return total_loss, allocation_loss, confidence_loss, ce_loss, top_k_loss, allocation_accuracy, confidence_accuracy
 
 
 def save_model_and_config(model, sequence_length, features_per_timestep, num_assets, filepath, config_path):
@@ -340,15 +402,24 @@ def train():
         'model_size_mb': model_size_mb
     })
     
+    normalizer = ObservationNormalizer(features_per_timestep)
+    if normalizer.load(NORM_STATS_PATH):
+        print(f"Loaded normalization stats from {NORM_STATS_PATH} (count: {normalizer.count})")
+    else:
+        print("Starting with fresh normalization statistics")
+    
     optimizer = tf.keras.optimizers.AdamW(learning_rate=LEARNING_RATE, weight_decay=0.01)
     
     os.makedirs("models", exist_ok=True)
     
     best_loss = float('inf')
+    best_allocation_accuracy = 0.0
+    best_confidence_accuracy = 0.0
     
     print(f"Found {len(data_files)} data files")
     
     global_step = 0
+    first_batch_logged = False
     
     for epoch in range(1000):
         print(f"\n{'='*60}")
@@ -376,6 +447,8 @@ def train():
                     
                     num_batches = len(samples) // BATCH_SIZE
                     epoch_loss = 0.0
+                    epoch_alloc_acc = 0.0
+                    epoch_conf_acc = 0.0
                     nan_detected = False
                     
                     for batch_idx in range(num_batches):
@@ -384,8 +457,20 @@ def train():
                         try:
                             obs_batch, action_batch, confidence_batch = create_batch(batch_samples)
                             
-                            total_loss, allocation_loss, confidence_loss, kl_loss, allocation_accuracy, confidence_accuracy = train_step(
-                                model, optimizer, obs_batch, action_batch, confidence_batch
+                            normalizer.update(obs_batch)
+                            obs_batch_norm = normalizer.normalize(obs_batch).astype(np.float32)
+                            
+                            if not first_batch_logged:
+                                print(f"\n  First batch shapes:")
+                                print(f"    obs_batch: {obs_batch.shape}")
+                                print(f"    action_batch: {action_batch.shape}")
+                                print(f"    confidence_batch: {confidence_batch.shape}")
+                                print(f"    obs_batch raw stats: min={obs_batch.min():.4f}, max={obs_batch.max():.4f}, mean={obs_batch.mean():.4f}")
+                                print(f"    obs_batch norm stats: min={obs_batch_norm.min():.4f}, max={obs_batch_norm.max():.4f}, mean={obs_batch_norm.mean():.4f}")
+                                first_batch_logged = True
+                            
+                            total_loss, allocation_loss, confidence_loss, ce_loss, top_k_loss, allocation_accuracy, confidence_accuracy = train_step(
+                                model, optimizer, obs_batch_norm, action_batch, confidence_batch
                             )
                             
                             if tf.math.is_nan(total_loss) or tf.math.is_inf(total_loss):
@@ -397,6 +482,8 @@ def train():
                                 break
                             
                             epoch_loss += total_loss.numpy()
+                            epoch_alloc_acc += allocation_accuracy.numpy()
+                            epoch_conf_acc += confidence_accuracy.numpy()
                             global_step += 1
                             
                             if global_step % LOG_INTERVAL == 0:
@@ -404,7 +491,8 @@ def train():
                                     'loss': total_loss.numpy(),
                                     'allocation_loss': allocation_loss.numpy(),
                                     'confidence_loss': confidence_loss.numpy(),
-                                    'kl_loss': kl_loss.numpy(),
+                                    'ce_loss': ce_loss.numpy(),
+                                    'top_k_loss': top_k_loss.numpy(),
                                     'allocation_accuracy': allocation_accuracy.numpy(),
                                     'confidence_accuracy': confidence_accuracy.numpy(),
                                     'step': global_step
@@ -413,7 +501,8 @@ def train():
                                 print(f"  Step {global_step}: Loss={total_loss.numpy():.6f}, "
                                       f"Alloc={allocation_loss.numpy():.6f}, "
                                       f"Conf={confidence_loss.numpy():.6f}, "
-                                      f"KL={kl_loss.numpy():.6f}, "
+                                      f"CE={ce_loss.numpy():.6f}, "
+                                      f"TopK={top_k_loss.numpy():.6f}, "
                                       f"AllocAcc={allocation_accuracy.numpy():.4f}, "
                                       f"ConfAcc={confidence_accuracy.numpy():.4f}")
                         
@@ -431,15 +520,32 @@ def train():
                     
                     if num_batches > 0:
                         avg_loss = epoch_loss / num_batches
-                        print(f"  Chunk {chunk_num} Epoch {chunk_epoch + 1}/{EPOCHS_PER_CHUNK}: Avg loss={avg_loss:.6f}")
+                        avg_alloc_acc = epoch_alloc_acc / num_batches
+                        avg_conf_acc = epoch_conf_acc / num_batches
+                        print(f"  Chunk {chunk_num} Epoch {chunk_epoch + 1}/{EPOCHS_PER_CHUNK}: Avg loss={avg_loss:.6f}, AllocAcc={avg_alloc_acc:.4f}, ConfAcc={avg_conf_acc:.4f}")
+                        
+                        model_improved = False
                         
                         if avg_loss < best_loss:
                             best_loss = avg_loss
+                            model_improved = True
+                        
+                        if avg_alloc_acc > best_allocation_accuracy:
+                            best_allocation_accuracy = avg_alloc_acc
+                            model_improved = True
+                        
+                        if avg_conf_acc > best_confidence_accuracy:
+                            best_confidence_accuracy = avg_conf_acc
+                            model_improved = True
+                        
+                        if model_improved:
                             save_model_and_config(model, sequence_length, features_per_timestep, 
                                                 num_assets, BEST_MODEL_PATH, CONFIG_PATH)
-                            print(f"    New best model saved! Loss: {best_loss:.6f}")
-                            wandb.log({'best_loss': best_loss, 'step': global_step})
+                            normalizer.save(NORM_STATS_PATH)
+                            print(f"    New best model saved! Loss: {best_loss:.6f}, AllocAcc: {best_allocation_accuracy:.4f}, ConfAcc: {best_confidence_accuracy:.4f}")
+                            wandb.log({'best_loss': best_loss, 'best_allocation_accuracy': best_allocation_accuracy, 'best_confidence_accuracy': best_confidence_accuracy, 'step': global_step})
     
+    normalizer.save(NORM_STATS_PATH)
     wandb.finish()
     print("\nTraining completed!")
 
