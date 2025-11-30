@@ -1,0 +1,17 @@
+{
+  "initial_portfolio": 10000.0,
+  "final_portfolio": 9655.18462447961,
+  "portfolio_return": -3.4481537552038937,
+  "benchmark_return": -3.3709147817023952,
+  "excess_return": -0.07723897350149844,
+  "sharpe_ratio": -1.881611064034331,
+  "max_drawdown": 6.5456199800469985,
+  "volatility": 0.21822617512474063,
+  "win_rate": 47.65625,
+  "total_steps": 256,
+  "total_reward": -337.49771800715797,
+  "avg_reward": -1.3183504609654608,
+  "reward_prediction_correlation": -0.009076794651943476,
+  "avg_predicted_reward": 36.14874267578125,
+  "avg_prediction_uncertainty": 1.4500004053115845
+}

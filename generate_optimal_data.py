@@ -10,10 +10,10 @@ import random
 import string
 
 DEBUG = False
-NUM_OF_THREADS = 8
-DEBUG_SAMPLES = 32_000 * NUM_OF_THREADS
-N_CANDIDATES = 12
-N_REFINEMENT_ITERATIONS = 12
+NUM_OF_THREADS = 2
+DEBUG_SAMPLES = 200 * NUM_OF_THREADS
+N_CANDIDATES = 5
+N_REFINEMENT_ITERATIONS = 1
 REFINEMENT_SAMPLES_PER_ITERATION = 3
 N_SAMPLES = NUM_OF_THREADS * 256_0000  # Total samples across all threads
 OUTPUT_FOLDER = "syntheticData"
@@ -250,7 +250,6 @@ def generate_optimal_dataset(n_samples=N_SAMPLES, output_file=None, debug=DEBUG,
     for i in tqdm(range(n_samples)):
         obs = env.reset()
         
-        # Add noise to observation for training robustness
         if add_noise:
             noised_obs = add_observation_noise(obs, noise_level=noise_level, noise_type=noise_type)
         else:
@@ -270,16 +269,18 @@ def generate_optimal_dataset(n_samples=N_SAMPLES, output_file=None, debug=DEBUG,
         
         _, actual_reward, _, info = env.step(optimal_action)
         
-        # Save the NOISED observation with optimal action
         save_sample_incremental(output_file, noised_obs, optimal_action, actual_reward, confidence)
         
         rewards_history.append(actual_reward)
         portfolio_values.append(info['portfolio_value'])
         
-        if debug and (i + 1) % 10 == 0:
-            thread_prefix = f"[Thread {thread_id}] " if thread_id is not None else ""
-            avg_reward = np.mean(rewards_history[-10:])
-            print(f"\n{thread_prefix}Sample {i+1}/{n_samples}: Reward={actual_reward:.2f}, Avg(10)={avg_reward:.2f}")
+        if (i + 1) % 10 == 0:
+            avg_10 = np.mean(rewards_history[-10:])
+            avg_50 = np.mean(rewards_history[-50:]) if len(rewards_history) >= 50 else np.mean(rewards_history)
+            avg_all = np.mean(rewards_history)
+            win_rate = sum(1 for r in rewards_history if r > 0) / len(rewards_history) * 100
+            print(f"\n{thread_prefix}Sample {i+1}/{n_samples}: R={actual_reward:.1f}, "
+                  f"Avg10={avg_10:.1f}, Avg50={avg_50:.1f}, AvgAll={avg_all:.1f}, WR={win_rate:.1f}%")
     
     print(f"\n{thread_prefix} Generated {n_samples} samples")
     print(f"{thread_prefix}  Saved to {output_file}")
