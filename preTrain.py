@@ -16,14 +16,16 @@ MODEL_VERSIONS = ['v1-transformer', 'v2-cnn-transformer-cnn']
 MODEL_TYPE = MODEL_VERSIONS[1]
 TEST = False
 NUM_PREDICTIONS = 8
-D_MODEL = 1024
-NHEAD = 32
-NUM_BLOCKS = 8
-CNN_FILTERS = 1024
+D_MODEL = 512
+NHEAD = 16
+NUM_BLOCKS = 12
+CNN_FILTERS = 512
 CNN_KERNEL = 5
 DROPOUT = 0.2
 LEARNING_RATE = 0.000175
 BATCH_SIZE = 2
+ACCUMULATION_STEPS = 8
+GRADIENT_CLIP_NORM = 1.0
 SAMPLES_PER_FILE = 512
 BEST_MODEL_PATH = "models/best_pretrain_transformer.weights.h5"
 CONFIG_PATH = "models/model_config.json"
@@ -635,6 +637,13 @@ def train():
         print(f"GPUs available: {len(physical_devices)}")
         for device in physical_devices:
             tf.config.experimental.set_memory_growth(device, True)
+            try:
+                tf.config.set_logical_device_configuration(
+                    device,
+                    [tf.config.LogicalDeviceConfiguration(memory_limit=4096)]
+                )
+            except:
+                pass
     else:
         print("No GPU detected, using CPU")
     
@@ -653,6 +662,9 @@ def train():
         'dropout': DROPOUT,
         'learning_rate': LEARNING_RATE,
         'batch_size': BATCH_SIZE,
+        'accumulation_steps': ACCUMULATION_STEPS,
+        'effective_batch_size': BATCH_SIZE * ACCUMULATION_STEPS,
+        'gradient_clip_norm': GRADIENT_CLIP_NORM,
         'num_assets': num_assets,
         'samples_per_file': SAMPLES_PER_FILE,
         'epochs_per_chunk': EPOCHS_PER_CHUNK,
@@ -759,14 +771,101 @@ def train():
                 if chunk_num == 1 and file_idx == 0 and epoch == 0:
                     print(f"    X shape: {X.shape}, stats: min={X.min():.2f}, max={X.max():.2f}, mean={X.mean():.2f}")
                 
-                model.fit(
-                    X,
-                    {'allocation': y_alloc, 'reward': y_reward},
-                    batch_size=BATCH_SIZE,
-                    epochs=EPOCHS_PER_CHUNK,
-                    callbacks=callbacks,
-                    verbose=1
-                )
+                num_samples = len(X)
+                indices = np.arange(num_samples)
+                
+                for sub_epoch in range(EPOCHS_PER_CHUNK):
+                    np.random.shuffle(indices)
+                    epoch_loss = 0.0
+                    epoch_alloc_loss = 0.0
+                    epoch_reward_loss = 0.0
+                    num_batches = 0
+                    
+                    for start_idx in range(0, num_samples, BATCH_SIZE * ACCUMULATION_STEPS):
+                        batch_gradients = [tf.zeros_like(var) for var in model.trainable_variables]
+                        accum_loss = 0.0
+                        accum_alloc_loss = 0.0
+                        accum_reward_loss = 0.0
+                        
+                        for accum_step in range(ACCUMULATION_STEPS):
+                            step_start = start_idx + accum_step * BATCH_SIZE
+                            step_end = min(step_start + BATCH_SIZE, num_samples)
+                            
+                            if step_start >= num_samples:
+                                break
+                            
+                            batch_indices = indices[step_start:step_end]
+                            X_batch = tf.constant(X[batch_indices])
+                            y_alloc_batch = tf.constant(y_alloc[batch_indices])
+                            y_reward_batch = tf.constant(y_reward[batch_indices])
+                            
+                            with tf.GradientTape() as tape:
+                                alloc_pred, reward_pred = model(X_batch, training=True)
+                                
+                                alloc_loss = allocation_loss(y_alloc_batch, alloc_pred)
+                                reward_loss = keras.losses.categorical_crossentropy(y_reward_batch, reward_pred)
+                                reward_loss = tf.reduce_mean(reward_loss)
+                                
+                                total_loss = (TOP_K_WEIGHT * alloc_loss + REWARD_WEIGHT * reward_loss) / ACCUMULATION_STEPS
+                            
+                            gradients = tape.gradient(total_loss, model.trainable_variables)
+                            
+                            for i, grad in enumerate(gradients):
+                                if grad is not None:
+                                    batch_gradients[i] = batch_gradients[i] + grad
+                            
+                            accum_loss += total_loss.numpy() * ACCUMULATION_STEPS
+                            accum_alloc_loss += alloc_loss.numpy()
+                            accum_reward_loss += reward_loss.numpy()
+                            
+                            del X_batch, y_alloc_batch, y_reward_batch
+                            del alloc_pred, reward_pred, alloc_loss, reward_loss, total_loss
+                            del gradients
+                        
+                        batch_gradients, _ = tf.clip_by_global_norm(batch_gradients, GRADIENT_CLIP_NORM)
+                        
+                        model.optimizer.apply_gradients(zip(batch_gradients, model.trainable_variables))
+                        
+                        del batch_gradients
+                        
+                        epoch_loss += accum_loss
+                        epoch_alloc_loss += accum_alloc_loss
+                        epoch_reward_loss += accum_reward_loss
+                        num_batches += 1
+                        
+                        detailed_logging_callback.batch_count += 1
+                        if detailed_logging_callback.batch_count % detailed_logging_callback.log_activations_every == 0:
+                            detailed_logging_callback._log_activations()
+                        if detailed_logging_callback.batch_count % detailed_logging_callback.log_weights_every == 0:
+                            detailed_logging_callback._log_weight_importance()
+                        
+                        wandb.log({
+                            'batch': detailed_logging_callback.batch_count,
+                            'batch_loss': accum_loss / ACCUMULATION_STEPS,
+                            'batch_allocation_loss': accum_alloc_loss / ACCUMULATION_STEPS,
+                            'batch_reward_loss': accum_reward_loss / ACCUMULATION_STEPS
+                        })
+                    
+                    if num_batches > 0:
+                        avg_loss = epoch_loss / num_batches
+                        avg_alloc_loss = epoch_alloc_loss / num_batches
+                        avg_reward_loss = epoch_reward_loss / num_batches
+                        
+                        print(f"    Epoch {sub_epoch+1}/{EPOCHS_PER_CHUNK} - loss: {avg_loss:.4f} - alloc_loss: {avg_alloc_loss:.4f} - reward_loss: {avg_reward_loss:.4f}")
+                        
+                        wandb.log({
+                            'epoch_loss': avg_loss,
+                            'epoch_allocation_loss': avg_alloc_loss,
+                            'epoch_reward_loss': avg_reward_loss
+                        })
+                        
+                        rolling_avg_callback.loss_history.append(avg_loss)
+                        if len(rolling_avg_callback.loss_history) >= rolling_avg_callback.window_size:
+                            window_avg = np.mean(rolling_avg_callback.loss_history[-rolling_avg_callback.window_size:])
+                            if window_avg < rolling_avg_callback.best_avg_loss:
+                                rolling_avg_callback.best_avg_loss = window_avg
+                                model.save_weights(rolling_avg_callback.model_path)
+                                print(f"    Model saved - avg loss: {window_avg:.6f}")
                 
                 normalizer.save(NORM_STATS_PATH)
                 save_model_config(sequence_length, features_per_timestep, num_assets, CONFIG_PATH)
