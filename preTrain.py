@@ -9,23 +9,66 @@ import json
 from wandb.integration.keras import WandbMetricsLogger
 import matplotlib.pyplot as plt
 
+tf.keras.mixed_precision.set_global_policy('mixed_float16')
+
+MODEL_VERSIONS = ['v1-transformer', 'v2-cnn-transformer-cnn']
+
+MODEL_TYPE = MODEL_VERSIONS[1]
 TEST = False
-NUM_PREDICTIONS = 32
-D_MODEL = 512
-NHEAD = 8
-NUM_ENCODER_LAYERS = 5
-DIM_FEEDFORWARD = 512
-DROPOUT = 0.1
-LEARNING_RATE = 0.0001
-BATCH_SIZE = 32
-SAMPLES_PER_FILE = 128
+NUM_PREDICTIONS = 8
+D_MODEL = 1024
+NHEAD = 32
+NUM_BLOCKS = 8
+CNN_FILTERS = 1024
+CNN_KERNEL = 5
+DROPOUT = 0.2
+LEARNING_RATE = 0.000175
+BATCH_SIZE = 2
+SAMPLES_PER_FILE = 512
 BEST_MODEL_PATH = "models/best_pretrain_transformer.weights.h5"
 CONFIG_PATH = "models/model_config.json"
 NORM_STATS_PATH = "models/normalization_stats.json"
 DATA_FOLDER = "syntheticData"
 WANDB_PROJECT = "portfolio-pretrain"
-EPOCHS_PER_CHUNK = 1
-TEST_STEPS = 256
+EPOCHS_PER_CHUNK = 5
+TEST_STEPS = 64
+SAVE_AVG_WINDOW = 5
+TOP_1_WEIGHT = 0.3
+TOP_K_WEIGHT = 0.5
+REWARD_WEIGHT = 0.2
+
+REWARD_BUCKETS = [-250,-100, -25, 0, 25, 50, 100, 200, 400]
+NUM_REWARD_BUCKETS = len(REWARD_BUCKETS) + 1
+
+
+FEATURE_NAMES = [
+    'open', 'high', 'low', 'close', 'volume', 'quote_asset_volume', 
+    'number_of_trades', 'taker_buy_base_asset_volume', 'taker_buy_quote_asset_volume',
+    'ma_5', 'ma_10', 'ma_20', 'ema_5', 'ema_10', 'ema_20',
+    'rsi', 'macd_line', 'macd_signal', 'macd_histogram',
+    'bb_upper', 'bb_middle', 'bb_lower', 'atr', 'vwap',
+    'volume_profile', 'hvn_level_1', 'hvn_strength_1', 'lvn_level_1',
+    'hvn_level_2', 'hvn_strength_2', 'lvn_level_2',
+    'hvn_level_3', 'hvn_strength_3', 'lvn_level_3',
+    'hvn_level_4', 'hvn_strength_4', 'lvn_level_4',
+    'hvn_level_5', 'hvn_strength_5', 'lvn_level_5',
+    'time_profile', 'htn_level_1', 'htn_strength_1', 'ltn_level_1',
+    'htn_level_2', 'htn_strength_2', 'ltn_level_2',
+    'htn_level_3', 'htn_strength_3', 'ltn_level_3',
+    'htn_level_4', 'htn_strength_4', 'ltn_level_4',
+    'htn_level_5', 'htn_strength_5', 'ltn_level_5',
+    'trade_profile', 'trade_htn_level_1', 'trade_htn_strength_1', 'trade_ltn_level_1',
+    'trade_htn_level_2', 'trade_htn_strength_2', 'trade_ltn_level_2',
+    'trade_htn_level_3', 'trade_htn_strength_3', 'trade_ltn_level_3',
+    'trade_htn_level_4', 'trade_htn_strength_4', 'trade_ltn_level_4',
+    'trade_htn_level_5', 'trade_htn_strength_5', 'trade_ltn_level_5'
+]
+
+ASSET_NAMES = ['ADAUSDT', 'AVAXUSDT', 'BNBUSDT', 'BTCUSDT', 'DOGEUSDT', 
+               'DOTUSDT', 'ETHUSDT', 'LTCUSDT', 'SOLUSDT', 'XRPUSDT']
+
+PORTFOLIO_STATE_NAMES = ['cash_pct', 'portfolio_value_ratio', 'benchmark_ratio'] + \
+                        [f'{asset}_holdings_pct' for asset in ASSET_NAMES]
 
 
 class ObservationNormalizer:
@@ -110,16 +153,15 @@ def scan_data_folder(data_folder):
 
 
 class TransformerEncoderBlock(layers.Layer):
-    def __init__(self, d_model, num_heads, dim_feedforward, dropout_rate, **kwargs):
+    def __init__(self, d_model, num_heads, dropout_rate, **kwargs):
         super(TransformerEncoderBlock, self).__init__(**kwargs)
         self.d_model = d_model
         self.num_heads = num_heads
-        self.dim_feedforward = dim_feedforward
         self.dropout_rate = dropout_rate
         
-        self.mha = layers.MultiHeadAttention(num_heads=num_heads, key_dim=d_model)
+        self.mha = layers.MultiHeadAttention(num_heads=num_heads, key_dim=d_model // num_heads)
         self.ffn = keras.Sequential([
-            layers.Dense(dim_feedforward, activation='relu'),
+            layers.Dense(d_model * 2, activation='gelu'),
             layers.Dropout(dropout_rate),
             layers.Dense(d_model)
         ])
@@ -144,15 +186,94 @@ class TransformerEncoderBlock(layers.Layer):
         config.update({
             'd_model': self.d_model,
             'num_heads': self.num_heads,
-            'dim_feedforward': self.dim_feedforward,
             'dropout_rate': self.dropout_rate
         })
         return config
 
 
+class CNNTransformerBlock(layers.Layer):
+    def __init__(self, filters, kernel_size, d_model, num_heads, dropout_rate, axis='time', **kwargs):
+        super(CNNTransformerBlock, self).__init__(**kwargs)
+        self.filters = filters
+        self.kernel_size = kernel_size
+        self.d_model = d_model
+        self.num_heads = num_heads
+        self.dropout_rate = dropout_rate
+        self.axis = axis
+        
+        self.conv1 = layers.Conv1D(filters, kernel_size, padding='same', activation='gelu')
+        self.bn1 = layers.BatchNormalization()
+        
+        self.transformer = TransformerEncoderBlock(d_model, num_heads, dropout_rate)
+        
+        self.conv2 = layers.Conv1D(filters, kernel_size, padding='same', activation='gelu')
+        self.bn2 = layers.BatchNormalization()
+        self.dropout = layers.Dropout(dropout_rate)
+    
+    def call(self, x, training=False):
+        if self.axis == 'feature':
+            x = tf.transpose(x, [0, 2, 1])
+        
+        x = self.conv1(x)
+        x = self.bn1(x, training=training)
+        
+        x = self.transformer(x, training=training)
+        
+        x = self.conv2(x)
+        x = self.bn2(x, training=training)
+        x = self.dropout(x, training=training)
+        
+        if self.axis == 'feature':
+            x = tf.transpose(x, [0, 2, 1])
+        
+        return x
+    
+    def get_config(self):
+        config = super().get_config()
+        config.update({
+            'filters': self.filters,
+            'kernel_size': self.kernel_size,
+            'd_model': self.d_model,
+            'num_heads': self.num_heads,
+            'dropout_rate': self.dropout_rate,
+            'axis': self.axis
+        })
+        return config
+
+
+def build_model_v2(sequence_length, features_per_timestep, num_assets,
+                   d_model=D_MODEL, num_heads=NHEAD, num_blocks=NUM_BLOCKS,
+                   cnn_filters=CNN_FILTERS, cnn_kernel=CNN_KERNEL, dropout_rate=DROPOUT):
+    
+    inputs = layers.Input(shape=(sequence_length, features_per_timestep))
+    
+    x = layers.Dense(d_model)(inputs)
+    
+    for i in range(num_blocks):
+        axis = 'time' if i % 2 == 0 else 'feature'
+        x = CNNTransformerBlock(
+            cnn_filters, cnn_kernel, d_model, num_heads, dropout_rate,
+            axis=axis, name=f'cnn_transformer_block_{i}'
+        )(x)
+    
+    x = layers.GlobalAveragePooling1D()(x)
+    x = layers.Dense(d_model, activation='gelu')(x)
+    x = layers.Dropout(dropout_rate)(x)
+    
+    alloc_logits = layers.Dense(num_assets, dtype='float32')(x)
+    allocation_output = layers.Activation('softmax', dtype='float32', name='allocation')(alloc_logits)
+    
+    reward_logits = layers.Dense(NUM_REWARD_BUCKETS, dtype='float32')(x)
+    reward_output = layers.Activation('softmax', dtype='float32', name='reward')(reward_logits)
+    
+    model = keras.Model(inputs=inputs, outputs=[allocation_output, reward_output])
+    
+    return model
+
+
 def build_model(sequence_length, features_per_timestep, num_assets, d_model=D_MODEL, 
-                num_heads=NHEAD, num_layers=NUM_ENCODER_LAYERS, 
-                dim_feedforward=DIM_FEEDFORWARD, dropout_rate=DROPOUT):
+                num_heads=NHEAD, num_layers=NUM_BLOCKS,
+                dim_feedforward=D_MODEL*2, dropout_rate=DROPOUT):
     
     inputs = layers.Input(shape=(sequence_length, features_per_timestep))
     
@@ -165,23 +286,21 @@ def build_model(sequence_length, features_per_timestep, num_assets, d_model=D_MO
     x = x + pos_encoding
     
     for i in range(num_layers):
-        x = TransformerEncoderBlock(d_model, num_heads, dim_feedforward, dropout_rate, name=f'encoder_{i}')(x)
+        x = TransformerEncoderBlock(d_model, num_heads, dropout_rate, name=f'encoder_{i}')(x)
     
     x = layers.GlobalAveragePooling1D()(x)
     
-    alloc_hidden = layers.Dense(dim_feedforward // 2, activation='relu')(x)
+    alloc_hidden = layers.Dense(dim_feedforward // 2, activation='gelu')(x)
     alloc_hidden = layers.Dropout(dropout_rate)(alloc_hidden)
-    allocation_output = layers.Dense(num_assets, activation='softmax', name='allocation')(alloc_hidden)
+    alloc_logits = layers.Dense(num_assets, dtype='float32')(alloc_hidden)
+    allocation_output = layers.Activation('softmax', dtype='float32', name='allocation')(alloc_logits)
     
-    conf_hidden = layers.Dense(dim_feedforward // 2, activation='relu')(x)
-    conf_hidden = layers.Dropout(dropout_rate)(conf_hidden)
-    confidence_output = layers.Dense(num_assets, activation='sigmoid', name='confidence')(conf_hidden)
-    
-    reward_hidden = layers.Dense(dim_feedforward // 2, activation='relu')(x)
+    reward_hidden = layers.Dense(dim_feedforward // 2, activation='gelu')(x)
     reward_hidden = layers.Dropout(dropout_rate)(reward_hidden)
-    reward_output = layers.Dense(1, activation='linear', name='reward')(reward_hidden)
+    reward_logits = layers.Dense(NUM_REWARD_BUCKETS, dtype='float32')(reward_hidden)
+    reward_output = layers.Activation('softmax', dtype='float32', name='reward')(reward_logits)
     
-    model = keras.Model(inputs=inputs, outputs=[allocation_output, confidence_output, reward_output])
+    model = keras.Model(inputs=inputs, outputs=[allocation_output, reward_output])
     
     return model
 
@@ -205,27 +324,39 @@ def load_samples_from_file(filepath, offset=0, max_samples=None):
     return samples
 
 
+def reward_to_bucket(rewards):
+    bucket_indices = np.zeros(len(rewards), dtype=np.int32)
+    for i, threshold in enumerate(REWARD_BUCKETS):
+        bucket_indices += (rewards >= threshold).astype(np.int32)
+    return bucket_indices
+
+
+def bucket_to_reward_estimate(bucket_probs):
+    bucket_centers = np.array([-350, -175, -62.5, -12.5, 12.5, 37.5, 75, 150, 300, 500], dtype=np.float32)
+    return np.sum(bucket_probs * bucket_centers, axis=-1)
+
+
 def prepare_data(samples, normalizer):
     obs_list = []
     action_list = []
-    confidence_list = []
     reward_list = []
     
     for sample in samples:
         obs_list.append(sample['obs'])
         action_list.append(sample['action'])
-        confidence_list.append(sample['confidence'])
         reward_list.append(sample.get('reward', 0.0))
     
     obs_batch = np.array(obs_list, dtype=np.float32)
     action_batch = np.array(action_list, dtype=np.float32)
-    confidence_batch = np.array(confidence_list, dtype=np.float32)
-    reward_batch = np.array(reward_list, dtype=np.float32).reshape(-1, 1)
+    rewards_raw = np.array(reward_list, dtype=np.float32)
+    
+    bucket_indices = reward_to_bucket(rewards_raw)
+    reward_onehot = np.eye(NUM_REWARD_BUCKETS, dtype=np.float32)[bucket_indices]
     
     normalizer.update(obs_batch)
     obs_batch_norm = normalizer.normalize(obs_batch).astype(np.float32)
     
-    return obs_batch_norm, action_batch, confidence_batch, reward_batch
+    return obs_batch_norm, action_batch, reward_onehot
 
 
 class TopKAccuracy(keras.metrics.Metric):
@@ -256,20 +387,27 @@ class TopKAccuracy(keras.metrics.Metric):
 
 
 def allocation_loss(y_true, y_pred):
-    mse = tf.reduce_mean(tf.square(y_pred - y_true))
-    
     epsilon = 1e-7
     y_pred_safe = tf.clip_by_value(y_pred, epsilon, 1.0 - epsilon)
     y_true_safe = tf.clip_by_value(y_true, epsilon, 1.0 - epsilon)
-    ce = -tf.reduce_mean(tf.reduce_sum(y_true_safe * tf.math.log(y_pred_safe), axis=1))
     
-    top_k = 3
-    _, target_top_indices = tf.nn.top_k(y_true, k=top_k)
-    pred_at_tops = tf.gather(y_pred, target_top_indices, batch_dims=1)
-    true_at_tops = tf.gather(y_true, target_top_indices, batch_dims=1)
-    top_k_loss = tf.reduce_mean(tf.square(pred_at_tops - true_at_tops))
+    _, top1_indices = tf.nn.top_k(y_true, k=1)
+    pred_at_top1 = tf.gather(y_pred, top1_indices, batch_dims=1)
+    true_at_top1 = tf.gather(y_true, top1_indices, batch_dims=1)
+    top1_loss = tf.reduce_mean(tf.square(pred_at_top1 - true_at_top1))
     
-    return mse + 0.3 * ce + 0.5 * top_k_loss
+    _, top3_indices = tf.nn.top_k(y_true, k=3)
+    pred_at_top3 = tf.gather(y_pred, top3_indices, batch_dims=1)
+    true_at_top3 = tf.gather(y_true, top3_indices, batch_dims=1)
+    top3_loss = tf.reduce_mean(tf.square(pred_at_top3 - true_at_top3))
+    
+    mse = tf.reduce_mean(tf.square(y_pred - y_true))
+    
+    total_alloc = TOP_1_WEIGHT + TOP_K_WEIGHT
+    w1 = TOP_1_WEIGHT / total_alloc
+    w3 = TOP_K_WEIGHT / total_alloc
+    
+    return w1 * top1_loss + w3 * top3_loss + 0.1 * mse
 
 
 def save_model_config(sequence_length, features_per_timestep, num_assets, config_path):
@@ -279,51 +417,188 @@ def save_model_config(sequence_length, features_per_timestep, num_assets, config
         'num_assets': int(num_assets),
         'd_model': D_MODEL,
         'num_heads': NHEAD,
-        'num_layers': NUM_ENCODER_LAYERS,
-        'dim_feedforward': DIM_FEEDFORWARD,
-        'dropout_rate': DROPOUT
+        'num_layers': NUM_BLOCKS,
+        'cnn_filters': CNN_FILTERS,
+        'cnn_kernel': CNN_KERNEL,
+        'dropout_rate': DROPOUT,
+        'model_type': MODEL_TYPE
     }
     with open(config_path, 'w') as f:
         json.dump(config, f, indent=2)
 
 
-class BestMetricsCallback(keras.callbacks.Callback):
-    def __init__(self, model_path, metrics_to_track):
+class RollingAverageCallback(keras.callbacks.Callback):
+    def __init__(self, model_path, window_size=SAVE_AVG_WINDOW):
         super().__init__()
         self.model_path = model_path
-        self.metrics_to_track = metrics_to_track
-        self.best_values = {}
-        for metric, mode in metrics_to_track.items():
-            self.best_values[metric] = float('inf') if mode == 'min' else float('-inf')
+        self.window_size = window_size
+        self.loss_history = []
+        self.best_avg_loss = float('inf')
     
     def on_epoch_end(self, epoch, logs=None):
         if logs is None:
             return
         
-        improved = []
-        for metric, mode in self.metrics_to_track.items():
-            if metric not in logs:
-                continue
-            
-            current = logs[metric]
-            if mode == 'min' and current < self.best_values[metric]:
-                self.best_values[metric] = current
-                improved.append(metric)
-            elif mode == 'max' and current > self.best_values[metric]:
-                self.best_values[metric] = current
-                improved.append(metric)
+        current_loss = logs.get('loss', float('inf'))
+        self.loss_history.append(current_loss)
         
-        if improved:
-            self.model.save_weights(self.model_path)
-            print(f"\nModel saved - improved: {', '.join(improved)}")
+        if len(self.loss_history) >= self.window_size:
+            avg_loss = np.mean(self.loss_history[-self.window_size:])
             
-            wandb.log({f'best_{k}': v for k, v in self.best_values.items()})
+            if avg_loss < self.best_avg_loss:
+                self.best_avg_loss = avg_loss
+                self.model.save_weights(self.model_path)
+                print(f"\nModel saved - avg loss over {self.window_size} epochs: {avg_loss:.6f}")
+                
+                wandb.log({
+                    'best_avg_loss': self.best_avg_loss,
+                    'current_avg_loss': avg_loss
+                })
 
 
 class DetailedLoggingCallback(keras.callbacks.Callback):
-    def __init__(self):
+    def __init__(self, log_activations_every=20, log_weights_every=100):
         super().__init__()
         self.batch_count = 0
+        self.log_activations_every = log_activations_every
+        self.log_weights_every = log_weights_every
+        self.sample_input = None
+        self.sample_output = None
+        self.feature_labels = self._build_feature_labels()
+    
+    def _build_feature_labels(self):
+        labels = []
+        for asset in ASSET_NAMES:
+            for feat in FEATURE_NAMES:
+                labels.append(f'{asset}_{feat}')
+        for pstate in PORTFOLIO_STATE_NAMES:
+            labels.append(pstate)
+        return labels
+    
+    def set_sample_input(self, sample_input, sample_output=None):
+        self.sample_input = sample_input
+        self.sample_output = sample_output
+    
+    def _create_heatmap(self, data, title, xlabel='Features', ylabel='Sequence'):
+        fig, ax = plt.subplots(figsize=(10, 6))
+        im = ax.imshow(data, aspect='auto', cmap='viridis')
+        ax.set_title(title)
+        ax.set_xlabel(xlabel)
+        ax.set_ylabel(ylabel)
+        plt.colorbar(im, ax=ax)
+        plt.tight_layout()
+        return fig
+    
+    def _log_activations(self):
+        if self.sample_input is None:
+            return
+        
+        sample = self.sample_input[:2]
+        log_data = {}
+        
+        x = sample
+        for layer in self.model.layers:
+            if isinstance(layer, layers.InputLayer):
+                continue
+            
+            x = layer(x, training=False)
+            
+            if isinstance(layer, CNNTransformerBlock):
+                act_np = x.numpy()
+                name = layer.name
+                
+                log_data[f'activation/{name}/mean'] = float(np.mean(act_np))
+                log_data[f'activation/{name}/std'] = float(np.std(act_np))
+                log_data[f'activation/{name}/min'] = float(np.min(act_np))
+                log_data[f'activation/{name}/max'] = float(np.max(act_np))
+                
+                sample_act = act_np[0]
+                if sample_act.shape[1] > 64:
+                    step = sample_act.shape[1] // 64
+                    sample_act = sample_act[:, ::step]
+                if sample_act.shape[0] > 64:
+                    step = sample_act.shape[0] // 64
+                    sample_act = sample_act[::step, :]
+                
+                fig = self._create_heatmap(sample_act, name)
+                log_data[f'activation/{name}/heatmap'] = wandb.Image(fig)
+                plt.close(fig)
+            
+            if isinstance(layer, layers.GlobalAveragePooling1D):
+                break
+        
+        if log_data:
+            wandb.log(log_data)
+        
+        wandb.log(log_data)
+    
+    def _log_weight_importance(self):
+        log_data = {}
+        
+        input_layer = None
+        for layer in self.model.layers:
+            if isinstance(layer, layers.Dense) and hasattr(layer, 'kernel') and layer.kernel is not None:
+                if layer.kernel.shape[0] == len(self.feature_labels):
+                    input_layer = layer
+                    break
+        
+        if input_layer is not None and hasattr(input_layer, 'kernel'):
+            kernel = input_layer.kernel.numpy()
+            importance = np.mean(np.abs(kernel), axis=1)
+            
+            n_features = len(FEATURE_NAMES)
+            n_assets = len(ASSET_NAMES)
+            
+            asset_importance = np.zeros(n_assets)
+            for i, asset in enumerate(ASSET_NAMES):
+                start_idx = i * n_features
+                end_idx = start_idx + n_features
+                if end_idx <= len(importance):
+                    asset_importance[i] = np.mean(importance[start_idx:end_idx])
+            
+            fig, ax = plt.subplots(figsize=(10, 4))
+            bars = ax.bar(range(n_assets), asset_importance)
+            ax.set_xticks(range(n_assets))
+            ax.set_xticklabels(ASSET_NAMES, rotation=45, ha='right')
+            ax.set_ylabel('Mean abs weight')
+            ax.set_title('Input importance by asset')
+            plt.tight_layout()
+            log_data['weights/input_asset_importance'] = wandb.Image(fig)
+            plt.close(fig)
+            
+            feature_importance = np.zeros(n_features)
+            for i in range(n_features):
+                indices = [a * n_features + i for a in range(n_assets) if a * n_features + i < len(importance)]
+                if indices:
+                    feature_importance[i] = np.mean(importance[indices])
+            
+            top_k = 20
+            top_indices = np.argsort(feature_importance)[-top_k:][::-1]
+            top_names = [FEATURE_NAMES[i] for i in top_indices]
+            top_values = feature_importance[top_indices]
+            
+            fig, ax = plt.subplots(figsize=(10, 6))
+            ax.barh(range(len(top_names)), top_values)
+            ax.set_yticks(range(len(top_names)))
+            ax.set_yticklabels(top_names)
+            ax.set_xlabel('Mean abs weight')
+            ax.set_title(f'Top {top_k} feature importance')
+            ax.invert_yaxis()
+            plt.tight_layout()
+            log_data['weights/input_feature_importance'] = wandb.Image(fig)
+            plt.close(fig)
+        
+        for layer in self.model.layers:
+            if isinstance(layer, CNNTransformerBlock):
+                for sublayer in [layer.conv1, layer.conv2]:
+                    if hasattr(sublayer, 'kernel'):
+                        kernel = sublayer.kernel.numpy()
+                        importance = np.mean(np.abs(kernel), axis=(0, 1))
+                        
+                        log_data[f'weights/{layer.name}_{sublayer.name}_mean'] = float(np.mean(np.abs(kernel)))
+                        log_data[f'weights/{layer.name}_{sublayer.name}_std'] = float(np.std(kernel))
+        
+        wandb.log(log_data)
     
     def on_batch_end(self, batch, logs=None):
         if logs is None:
@@ -336,6 +611,12 @@ class DetailedLoggingCallback(keras.callbacks.Callback):
             log_data[f'batch_{key}'] = float(value)
         
         wandb.log(log_data)
+        
+        if self.batch_count % self.log_activations_every == 0:
+            self._log_activations()
+        
+        if self.batch_count % self.log_weights_every == 0:
+            self._log_weight_importance()
     
     def on_epoch_end(self, epoch, logs=None):
         if logs is None:
@@ -361,21 +642,32 @@ def train():
     sequence_length, features_per_timestep, num_assets, data_files = scan_data_folder(DATA_FOLDER)
     
     wandb.init(project=WANDB_PROJECT, config={
+        'model_type': MODEL_TYPE,
         'sequence_length': sequence_length,
         'features_per_timestep': features_per_timestep,
         'd_model': D_MODEL,
         'nhead': NHEAD,
-        'num_encoder_layers': NUM_ENCODER_LAYERS,
-        'dim_feedforward': DIM_FEEDFORWARD,
+        'num_blocks': NUM_BLOCKS,
+        'cnn_filters': CNN_FILTERS,
+        'cnn_kernel': CNN_KERNEL,
         'dropout': DROPOUT,
         'learning_rate': LEARNING_RATE,
         'batch_size': BATCH_SIZE,
         'num_assets': num_assets,
         'samples_per_file': SAMPLES_PER_FILE,
-        'epochs_per_chunk': EPOCHS_PER_CHUNK
+        'epochs_per_chunk': EPOCHS_PER_CHUNK,
+        'save_avg_window': SAVE_AVG_WINDOW,
+        'top_1_weight': TOP_1_WEIGHT,
+        'top_k_weight': TOP_K_WEIGHT,
+        'reward_weight': REWARD_WEIGHT,
+        'reward_buckets': REWARD_BUCKETS,
+        'num_reward_buckets': NUM_REWARD_BUCKETS
     })
     
-    model = build_model(sequence_length, features_per_timestep, num_assets)
+    if MODEL_TYPE == 'v2-cnn-transformer-cnn':
+        model = build_model_v2(sequence_length, features_per_timestep, num_assets)
+    else:
+        model = build_model(sequence_length, features_per_timestep, num_assets)
     
     if os.path.exists(BEST_MODEL_PATH):
         print(f"\nLoading weights from {BEST_MODEL_PATH}")
@@ -387,24 +679,26 @@ def train():
     
     model.summary()
     
+    num_params = sum([tf.reduce_prod(w.shape).numpy() for w in model.trainable_weights])
+    model_size_mb = num_params * 2 / (1024 * 1024)
+    print(f"\nModel parameters: {num_params:,}")
+    print(f"Model size (float16): {model_size_mb:.2f} MB")
+    
     optimizer = keras.optimizers.AdamW(learning_rate=LEARNING_RATE, weight_decay=0.01)
     
     model.compile(
         optimizer=optimizer,
         loss={
             'allocation': allocation_loss,
-            'confidence': 'mse',
-            'reward': 'mse'
+            'reward': keras.losses.CategoricalCrossentropy()
         },
         loss_weights={
-            'allocation': 1.0,
-            'confidence': 0.5,
-            'reward': 0.3
+            'allocation': TOP_K_WEIGHT,
+            'reward': REWARD_WEIGHT
         },
         metrics={
             'allocation': ['mae', TopKAccuracy(k=1, name='top1_acc'), TopKAccuracy(k=3, name='top3_acc')],
-            'confidence': ['mae'],
-            'reward': ['mae']
+            'reward': ['accuracy']
         }
     )
     
@@ -416,23 +710,11 @@ def train():
     
     os.makedirs("models", exist_ok=True)
     
-    metrics_to_track = {
-        'loss': 'min',
-        'allocation_loss': 'min',
-        'confidence_loss': 'min',
-        'reward_loss': 'min',
-        'allocation_mae': 'min',
-        'allocation_top1_acc': 'max',
-        'allocation_top3_acc': 'max',
-        'confidence_mae': 'min',
-        'reward_mae': 'min'
-    }
-    
-    best_metrics_callback = BestMetricsCallback(BEST_MODEL_PATH, metrics_to_track)
-    detailed_logging_callback = DetailedLoggingCallback()
+    rolling_avg_callback = RollingAverageCallback(BEST_MODEL_PATH, SAVE_AVG_WINDOW)
+    detailed_logging_callback = DetailedLoggingCallback(log_activations_every=500, log_weights_every=5000)
     
     callbacks = [
-        best_metrics_callback,
+        rolling_avg_callback,
         detailed_logging_callback,
         keras.callbacks.ReduceLROnPlateau(
             monitor='loss',
@@ -451,7 +733,10 @@ def train():
         print(f"Epoch {epoch + 1}")
         print(f"{'='*60}")
         
-        for file_idx, filename in enumerate(data_files):
+        shuffled_files = data_files.copy()
+        np.random.shuffle(shuffled_files)
+        
+        for file_idx, filename in enumerate(shuffled_files):
             filepath = os.path.join(DATA_FOLDER, filename)
             print(f"\nProcessing {filename} ({file_idx + 1}/{len(data_files)})")
             
@@ -467,14 +752,16 @@ def train():
                 chunk_offset += len(samples)
                 print(f"  Chunk {chunk_num}: {len(samples)} samples")
                 
-                X, y_alloc, y_conf, y_reward = prepare_data(samples, normalizer)
+                X, y_alloc, y_reward = prepare_data(samples, normalizer)
+                
+                detailed_logging_callback.set_sample_input(X)
                 
                 if chunk_num == 1 and file_idx == 0 and epoch == 0:
                     print(f"    X shape: {X.shape}, stats: min={X.min():.2f}, max={X.max():.2f}, mean={X.mean():.2f}")
                 
                 model.fit(
                     X,
-                    {'allocation': y_alloc, 'confidence': y_conf, 'reward': y_reward},
+                    {'allocation': y_alloc, 'reward': y_reward},
                     batch_size=BATCH_SIZE,
                     epochs=EPOCHS_PER_CHUNK,
                     callbacks=callbacks,
@@ -497,13 +784,15 @@ def evaluate_model():
             tf.config.experimental.set_memory_growth(device, True)
     
     if not os.path.exists(CONFIG_PATH) or not os.path.exists(BEST_MODEL_PATH):
-        print("No trained model found. Training first...")
-        print("Set TEST=False and run training, or the model will be created now.\n")
+        print("No trained model found. Creating new model...")
         
         print(f"Scanning data folder: {DATA_FOLDER}")
         sequence_length, features_per_timestep, num_assets, _ = scan_data_folder(DATA_FOLDER)
         
-        model = build_model(sequence_length, features_per_timestep, num_assets)
+        if MODEL_TYPE == 'v2-cnn-transformer-cnn':
+            model = build_model_v2(sequence_length, features_per_timestep, num_assets)
+        else:
+            model = build_model(sequence_length, features_per_timestep, num_assets)
         
         os.makedirs("models", exist_ok=True)
         model.save_weights(BEST_MODEL_PATH)
@@ -521,15 +810,26 @@ def evaluate_model():
     sequence_length = config['sequence_length']
     features_per_timestep = config['features_per_timestep']
     num_assets = config['num_assets']
+    model_type = config.get('model_type', 'v1-transformer')
     
-    model = build_model(
-        sequence_length, features_per_timestep, num_assets,
-        d_model=config['d_model'],
-        num_heads=config['num_heads'],
-        num_layers=config['num_layers'],
-        dim_feedforward=config['dim_feedforward'],
-        dropout_rate=config['dropout_rate']
-    )
+    if model_type == 'v2-cnn-transformer-cnn':
+        model = build_model_v2(
+            sequence_length, features_per_timestep, num_assets,
+            d_model=config['d_model'],
+            num_heads=config['num_heads'],
+            num_blocks=config['num_layers'],
+            cnn_filters=config.get('cnn_filters', CNN_FILTERS),
+            cnn_kernel=config.get('cnn_kernel', CNN_KERNEL),
+            dropout_rate=config['dropout_rate']
+        )
+    else:
+        model = build_model(
+            sequence_length, features_per_timestep, num_assets,
+            d_model=config['d_model'],
+            num_heads=config['num_heads'],
+            num_layers=config['num_layers'],
+            dropout_rate=config['dropout_rate']
+        )
     model.load_weights(BEST_MODEL_PATH)
     print("Model loaded successfully")
     
@@ -545,7 +845,6 @@ def evaluate_model():
     predicted_rewards = []
     predicted_reward_stds = []
     allocations_history = []
-    confidence_history = []
     timestamps = []
     
     obs = env.get_observation()
@@ -565,27 +864,23 @@ def evaluate_model():
         obs_norm = normalizer.normalize(obs.reshape(1, *obs.shape)).astype(np.float32)
         
         allocation_preds = []
-        confidence_preds = []
         reward_preds = []
         for _ in range(NUM_PREDICTIONS):
-            alloc, conf, rew = model(obs_norm, training=True)
+            alloc, rew = model(obs_norm, training=True)
             allocation_preds.append(alloc.numpy())
-            confidence_preds.append(conf.numpy())
             reward_preds.append(rew.numpy())
         
         allocation_preds = np.array(allocation_preds)
-        confidence_preds = np.array(confidence_preds)
         reward_preds = np.array(reward_preds)
         
         allocation = np.mean(allocation_preds, axis=0)[0]
-        confidence = np.mean(confidence_preds, axis=0)[0]
-        pred_reward = np.mean(reward_preds)
-        pred_reward_std = np.std(reward_preds)
+        mean_bucket_probs = np.mean(reward_preds, axis=0)[0]
+        pred_reward = bucket_to_reward_estimate(mean_bucket_probs)
+        pred_reward_std = np.std([bucket_to_reward_estimate(r[0]) for r in reward_preds])
         
         predicted_rewards.append(pred_reward)
         predicted_reward_stds.append(pred_reward_std)
         allocations_history.append(allocation.copy())
-        confidence_history.append(confidence.copy())
         
         obs, reward, done, info = env.step(allocation)
         rewards.append(reward)
@@ -609,7 +904,6 @@ def evaluate_model():
     predicted_rewards = np.array(predicted_rewards)
     predicted_reward_stds = np.array(predicted_reward_stds)
     allocations_history = np.array(allocations_history)
-    confidence_history = np.array(confidence_history)
     
     final_portfolio = portfolio_values[-1]
     final_benchmark = benchmark_values[-1]
@@ -758,11 +1052,10 @@ def evaluate_model():
     ax1.grid(True, alpha=0.3)
     
     ax2 = axes[1]
-    avg_confidence = np.mean(confidence_history, axis=1)
-    ax2.plot(avg_confidence, linewidth=2)
+    ax2.plot(predicted_reward_stds, linewidth=2)
     ax2.set_xlabel('Step')
-    ax2.set_ylabel('Average Confidence')
-    ax2.set_title('Model Confidence Over Time')
+    ax2.set_ylabel('Prediction Uncertainty')
+    ax2.set_title('Model Prediction Uncertainty Over Time')
     ax2.grid(True, alpha=0.3)
     
     plt.tight_layout()
