@@ -10,7 +10,7 @@ import random
 import string
 
 DEBUG = False
-NUM_OF_THREADS = 6
+NUM_OF_THREADS = 1
 DEBUG_SAMPLES = 200 * NUM_OF_THREADS
 N_CANDIDATES = 5
 N_REFINEMENT_ITERATIONS = 1
@@ -376,7 +376,7 @@ def plot_debug_statistics(rewards_history, portfolio_values, output_file):
     plt.show()
 
 
-def thread_worker(thread_id, n_samples, noise_level=0.0125, noise_type='mixed'):
+def thread_worker(thread_id, n_samples, noise_level=0.00275, noise_type='mixed'):
     """Modified thread worker to support noise parameters."""
     print(f"[Thread {thread_id}] Starting with noise_level={noise_level}, noise_type={noise_type}...")
     rewards, portfolio_values = generate_optimal_dataset(

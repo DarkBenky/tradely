@@ -11,20 +11,20 @@ import matplotlib.pyplot as plt
 
 tf.keras.mixed_precision.set_global_policy('mixed_float16')
 
-MODEL_VERSIONS = ['v1-transformer', 'v2-cnn-transformer-cnn']
+MODEL_VERSIONS = ['v1-transformer', 'v2-cnn-transformer-cnn', 'lstm', 'dense', 'cnn', 'hybrid-attention', 'temporal-cnn']
 
-MODEL_TYPE = MODEL_VERSIONS[1]
+MODEL_TYPE = MODEL_VERSIONS[6]
 TEST = False
 NUM_PREDICTIONS = 8
-D_MODEL = 512
+D_MODEL = 4096
 NHEAD = 16
-NUM_BLOCKS = 12
+NUM_BLOCKS = 8
 CNN_FILTERS = 512
 CNN_KERNEL = 5
 DROPOUT = 0.2
 LEARNING_RATE = 0.000175
-BATCH_SIZE = 2
-ACCUMULATION_STEPS = 8
+BATCH_SIZE = 6
+ACCUMULATION_STEPS = 3
 GRADIENT_CLIP_NORM = 1.0
 SAMPLES_PER_FILE = 512
 BEST_MODEL_PATH = "models/best_pretrain_transformer.weights.h5"
@@ -35,9 +35,13 @@ WANDB_PROJECT = "portfolio-pretrain"
 EPOCHS_PER_CHUNK = 5
 TEST_STEPS = 64
 SAVE_AVG_WINDOW = 5
-TOP_1_WEIGHT = 0.3
-TOP_K_WEIGHT = 0.5
-REWARD_WEIGHT = 0.2
+TOP_1_WEIGHT = 0.45
+TOP_K_WEIGHT = 0.4
+REWARD_WEIGHT = 0.15
+LOG_INTERVAL = 16
+
+TEMPORAL_CNN_KERNELS = [7, 5, 3, 3, 3, 3, 3, 3]
+TEMPORAL_CNN_DILATIONS = [1, 1, 2, 4, 8, 16, 32, 64]
 
 REWARD_BUCKETS = [-250,-100, -25, 0, 25, 50, 100, 200, 400]
 NUM_REWARD_BUCKETS = len(REWARD_BUCKETS) + 1
@@ -249,7 +253,7 @@ def build_model_v2(sequence_length, features_per_timestep, num_assets,
     
     inputs = layers.Input(shape=(sequence_length, features_per_timestep))
     
-    x = layers.Dense(d_model)(inputs)
+    x = layers.Dense(d_model, name='v2_input_projection')(inputs)
     
     for i in range(num_blocks):
         axis = 'time' if i % 2 == 0 else 'feature'
@@ -258,14 +262,14 @@ def build_model_v2(sequence_length, features_per_timestep, num_assets,
             axis=axis, name=f'cnn_transformer_block_{i}'
         )(x)
     
-    x = layers.GlobalAveragePooling1D()(x)
-    x = layers.Dense(d_model, activation='gelu')(x)
-    x = layers.Dropout(dropout_rate)(x)
+    x = layers.GlobalAveragePooling1D(name='v2_global_pool')(x)
+    x = layers.Dense(d_model, activation='gelu', name='v2_head_dense')(x)
+    x = layers.Dropout(dropout_rate, name='v2_head_dropout')(x)
     
-    alloc_logits = layers.Dense(num_assets, dtype='float32')(x)
+    alloc_logits = layers.Dense(num_assets, dtype='float32', name='v2_alloc_logits')(x)
     allocation_output = layers.Activation('softmax', dtype='float32', name='allocation')(alloc_logits)
     
-    reward_logits = layers.Dense(NUM_REWARD_BUCKETS, dtype='float32')(x)
+    reward_logits = layers.Dense(NUM_REWARD_BUCKETS, dtype='float32', name='v2_reward_logits')(x)
     reward_output = layers.Activation('softmax', dtype='float32', name='reward')(reward_logits)
     
     model = keras.Model(inputs=inputs, outputs=[allocation_output, reward_output])
@@ -279,7 +283,7 @@ def build_model(sequence_length, features_per_timestep, num_assets, d_model=D_MO
     
     inputs = layers.Input(shape=(sequence_length, features_per_timestep))
     
-    x = layers.Dense(d_model)(inputs)
+    x = layers.Dense(d_model, name='v1_input_projection')(inputs)
     
     pos_encoding = tf.Variable(
         tf.random.normal([1, sequence_length, d_model], stddev=0.02),
@@ -290,21 +294,205 @@ def build_model(sequence_length, features_per_timestep, num_assets, d_model=D_MO
     for i in range(num_layers):
         x = TransformerEncoderBlock(d_model, num_heads, dropout_rate, name=f'encoder_{i}')(x)
     
-    x = layers.GlobalAveragePooling1D()(x)
+    x = layers.GlobalAveragePooling1D(name='v1_global_pool')(x)
     
-    alloc_hidden = layers.Dense(dim_feedforward // 2, activation='gelu')(x)
-    alloc_hidden = layers.Dropout(dropout_rate)(alloc_hidden)
-    alloc_logits = layers.Dense(num_assets, dtype='float32')(alloc_hidden)
+    alloc_hidden = layers.Dense(dim_feedforward // 2, activation='gelu', name='v1_alloc_hidden')(x)
+    alloc_hidden = layers.Dropout(dropout_rate, name='v1_alloc_dropout')(alloc_hidden)
+    alloc_logits = layers.Dense(num_assets, dtype='float32', name='v1_alloc_logits')(alloc_hidden)
     allocation_output = layers.Activation('softmax', dtype='float32', name='allocation')(alloc_logits)
     
-    reward_hidden = layers.Dense(dim_feedforward // 2, activation='gelu')(x)
-    reward_hidden = layers.Dropout(dropout_rate)(reward_hidden)
-    reward_logits = layers.Dense(NUM_REWARD_BUCKETS, dtype='float32')(reward_hidden)
+    reward_hidden = layers.Dense(dim_feedforward // 2, activation='gelu', name='v1_reward_hidden')(x)
+    reward_hidden = layers.Dropout(dropout_rate, name='v1_reward_dropout')(reward_hidden)
+    reward_logits = layers.Dense(NUM_REWARD_BUCKETS, dtype='float32', name='v1_reward_logits')(reward_hidden)
     reward_output = layers.Activation('softmax', dtype='float32', name='reward')(reward_logits)
     
     model = keras.Model(inputs=inputs, outputs=[allocation_output, reward_output])
     
     return model
+
+
+def build_model_lstm(sequence_length, features_per_timestep, num_assets,
+                     d_model=D_MODEL, num_layers=NUM_BLOCKS, dropout_rate=DROPOUT):
+    
+    inputs = layers.Input(shape=(sequence_length, features_per_timestep))
+    
+    x = inputs
+    for i in range(num_layers):
+        return_sequences = (i < num_layers - 1)
+        x = layers.LSTM(d_model, return_sequences=return_sequences, dropout=dropout_rate, name=f'lstm_{i}')(x)
+        if return_sequences:
+            x = layers.BatchNormalization(name=f'lstm_bn_{i}')(x)
+    
+    x = layers.Dense(d_model, activation='gelu', name='lstm_head_dense')(x)
+    x = layers.Dropout(dropout_rate, name='lstm_head_dropout')(x)
+    
+    alloc_logits = layers.Dense(num_assets, dtype='float32', name='lstm_alloc_logits')(x)
+    allocation_output = layers.Activation('softmax', dtype='float32', name='allocation')(alloc_logits)
+    
+    reward_logits = layers.Dense(NUM_REWARD_BUCKETS, dtype='float32', name='lstm_reward_logits')(x)
+    reward_output = layers.Activation('softmax', dtype='float32', name='reward')(reward_logits)
+    
+    model = keras.Model(inputs=inputs, outputs=[allocation_output, reward_output])
+    
+    return model
+
+
+def build_model_dense(sequence_length, features_per_timestep, num_assets,
+                      d_model=D_MODEL, num_layers=NUM_BLOCKS, dropout_rate=DROPOUT):
+    
+    inputs = layers.Input(shape=(sequence_length, features_per_timestep))
+    
+    x = layers.Flatten()(inputs)
+    
+    for i in range(num_layers):
+        x = layers.Dense(d_model, activation='gelu', name=f'dense_{i}')(x)
+        x = layers.BatchNormalization()(x)
+        x = layers.Dropout(dropout_rate)(x)
+    
+    alloc_logits = layers.Dense(num_assets, dtype='float32', name='alloc_dense')(x)
+    allocation_output = layers.Activation('softmax', dtype='float32', name='allocation')(alloc_logits)
+    
+    reward_logits = layers.Dense(NUM_REWARD_BUCKETS, dtype='float32', name='reward_dense')(x)
+    reward_output = layers.Activation('softmax', dtype='float32', name='reward')(reward_logits)
+    
+    model = keras.Model(inputs=inputs, outputs=[allocation_output, reward_output])
+    
+    return model
+
+
+def build_model_cnn(sequence_length, features_per_timestep, num_assets,
+                    d_model=D_MODEL, num_layers=NUM_BLOCKS, 
+                    cnn_filters=CNN_FILTERS, cnn_kernel=CNN_KERNEL, dropout_rate=DROPOUT):
+    
+    inputs = layers.Input(shape=(sequence_length, features_per_timestep))
+    
+    x = inputs
+    
+    for i in range(num_layers):
+        x = layers.Conv1D(cnn_filters, cnn_kernel, padding='same', activation='gelu', name=f'conv1d_{i}')(x)
+        x = layers.BatchNormalization(name=f'cnn_bn_{i}')(x)
+        x = layers.Dropout(dropout_rate, name=f'cnn_dropout_{i}')(x)
+        if i % 2 == 1:
+            x = layers.MaxPooling1D(pool_size=2, name=f'cnn_pool_{i}')(x)
+    
+    x = layers.GlobalAveragePooling1D(name='cnn_global_pool')(x)
+    x = layers.Dense(d_model, activation='gelu', name='cnn_head_dense')(x)
+    x = layers.Dropout(dropout_rate, name='cnn_head_dropout')(x)
+    
+    alloc_logits = layers.Dense(num_assets, dtype='float32', name='cnn_alloc_logits')(x)
+    allocation_output = layers.Activation('softmax', dtype='float32', name='allocation')(alloc_logits)
+    
+    reward_logits = layers.Dense(NUM_REWARD_BUCKETS, dtype='float32', name='cnn_reward_logits')(x)
+    reward_output = layers.Activation('softmax', dtype='float32', name='reward')(reward_logits)
+    
+    model = keras.Model(inputs=inputs, outputs=[allocation_output, reward_output])
+    
+    return model
+
+
+def build_model_hybrid_attention(sequence_length, features_per_timestep, num_assets,
+                                  d_model=D_MODEL, num_heads=NHEAD, num_layers=NUM_BLOCKS,
+                                  cnn_filters=CNN_FILTERS, dropout_rate=DROPOUT):
+    
+    inputs = layers.Input(shape=(sequence_length, features_per_timestep))
+    
+    x = layers.Conv1D(cnn_filters, 3, padding='same', activation='gelu', name='hybrid_input_conv')(inputs)
+    x = layers.BatchNormalization(name='hybrid_input_bn')(x)
+    
+    x = layers.Dense(d_model, name='hybrid_input_projection')(x)
+    
+    pos_encoding = tf.Variable(
+        tf.random.normal([1, sequence_length, d_model], stddev=0.02),
+        trainable=True, name='hybrid_pos_encoding'
+    )
+    x = x + pos_encoding
+    
+    for i in range(num_layers):
+        attn_out = layers.MultiHeadAttention(
+            num_heads, d_model // num_heads, dropout=dropout_rate, 
+            name=f'hybrid_attn_{i}'
+        )(x, x)
+        attn_out = layers.Dropout(dropout_rate, name=f'hybrid_attn_drop_{i}')(attn_out)
+        x = layers.LayerNormalization(epsilon=1e-6, name=f'hybrid_attn_norm_{i}')(x + attn_out)
+        
+        conv_out = layers.Conv1D(d_model * 2, 3, padding='same', activation='gelu', name=f'hybrid_conv1_{i}')(x)
+        conv_out = layers.Conv1D(d_model, 1, name=f'hybrid_conv2_{i}')(conv_out)
+        conv_out = layers.Dropout(dropout_rate, name=f'hybrid_conv_drop_{i}')(conv_out)
+        x = layers.LayerNormalization(epsilon=1e-6, name=f'hybrid_conv_norm_{i}')(x + conv_out)
+    
+    pooled = layers.GlobalAveragePooling1D(name='hybrid_avg_pool')(x)
+    max_pooled = layers.GlobalMaxPooling1D(name='hybrid_max_pool')(x)
+    x = layers.Concatenate(name='hybrid_pool_concat')([pooled, max_pooled])
+    
+    x = layers.Dense(d_model, activation='gelu', name='hybrid_head_dense')(x)
+    x = layers.Dropout(dropout_rate, name='hybrid_head_dropout')(x)
+    
+    alloc_logits = layers.Dense(num_assets, dtype='float32', name='hybrid_alloc_logits')(x)
+    allocation_output = layers.Activation('softmax', dtype='float32', name='allocation')(alloc_logits)
+    
+    reward_logits = layers.Dense(NUM_REWARD_BUCKETS, dtype='float32', name='hybrid_reward_logits')(x)
+    reward_output = layers.Activation('softmax', dtype='float32', name='reward')(reward_logits)
+    
+    model = keras.Model(inputs=inputs, outputs=[allocation_output, reward_output])
+    
+    return model
+
+
+def build_model_temporal_cnn(sequence_length, features_per_timestep, num_assets,
+                              d_model=D_MODEL, num_layers=NUM_BLOCKS,
+                              cnn_filters=CNN_FILTERS, dropout_rate=DROPOUT):
+    
+    inputs = layers.Input(shape=(sequence_length, features_per_timestep))
+    
+    x = layers.Conv1D(cnn_filters, 1, name='temporal_input_project')(inputs)
+    
+    for i in range(num_layers):
+        residual = x
+        
+        kernel = TEMPORAL_CNN_KERNELS[min(i, len(TEMPORAL_CNN_KERNELS) - 1)]
+        dilation = TEMPORAL_CNN_DILATIONS[min(i, len(TEMPORAL_CNN_DILATIONS) - 1)]
+        
+        x = layers.Conv1D(cnn_filters, kernel, dilation_rate=dilation, 
+                         padding='same', activation='gelu', 
+                         name=f'temporal_conv_{i}')(x)
+        x = layers.BatchNormalization(name=f'temporal_bn_{i}')(x)
+        x = layers.Dropout(dropout_rate, name=f'temporal_drop_{i}')(x)
+        
+        x = layers.Add(name=f'temporal_residual_{i}')([x, residual])
+    
+    x = layers.Conv1D(d_model, 1, activation='gelu', name='temporal_project')(x)
+    x = layers.Dropout(dropout_rate, name='temporal_project_drop')(x)
+    
+    pooled = layers.GlobalAveragePooling1D(name='temporal_avg_pool')(x)
+    max_pooled = layers.GlobalMaxPooling1D(name='temporal_max_pool')(x)
+    x = layers.Concatenate(name='temporal_pool_concat')([pooled, max_pooled])
+    
+    x = layers.Dense(d_model, activation='gelu', name='temporal_dense1')(x)
+    x = layers.Dropout(dropout_rate, name='temporal_drop1')(x)
+    x = layers.Dense(d_model // 2, activation='gelu', name='temporal_dense2')(x)
+    x = layers.Dropout(dropout_rate, name='temporal_drop2')(x)
+    
+    alloc_logits = layers.Dense(num_assets, dtype='float32', name='temporal_alloc_logits')(x)
+    allocation_output = layers.Activation('softmax', dtype='float32', name='allocation')(alloc_logits)
+    
+    reward_logits = layers.Dense(NUM_REWARD_BUCKETS, dtype='float32', name='temporal_reward_logits')(x)
+    reward_output = layers.Activation('softmax', dtype='float32', name='reward')(reward_logits)
+    
+    model = keras.Model(inputs=inputs, outputs=[allocation_output, reward_output])
+    
+    return model
+
+
+def count_samples_in_file(filepath):
+    count = 0
+    with open(filepath, 'rb') as f:
+        while True:
+            try:
+                pickle.load(f)
+                count += 1
+            except EOFError:
+                break
+    return count
 
 
 def load_samples_from_file(filepath, offset=0, max_samples=None):
@@ -324,6 +512,68 @@ def load_samples_from_file(filepath, offset=0, max_samples=None):
             except EOFError:
                 break
     return samples
+
+
+class MixedDataLoader:
+    def __init__(self, data_folder, max_ram_samples=4096):
+        self.data_folder = data_folder
+        self.max_ram_samples = max_ram_samples
+        self.file_paths = []
+        self.file_sizes = []
+        self.file_offsets = []
+        self.total_samples = 0
+        
+        self._scan_files()
+    
+    def _scan_files(self):
+        data_files = sorted([f for f in os.listdir(self.data_folder) if f.endswith('.pkl')])
+        
+        print(f"Scanning {len(data_files)} files...")
+        for filename in data_files:
+            filepath = os.path.join(self.data_folder, filename)
+            size = count_samples_in_file(filepath)
+            
+            self.file_paths.append(filepath)
+            self.file_sizes.append(size)
+            self.file_offsets.append(0)
+            self.total_samples += size
+            
+            print(f"  {filename}: {size} samples")
+        
+        self.file_sizes = np.array(self.file_sizes)
+        self.file_probs = self.file_sizes / self.file_sizes.sum()
+        
+        print(f"Total samples across all files: {self.total_samples}")
+    
+    def load_mixed_batch(self):
+        target_per_file = max(1, self.max_ram_samples // len(self.file_paths))
+        
+        all_samples = []
+        samples_per_file = []
+        
+        for i, (filepath, size) in enumerate(zip(self.file_paths, self.file_sizes)):
+            n_samples = min(target_per_file, size - self.file_offsets[i])
+            
+            if n_samples <= 0:
+                self.file_offsets[i] = 0
+                n_samples = min(target_per_file, size)
+            
+            samples = load_samples_from_file(filepath, offset=self.file_offsets[i], max_samples=n_samples)
+            
+            all_samples.extend(samples)
+            samples_per_file.append(len(samples))
+            self.file_offsets[i] += len(samples)
+        
+        indices = np.arange(len(all_samples))
+        np.random.shuffle(indices)
+        all_samples = [all_samples[i] for i in indices]
+        
+        print(f"Loaded {len(all_samples)} samples ({samples_per_file})")
+        
+        return all_samples
+    
+    def reset_offsets(self):
+        self.file_offsets = [0] * len(self.file_paths)
 
 
 def reward_to_bucket(rewards):
@@ -503,6 +753,15 @@ class DetailedLoggingCallback(keras.callbacks.Callback):
             if isinstance(layer, layers.InputLayer):
                 continue
             
+            if layer.name.startswith(('alloc_', 'reward_', 'v1_alloc', 'v1_reward', 'v2_alloc', 'v2_reward', 'temporal_', 'hybrid_', 'cnn_')):
+                break
+            
+            if layer.name in ['allocation', 'reward']:
+                break
+            
+            if isinstance(layer, layers.Add):
+                continue
+            
             x = layer(x, training=False)
             
             if isinstance(layer, CNNTransformerBlock):
@@ -678,6 +937,16 @@ def train():
     
     if MODEL_TYPE == 'v2-cnn-transformer-cnn':
         model = build_model_v2(sequence_length, features_per_timestep, num_assets)
+    elif MODEL_TYPE == 'lstm':
+        model = build_model_lstm(sequence_length, features_per_timestep, num_assets)
+    elif MODEL_TYPE == 'dense':
+        model = build_model_dense(sequence_length, features_per_timestep, num_assets)
+    elif MODEL_TYPE == 'cnn':
+        model = build_model_cnn(sequence_length, features_per_timestep, num_assets)
+    elif MODEL_TYPE == 'hybrid-attention':
+        model = build_model_hybrid_attention(sequence_length, features_per_timestep, num_assets)
+    elif MODEL_TYPE == 'temporal-cnn':
+        model = build_model_temporal_cnn(sequence_length, features_per_timestep, num_assets)
     else:
         model = build_model(sequence_length, features_per_timestep, num_assets)
     
@@ -724,6 +993,7 @@ def train():
     
     rolling_avg_callback = RollingAverageCallback(BEST_MODEL_PATH, SAVE_AVG_WINDOW)
     detailed_logging_callback = DetailedLoggingCallback(log_activations_every=500, log_weights_every=5000)
+    detailed_logging_callback.set_model(model)
     
     callbacks = [
         rolling_avg_callback,
@@ -740,135 +1010,165 @@ def train():
     
     print(f"\nFound {len(data_files)} data files")
     
-    for epoch in range(1000):
+    data_loader = MixedDataLoader(DATA_FOLDER, max_ram_samples=4096)
+    
+    for epoch in range(100_000):
         print(f"\n{'='*60}")
         print(f"Epoch {epoch + 1}")
         print(f"{'='*60}")
         
-        shuffled_files = data_files.copy()
-        np.random.shuffle(shuffled_files)
+        data_loader.reset_offsets()
         
-        for file_idx, filename in enumerate(shuffled_files):
-            filepath = os.path.join(DATA_FOLDER, filename)
-            print(f"\nProcessing {filename} ({file_idx + 1}/{len(data_files)})")
+        num_batches_per_epoch = max(1, data_loader.total_samples // (BATCH_SIZE * ACCUMULATION_STEPS * EPOCHS_PER_CHUNK))
+        
+        for batch_idx in range(num_batches_per_epoch):
+            print(f"\nMixed batch {batch_idx + 1}/{num_batches_per_epoch}")
             
-            chunk_offset = 0
-            chunk_num = 0
+            samples = data_loader.load_mixed_batch()
+            if not samples:
+                break
             
-            while True:
-                samples = load_samples_from_file(filepath, offset=chunk_offset, max_samples=SAMPLES_PER_FILE)
-                if not samples:
-                    break
+            X, y_alloc, y_reward = prepare_data(samples, normalizer)
+            
+            detailed_logging_callback.set_sample_input(X)
+            
+            if batch_idx == 0 and epoch == 0:
+                print(f"  X shape: {X.shape}, stats: min={X.min():.2f}, max={X.max():.2f}, mean={X.mean():.2f}")
+            
+            num_samples = len(X)
+            indices = np.arange(num_samples)
+            
+            for sub_epoch in range(EPOCHS_PER_CHUNK):
+                np.random.shuffle(indices)
+                epoch_loss = 0.0
+                epoch_alloc_loss = 0.0
+                epoch_reward_loss = 0.0
+                num_batches = 0
                 
-                chunk_num += 1
-                chunk_offset += len(samples)
-                print(f"  Chunk {chunk_num}: {len(samples)} samples")
-                
-                X, y_alloc, y_reward = prepare_data(samples, normalizer)
-                
-                detailed_logging_callback.set_sample_input(X)
-                
-                if chunk_num == 1 and file_idx == 0 and epoch == 0:
-                    print(f"    X shape: {X.shape}, stats: min={X.min():.2f}, max={X.max():.2f}, mean={X.mean():.2f}")
-                
-                num_samples = len(X)
-                indices = np.arange(num_samples)
-                
-                for sub_epoch in range(EPOCHS_PER_CHUNK):
-                    np.random.shuffle(indices)
-                    epoch_loss = 0.0
-                    epoch_alloc_loss = 0.0
-                    epoch_reward_loss = 0.0
-                    num_batches = 0
+                for start_idx in range(0, num_samples, BATCH_SIZE * ACCUMULATION_STEPS):
+                    batch_gradients = [tf.zeros_like(var) for var in model.trainable_variables]
+                    accum_loss = 0.0
+                    accum_alloc_loss = 0.0
+                    accum_reward_loss = 0.0
+                    accum_alloc_mae = 0.0
+                    accum_top1_acc = 0.0
+                    accum_top3_acc = 0.0
+                    accum_reward_acc = 0.0
                     
-                    for start_idx in range(0, num_samples, BATCH_SIZE * ACCUMULATION_STEPS):
-                        batch_gradients = [tf.zeros_like(var) for var in model.trainable_variables]
-                        accum_loss = 0.0
-                        accum_alloc_loss = 0.0
-                        accum_reward_loss = 0.0
+                    for accum_step in range(ACCUMULATION_STEPS):
+                        step_start = start_idx + accum_step * BATCH_SIZE
+                        step_end = min(step_start + BATCH_SIZE, num_samples)
                         
-                        for accum_step in range(ACCUMULATION_STEPS):
-                            step_start = start_idx + accum_step * BATCH_SIZE
-                            step_end = min(step_start + BATCH_SIZE, num_samples)
-                            
-                            if step_start >= num_samples:
-                                break
-                            
-                            batch_indices = indices[step_start:step_end]
-                            X_batch = tf.constant(X[batch_indices])
-                            y_alloc_batch = tf.constant(y_alloc[batch_indices])
-                            y_reward_batch = tf.constant(y_reward[batch_indices])
-                            
-                            with tf.GradientTape() as tape:
-                                alloc_pred, reward_pred = model(X_batch, training=True)
-                                
-                                alloc_loss = allocation_loss(y_alloc_batch, alloc_pred)
-                                reward_loss = keras.losses.categorical_crossentropy(y_reward_batch, reward_pred)
-                                reward_loss = tf.reduce_mean(reward_loss)
-                                
-                                total_loss = (TOP_K_WEIGHT * alloc_loss + REWARD_WEIGHT * reward_loss) / ACCUMULATION_STEPS
-                            
-                            gradients = tape.gradient(total_loss, model.trainable_variables)
-                            
-                            for i, grad in enumerate(gradients):
-                                if grad is not None:
-                                    batch_gradients[i] = batch_gradients[i] + grad
-                            
-                            accum_loss += total_loss.numpy() * ACCUMULATION_STEPS
-                            accum_alloc_loss += alloc_loss.numpy()
-                            accum_reward_loss += reward_loss.numpy()
-                            
-                            del X_batch, y_alloc_batch, y_reward_batch
-                            del alloc_pred, reward_pred, alloc_loss, reward_loss, total_loss
-                            del gradients
+                        if step_start >= num_samples:
+                            break
                         
-                        batch_gradients, _ = tf.clip_by_global_norm(batch_gradients, GRADIENT_CLIP_NORM)
+                        batch_indices = indices[step_start:step_end]
+                        X_batch = tf.constant(X[batch_indices])
+                        y_alloc_batch = tf.constant(y_alloc[batch_indices])
+                        y_reward_batch = tf.constant(y_reward[batch_indices])
                         
-                        model.optimizer.apply_gradients(zip(batch_gradients, model.trainable_variables))
+                        with tf.GradientTape() as tape:
+                            alloc_pred, reward_pred = model(X_batch, training=True)
+                            
+                            alloc_loss = allocation_loss(y_alloc_batch, alloc_pred)
+                            reward_loss = keras.losses.categorical_crossentropy(y_reward_batch, reward_pred)
+                            reward_loss = tf.reduce_mean(reward_loss)
+                            
+                            total_loss = (TOP_K_WEIGHT * alloc_loss + REWARD_WEIGHT * reward_loss) / ACCUMULATION_STEPS
                         
-                        del batch_gradients
+                        gradients = tape.gradient(total_loss, model.trainable_variables)
                         
-                        epoch_loss += accum_loss
-                        epoch_alloc_loss += accum_alloc_loss
-                        epoch_reward_loss += accum_reward_loss
-                        num_batches += 1
+                        for i, grad in enumerate(gradients):
+                            if grad is not None:
+                                batch_gradients[i] = batch_gradients[i] + grad
                         
-                        detailed_logging_callback.batch_count += 1
-                        if detailed_logging_callback.batch_count % detailed_logging_callback.log_activations_every == 0:
-                            detailed_logging_callback._log_activations()
-                        if detailed_logging_callback.batch_count % detailed_logging_callback.log_weights_every == 0:
-                            detailed_logging_callback._log_weight_importance()
+                        alloc_mae = tf.reduce_mean(tf.abs(alloc_pred - y_alloc_batch))
                         
-                        wandb.log({
-                            'batch': detailed_logging_callback.batch_count,
-                            'batch_loss': accum_loss / ACCUMULATION_STEPS,
-                            'batch_allocation_loss': accum_alloc_loss / ACCUMULATION_STEPS,
-                            'batch_reward_loss': accum_reward_loss / ACCUMULATION_STEPS
-                        })
+                        true_top1 = tf.argmax(y_alloc_batch, axis=-1)
+                        pred_top1 = tf.argmax(alloc_pred, axis=-1)
+                        top1_acc = tf.reduce_mean(tf.cast(tf.equal(pred_top1, true_top1), tf.float32))
+                        
+                        true_top3 = tf.argsort(y_alloc_batch, axis=-1, direction='DESCENDING')[:, :3]
+                        pred_top3 = tf.argsort(alloc_pred, axis=-1, direction='DESCENDING')[:, :3]
+                        matches = tf.reduce_sum(tf.cast(
+                            tf.equal(tf.expand_dims(pred_top3, 2), tf.expand_dims(true_top3, 1)), tf.float32
+                        ), axis=[1, 2])
+                        top3_acc = tf.reduce_mean(matches / 3.0)
+                        
+                        reward_acc = tf.reduce_mean(tf.cast(
+                            tf.equal(tf.argmax(reward_pred, axis=-1), tf.argmax(y_reward_batch, axis=-1)), 
+                            tf.float32
+                        ))
+                        
+                        accum_loss += total_loss.numpy() * ACCUMULATION_STEPS
+                        accum_alloc_loss += alloc_loss.numpy()
+                        accum_reward_loss += reward_loss.numpy()
+                        accum_alloc_mae += alloc_mae.numpy()
+                        accum_top1_acc += top1_acc.numpy()
+                        accum_top3_acc += top3_acc.numpy()
+                        accum_reward_acc += reward_acc.numpy()
+                        
+                        del X_batch, y_alloc_batch, y_reward_batch
+                        del alloc_pred, reward_pred, alloc_loss, reward_loss, total_loss
+                        del gradients
                     
-                    if num_batches > 0:
-                        avg_loss = epoch_loss / num_batches
-                        avg_alloc_loss = epoch_alloc_loss / num_batches
-                        avg_reward_loss = epoch_reward_loss / num_batches
-                        
-                        print(f"    Epoch {sub_epoch+1}/{EPOCHS_PER_CHUNK} - loss: {avg_loss:.4f} - alloc_loss: {avg_alloc_loss:.4f} - reward_loss: {avg_reward_loss:.4f}")
-                        
-                        wandb.log({
-                            'epoch_loss': avg_loss,
-                            'epoch_allocation_loss': avg_alloc_loss,
-                            'epoch_reward_loss': avg_reward_loss
-                        })
-                        
-                        rolling_avg_callback.loss_history.append(avg_loss)
-                        if len(rolling_avg_callback.loss_history) >= rolling_avg_callback.window_size:
-                            window_avg = np.mean(rolling_avg_callback.loss_history[-rolling_avg_callback.window_size:])
-                            if window_avg < rolling_avg_callback.best_avg_loss:
-                                rolling_avg_callback.best_avg_loss = window_avg
-                                model.save_weights(rolling_avg_callback.model_path)
-                                print(f"    Model saved - avg loss: {window_avg:.6f}")
+                    batch_gradients, _ = tf.clip_by_global_norm(batch_gradients, GRADIENT_CLIP_NORM)
+                    
+                    model.optimizer.apply_gradients(zip(batch_gradients, model.trainable_variables))
+                    
+                    del batch_gradients
+                    
+                    epoch_loss += accum_loss
+                    epoch_alloc_loss += accum_alloc_loss
+                    epoch_reward_loss += accum_reward_loss
+                    num_batches += 1
+                    
+                    detailed_logging_callback.batch_count += 1
+                    if detailed_logging_callback.batch_count % detailed_logging_callback.log_activations_every == 0:
+                        detailed_logging_callback._log_activations()
+                    if detailed_logging_callback.batch_count % detailed_logging_callback.log_weights_every == 0:
+                        detailed_logging_callback._log_weight_importance()
+                    
+                    wandb.log({
+                        'batch/batch': detailed_logging_callback.batch_count,
+                        'batch/batch_loss': accum_loss / ACCUMULATION_STEPS,
+                        'batch/batch_allocation_loss': accum_alloc_loss / ACCUMULATION_STEPS,
+                        'batch/batch_reward_loss': accum_reward_loss / ACCUMULATION_STEPS,
+                        'batch/allocation_mae': accum_alloc_mae / ACCUMULATION_STEPS,
+                        'batch/top1_accuracy': accum_top1_acc / ACCUMULATION_STEPS,
+                        'batch/top3_accuracy': accum_top3_acc / ACCUMULATION_STEPS,
+                        'batch/reward_accuracy': accum_reward_acc / ACCUMULATION_STEPS
+                    })
                 
-                normalizer.save(NORM_STATS_PATH)
-                save_model_config(sequence_length, features_per_timestep, num_assets, CONFIG_PATH)
+                if num_batches > 0:
+                    avg_loss = epoch_loss / num_batches
+                    avg_alloc_loss = epoch_alloc_loss / num_batches
+                    avg_reward_loss = epoch_reward_loss / num_batches
+                    
+                    print(f"  Sub-epoch {sub_epoch+1}/{EPOCHS_PER_CHUNK} - loss: {avg_loss:.4f} - alloc: {avg_alloc_loss:.4f} - reward: {avg_reward_loss:.4f}")
+                    
+                    wandb.log({
+                        'epoch/epoch_loss': avg_loss,
+                        'epoch/epoch_allocation_loss': avg_alloc_loss,
+                        'epoch/epoch_reward_loss': avg_reward_loss
+                    })
+                    
+                    rolling_avg_callback.loss_history.append(avg_loss)
+                    if len(rolling_avg_callback.loss_history) >= rolling_avg_callback.window_size:
+                        window_avg = np.mean(rolling_avg_callback.loss_history[-rolling_avg_callback.window_size:])
+                        if window_avg < rolling_avg_callback.best_avg_loss:
+                            rolling_avg_callback.best_avg_loss = window_avg
+                            model.save_weights(rolling_avg_callback.model_path)
+                            print(f"  Model saved - avg loss: {window_avg:.6f}")
+                    
+                    total_epochs_done = epoch * num_batches_per_epoch * EPOCHS_PER_CHUNK + batch_idx * EPOCHS_PER_CHUNK + sub_epoch + 1
+                    if total_epochs_done % LOG_INTERVAL == 0:
+                        print(f"  Logging detailed metrics at epoch {total_epochs_done}")
+                        detailed_logging_callback._log_activations()
+                        detailed_logging_callback._log_weight_importance()
+            
+            normalizer.save(NORM_STATS_PATH)
+            save_model_config(sequence_length, features_per_timestep, num_assets, CONFIG_PATH)
     
     wandb.finish()
     print("\nTraining completed!")
@@ -919,6 +1219,45 @@ def evaluate_model():
             num_blocks=config['num_layers'],
             cnn_filters=config.get('cnn_filters', CNN_FILTERS),
             cnn_kernel=config.get('cnn_kernel', CNN_KERNEL),
+            dropout_rate=config['dropout_rate']
+        )
+    elif model_type == 'lstm':
+        model = build_model_lstm(
+            sequence_length, features_per_timestep, num_assets,
+            d_model=config['d_model'],
+            num_layers=config['num_layers'],
+            dropout_rate=config['dropout_rate']
+        )
+    elif model_type == 'dense':
+        model = build_model_dense(
+            sequence_length, features_per_timestep, num_assets,
+            d_model=config['d_model'],
+            num_layers=config['num_layers'],
+            dropout_rate=config['dropout_rate']
+        )
+    elif model_type == 'cnn':
+        model = build_model_cnn(
+            sequence_length, features_per_timestep, num_assets,
+            d_model=config['d_model'],
+            num_layers=config['num_layers'],
+            cnn_filters=config.get('cnn_filters', CNN_FILTERS),
+            cnn_kernel=config.get('cnn_kernel', CNN_KERNEL),
+            dropout_rate=config['dropout_rate']
+        )
+    elif model_type == 'hybrid-attention':
+        model = build_model_hybrid_attention(
+            sequence_length, features_per_timestep, num_assets,
+            d_model=config['d_model'],
+            num_heads=config['num_heads'],
+            num_layers=config['num_layers'],
+            cnn_filters=config.get('cnn_filters', CNN_FILTERS),
+            dropout_rate=config['dropout_rate']
+        )
+    elif model_type == 'temporal-cnn':
+        model = build_model_temporal_cnn(
+            sequence_length, features_per_timestep, num_assets,
+            d_model=config['d_model'],
+            cnn_filters=config.get('cnn_filters', CNN_FILTERS),
             dropout_rate=config['dropout_rate']
         )
     else:
