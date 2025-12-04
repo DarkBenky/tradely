@@ -10,9 +10,9 @@ import random
 import string
 
 DEBUG = False
-NUM_OF_THREADS = 1
+NUM_OF_THREADS = 2
 DEBUG_SAMPLES = 200 * NUM_OF_THREADS
-N_CANDIDATES = 5
+N_CANDIDATES = 7
 N_REFINEMENT_ITERATIONS = 1
 REFINEMENT_SAMPLES_PER_ITERATION = 3
 N_SAMPLES = NUM_OF_THREADS * 256_0000  # Total samples across all threads
@@ -31,20 +31,23 @@ class GradientOptimalActionFinder:
         self.action_dim = len(env.asset_names)
     
     def normalize_action(self, action):
-        action = np.clip(action, 0.0, 1.0)
-        total = np.sum(action)
+        np.clip(action, 0.0, 1.0, out=action)
+        total = action.sum()
         if total > 0:
-            action = action / total
+            action /= total
         else:
-            action = np.ones(self.action_dim) / self.action_dim
+            action[:] = 1.0 / self.action_dim
         return action
     
     def find_optimal_action(self, obs):
-        candidates = []
-        rewards = []
+        total_candidates = self.n_candidates + (self.n_refinement_iterations * self.refinement_samples)
+        candidates = np.empty((total_candidates, self.action_dim), dtype=np.float32)
+        rewards = np.empty(total_candidates, dtype=np.float32)
+        idx = 0
         
+        dirichlet_alpha = np.ones(self.action_dim)
         for _ in range(self.n_candidates):
-            action = np.random.dirichlet(np.ones(self.action_dim))
+            action = np.random.dirichlet(dirichlet_alpha).astype(np.float32)
             
             self.env.portfolio = self.env._saved_portfolio.copy()
             self.env.portfolio_value = self.env._saved_portfolio_value
@@ -53,18 +56,19 @@ class GradientOptimalActionFinder:
             
             reward = self.env.step_fast(action)
             
-            candidates.append(action)
-            rewards.append(reward)
+            candidates[idx] = action
+            rewards[idx] = reward
+            idx += 1
         
-        best_idx = np.argmax(rewards)
-        best_action = candidates[best_idx]
+        best_idx = np.argmax(rewards[:idx])
+        best_action = candidates[best_idx].copy()
         best_reward = rewards[best_idx]
         
         for iteration in range(self.n_refinement_iterations):
             noise_scale = 0.2 / (iteration + 1)
             
             for _ in range(self.refinement_samples):
-                noise = np.random.randn(self.action_dim) * noise_scale
+                noise = np.random.randn(self.action_dim).astype(np.float32) * noise_scale
                 perturbed_action = self.normalize_action(best_action + noise)
                 
                 self.env.portfolio = self.env._saved_portfolio.copy()
@@ -74,56 +78,49 @@ class GradientOptimalActionFinder:
                 
                 reward = self.env.step_fast(perturbed_action)
                 
-                candidates.append(perturbed_action)
-                rewards.append(reward)
+                candidates[idx] = perturbed_action
+                rewards[idx] = reward
+                idx += 1
                 
                 if reward > best_reward:
-                    best_action = perturbed_action
+                    best_action = perturbed_action.copy()
                     best_reward = reward
         
-        confidence = self._calculate_confidence(candidates, rewards)
+        confidence = self._calculate_confidence(candidates[:idx], rewards[:idx])
         
         return best_action, best_reward, confidence
     
     def _calculate_confidence(self, candidates, rewards):
-        candidates = np.array(candidates)
-        rewards = np.array(rewards)
-        
-        min_reward = np.min(rewards)
-        max_reward = np.max(rewards)
+        min_reward = rewards.min()
+        max_reward = rewards.max()
         
         if max_reward - min_reward < 1e-6:
-            weights = np.ones(len(rewards)) / len(rewards)
+            weights = np.ones(len(rewards), dtype=np.float32) / len(rewards)
         else:
             normalized_rewards = (rewards - min_reward) / (max_reward - min_reward)
-            exp_rewards = np.exp(normalized_rewards * 5)
-            weights = exp_rewards / np.sum(exp_rewards)
+            exp_rewards = np.exp(normalized_rewards * 5, dtype=np.float32)
+            weights = exp_rewards / exp_rewards.sum()
         
-        weighted_allocations = np.zeros(self.action_dim)
-        for i, candidate in enumerate(candidates):
-            weighted_allocations += candidate * weights[i]
+        median_reward = np.median(rewards)
+        high_reward_mask = rewards > median_reward
+        low_reward_mask = rewards < median_reward
         
-        confidence = np.zeros(self.action_dim)
-        for i in range(self.action_dim):
-            asset_allocations = candidates[:, i]
-            
-            high_reward_mask = rewards > np.percentile(rewards, 50)
-            low_reward_mask = rewards < np.percentile(rewards, 50)
-            
-            if np.any(high_reward_mask):
-                avg_high = np.mean(asset_allocations[high_reward_mask])
-            else:
-                avg_high = 0.5
-            
-            if np.any(low_reward_mask):
-                avg_low = np.mean(asset_allocations[low_reward_mask])
-            else:
-                avg_low = 0.5
-            
-            confidence[i] = 0.5 + (avg_high - avg_low)
-            confidence[i] = np.clip(confidence[i], 0.0, 1.0)
+        confidence = np.full(self.action_dim, 0.5, dtype=np.float32)
+        
+        if np.any(high_reward_mask) and np.any(low_reward_mask):
+            avg_high = candidates[high_reward_mask].mean(axis=0)
+            avg_low = candidates[low_reward_mask].mean(axis=0)
+            confidence = 0.5 + (avg_high - avg_low)
+            np.clip(confidence, 0.0, 1.0, out=confidence)
         
         return confidence
+
+
+def save_samples_batch(filepath, samples_batch):
+    mode = 'ab' if os.path.exists(filepath) else 'wb'
+    with open(filepath, mode) as f:
+        for sample in samples_batch:
+            pickle.dump(sample, f, protocol=pickle.HIGHEST_PROTOCOL)
 
 
 def save_sample_incremental(filepath, obs, action, reward, confidence):
@@ -136,7 +133,7 @@ def save_sample_incremental(filepath, obs, action, reward, confidence):
     
     mode = 'ab' if os.path.exists(filepath) else 'wb'
     with open(filepath, mode) as f:
-        pickle.dump(sample, f)
+        pickle.dump(sample, f, protocol=pickle.HIGHEST_PROTOCOL)
 
 
 def load_all_samples(filepath):
@@ -173,28 +170,26 @@ def add_observation_noise(obs, noise_level=0.0125, noise_type='gaussian'):
     noised_obs = obs.copy()
     
     if noise_type == 'gaussian':
-        # Gaussian noise proportional to the data scale
         data_std = np.std(obs, axis=0, keepdims=True)
-        data_std = np.where(data_std == 0, 1.0, data_std)
-        noise = np.random.normal(0, noise_level, obs.shape) * data_std
-        noised_obs = obs + noise
+        np.maximum(data_std, 1.0, out=data_std, where=(data_std == 0))
+        noise = np.random.normal(0, noise_level, obs.shape).astype(obs.dtype) * data_std
+        noised_obs += noise
         
     elif noise_type == 'uniform':
-        # Uniform noise proportional to data range
         data_range = np.ptp(obs, axis=0, keepdims=True)
-        data_range = np.where(data_range == 0, 1.0, data_range)
-        noise = np.random.uniform(-noise_level, noise_level, obs.shape) * data_range
-        noised_obs = obs + noise
+        np.maximum(data_range, 1.0, out=data_range, where=(data_range == 0))
+        noise = np.random.uniform(-noise_level, noise_level, obs.shape).astype(obs.dtype) * data_range
+        noised_obs += noise
         
     elif noise_type == 'mixed':
-        # Combination of gaussian and uniform noise
         data_std = np.std(obs, axis=0, keepdims=True)
-        data_std = np.where(data_std == 0, 1.0, data_std)
+        np.maximum(data_std, 1.0, out=data_std, where=(data_std == 0))
         
-        gaussian_noise = np.random.normal(0, noise_level * 0.7, obs.shape) * data_std
-        uniform_noise = np.random.uniform(-noise_level * 0.3, noise_level * 0.3, obs.shape) * data_std
+        gaussian_noise = np.random.normal(0, noise_level * 0.7, obs.shape).astype(obs.dtype) * data_std
+        uniform_noise = np.random.uniform(-noise_level * 0.3, noise_level * 0.3, obs.shape).astype(obs.dtype) * data_std
         
-        noised_obs = obs + gaussian_noise + uniform_noise
+        noised_obs += gaussian_noise
+        noised_obs += uniform_noise
     
     # Ensure no NaN or Inf values after adding noise
     noised_obs = np.nan_to_num(noised_obs, nan=0.0, posinf=1.0, neginf=0.0)
@@ -226,7 +221,9 @@ def generate_optimal_dataset(n_samples=N_SAMPLES, output_file=None, debug=DEBUG,
     if add_noise:
         print(f"{thread_prefix}Adding {noise_type} noise (level={noise_level}) to observations")
     
-    env = PortfolioEnv(obs_shape=obs_shape)
+    interval = random.randint(12, 72)
+    reward_scale = 12.0 / interval
+    env = PortfolioEnv(obs_shape=obs_shape, rebalancing_interval=interval)
     optimizer = GradientOptimalActionFinder(env, n_candidates=n_candidates, 
                                            n_refinement_iterations=n_refinement_iterations, 
                                            refinement_samples=refinement_samples)
@@ -239,8 +236,18 @@ def generate_optimal_dataset(n_samples=N_SAMPLES, output_file=None, debug=DEBUG,
         start_idx = 0
         print(f"{thread_prefix}Creating new dataset: {output_file}")
     
-    rewards_history = []
-    portfolio_values = []
+    from collections import deque
+    
+    rewards_history = np.empty(n_samples, dtype=np.float32)
+    portfolio_values = np.empty(n_samples, dtype=np.float32)
+    
+    rewards_10 = deque(maxlen=10)
+    rewards_50 = deque(maxlen=50)
+    rewards_sum = 0.0
+    wins = 0
+    
+    batch_buffer = []
+    batch_size = 100
     
     total_evaluations = n_candidates + (n_refinement_iterations * refinement_samples)
     print(f"\n{thread_prefix}Generating {n_samples} optimal action samples...")
@@ -262,38 +269,59 @@ def generate_optimal_dataset(n_samples=N_SAMPLES, output_file=None, debug=DEBUG,
         
         optimal_action, expected_reward, confidence = optimizer.find_optimal_action(obs)
         
-        env.portfolio = env._saved_portfolio.copy()
+        env.portfolio = env._saved_portfolio
         env.portfolio_value = env._saved_portfolio_value
         env.step_count = env._saved_step_count
-        env.prev_reward = env._saved_prev_reward.copy()
+        env.prev_reward = env._saved_prev_reward
         
         _, actual_reward, _, info = env.step(optimal_action)
+        normalized_reward = actual_reward * reward_scale
         
-        save_sample_incremental(output_file, noised_obs, optimal_action, actual_reward, confidence)
+        sample = {
+            'obs': noised_obs,
+            'action': optimal_action,
+            'reward': normalized_reward,
+            'confidence': confidence
+        }
+        batch_buffer.append(sample)
         
-        rewards_history.append(actual_reward)
-        portfolio_values.append(info['portfolio_value'])
+        if len(batch_buffer) >= batch_size:
+            save_samples_batch(output_file, batch_buffer)
+            batch_buffer.clear()
+        
+        rewards_history[i] = normalized_reward
+        portfolio_values[i] = info['portfolio_value']
+        
+        rewards_10.append(normalized_reward)
+        rewards_50.append(normalized_reward)
+        rewards_sum += normalized_reward
+        if normalized_reward > 0:
+            wins += 1
         
         if (i + 1) % 10 == 0:
-            avg_10 = np.mean(rewards_history[-10:])
-            avg_50 = np.mean(rewards_history[-50:]) if len(rewards_history) >= 50 else np.mean(rewards_history)
-            avg_all = np.mean(rewards_history)
-            win_rate = sum(1 for r in rewards_history if r > 0) / len(rewards_history) * 100
-            print(f"\n{thread_prefix}Sample {i+1}/{n_samples}: R={actual_reward:.1f}, "
+            avg_10 = sum(rewards_10) / len(rewards_10)
+            avg_50 = sum(rewards_50) / len(rewards_50)
+            avg_all = rewards_sum / (i + 1)
+            win_rate = (wins / (i + 1)) * 100
+            print(f"\n{thread_prefix}Sample {i+1}/{n_samples}: R={normalized_reward:.1f}, "
                   f"Avg10={avg_10:.1f}, Avg50={avg_50:.1f}, AvgAll={avg_all:.1f}, WR={win_rate:.1f}%")
+    
+    if batch_buffer:
+        save_samples_batch(output_file, batch_buffer)
+        batch_buffer.clear()
     
     print(f"\n{thread_prefix} Generated {n_samples} samples")
     print(f"{thread_prefix}  Saved to {output_file}")
     print(f"{thread_prefix}  Total samples in file: {start_idx + n_samples}")
-    print(f"{thread_prefix}  Average reward: ${np.mean(rewards_history):.2f}")
-    print(f"{thread_prefix}  Min reward: ${np.min(rewards_history):.2f}")
-    print(f"{thread_prefix}  Max reward: ${np.max(rewards_history):.2f}")
-    print(f"{thread_prefix}  Std reward: ${np.std(rewards_history):.2f}")
+    print(f"{thread_prefix}  Average reward: ${rewards_sum / n_samples:.2f}")
+    print(f"{thread_prefix}  Min reward: ${rewards_history.min():.2f}")
+    print(f"{thread_prefix}  Max reward: ${rewards_history.max():.2f}")
+    print(f"{thread_prefix}  Std reward: ${rewards_history.std():.2f}")
     
     if debug:
         plot_debug_statistics(rewards_history, portfolio_values, output_file)
     
-    return rewards_history, portfolio_values
+    return rewards_history.tolist(), portfolio_values.tolist()
 
 
 def plot_debug_statistics(rewards_history, portfolio_values, output_file):

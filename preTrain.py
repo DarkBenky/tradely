@@ -14,15 +14,15 @@ tf.keras.mixed_precision.set_global_policy('mixed_float16')
 MODEL_VERSIONS = ['v1-transformer', 'v2-cnn-transformer-cnn', 'lstm', 'dense', 'cnn', 'hybrid-attention', 'temporal-cnn']
 
 MODEL_TYPE = MODEL_VERSIONS[6]
-TEST = False
-NUM_PREDICTIONS = 8
+TEST = True
+NUM_PREDICTIONS = 24
 D_MODEL = 4096
 NHEAD = 16
 NUM_BLOCKS = 8
 CNN_FILTERS = 512
 CNN_KERNEL = 5
 DROPOUT = 0.2
-LEARNING_RATE = 0.000175
+LEARNING_RATE = 0.000015
 BATCH_SIZE = 6
 ACCUMULATION_STEPS = 3
 GRADIENT_CLIP_NORM = 1.0
@@ -33,7 +33,9 @@ NORM_STATS_PATH = "models/normalization_stats.json"
 DATA_FOLDER = "syntheticData"
 WANDB_PROJECT = "portfolio-pretrain"
 EPOCHS_PER_CHUNK = 5
-TEST_STEPS = 64
+TEST_STEPS = 128
+TEST_REBALANCE_STEPS = 3
+TEST_FEE_RATE = 0.0005
 SAVE_AVG_WINDOW = 5
 TOP_1_WEIGHT = 0.45
 TOP_K_WEIGHT = 0.4
@@ -1174,7 +1176,7 @@ def train():
     print("\nTraining completed!")
 
 
-def evaluate_model():
+def evaluate_model(rebalance_steps=TEST_REBALANCE_STEPS, fee_rate=TEST_FEE_RATE):
     from portfolio_env import PortfolioEnv, ModelType
     
     physical_devices = tf.config.list_physical_devices('GPU')
@@ -1276,14 +1278,20 @@ def evaluate_model():
         print("Warning: No normalization stats found")
     
     env = PortfolioEnv(obs_shape=ModelType.TRANSFORMER_SHAPE)
+    env.fee_rate = fee_rate
     
     portfolio_values = []
     benchmark_values = []
+    portfolio_values_detailed = []
+    benchmark_values_detailed = []
     rewards = []
     predicted_rewards = []
     predicted_reward_stds = []
     allocations_history = []
+    turnover_history = []
+    fees_paid_history = []
     timestamps = []
+    timestamps_detailed = []
     
     obs = env.get_observation()
     initial_portfolio = env._portfolio_portfolio_value()
@@ -1291,9 +1299,16 @@ def evaluate_model():
     
     portfolio_values.append(initial_portfolio)
     benchmark_values.append(initial_benchmark)
+    portfolio_values_detailed.append(initial_portfolio)
+    benchmark_values_detailed.append(initial_benchmark)
     timestamps.append(0)
+    timestamps_detailed.append(0)
     
-    print(f"\nRunning evaluation for {TEST_STEPS} steps...")
+    rebalance_interval = rebalance_steps * 12
+    
+    print(f"\nRunning evaluation for {TEST_STEPS} rebalances...")
+    print(f"Rebalance every {rebalance_steps} env steps ({rebalance_interval} candles, {rebalance_interval * 5} minutes)")
+    print(f"Fee rate: {fee_rate * 100:.3f}%")
     print(f"Initial portfolio value: ${initial_portfolio:.2f}")
     print(f"Initial benchmark value: ${initial_benchmark:.2f}")
     print(f"Asset names: {env.asset_names}")
@@ -1318,10 +1333,33 @@ def evaluate_model():
         
         predicted_rewards.append(pred_reward)
         predicted_reward_stds.append(pred_reward_std)
-        allocations_history.append(allocation.copy())
+        allocations_history.append(allocation)
+        prev_val = env._portfolio_portfolio_value()
         
-        obs, reward, done, info = env.step(allocation)
-        rewards.append(reward)
+        step_reward = 0
+        step_fees = 0
+        for substep in range(rebalance_steps):
+            obs, rew, done, info = env.step(allocation)
+            step_reward += rew
+            step_fees += info.get('fees_paid', 0.0)
+            
+            pval_detail = env._portfolio_portfolio_value()
+            bval_detail = env._update_benchmark_value()
+            portfolio_values_detailed.append(pval_detail)
+            benchmark_values_detailed.append(bval_detail)
+            timestamps_detailed.append(step + (substep + 1) / rebalance_steps)
+            
+            if done:
+                break
+        
+        rewards.append(step_reward)
+        fees_paid_history.append(step_fees)
+        
+        if prev_val > 0 and fee_rate > 0:
+            turnover = step_fees / (fee_rate * prev_val)
+            turnover_history.append(turnover)
+        else:
+            turnover_history.append(0)
         
         portfolio_val = env._portfolio_portfolio_value()
         benchmark_val = env._update_benchmark_value()
@@ -1329,8 +1367,8 @@ def evaluate_model():
         benchmark_values.append(benchmark_val)
         timestamps.append(step + 1)
         
-        if step % 1 == 0:
-            print(f"Step {step}: Portfolio=${portfolio_val:.2f}, Benchmark=${benchmark_val:.2f}, Reward={reward:.2f}")
+        if step % 50 == 0:
+            print(f"Step {step}: Portfolio=${portfolio_val:.2f}, Benchmark=${benchmark_val:.2f}, Reward={step_reward:.2f}, Fees=${step_fees:.2f}")
         
         if done:
             print(f"Episode ended at step {step}: {info}")
@@ -1367,15 +1405,34 @@ def evaluate_model():
     total_trades = len(rewards)
     win_rate = winning_trades / total_trades * 100 if total_trades > 0 else 0
     
+    total_fees = np.sum(fees_paid_history)
+    avg_turnover = np.mean(turnover_history) if turnover_history else 0
+    fee_adjusted_return = portfolio_return + (total_fees / initial_portfolio * 100)
+    
+    eval_period_hours = len(rewards) * rebalance_interval * 5 / 60
+    eval_period_days = eval_period_hours / 24
+    
     print("\n" + "="*60)
     print("EVALUATION SUMMARY")
     print("="*60)
+    print(f"\nEvaluation Period:")
+    print(f"  Rebalances: {total_trades}")
+    print(f"  Env steps per rebalance: {rebalance_steps}")
+    print(f"  Rebalance interval: {rebalance_interval} candles ({rebalance_interval * 5} min)")
+    print(f"  Total time: {eval_period_hours:.1f} hours ({eval_period_days:.2f} days)")
+    print(f"  Rebalances per day: {total_trades / eval_period_days:.1f}")
     print(f"\nPerformance Metrics:")
     print(f"  Initial Portfolio Value: ${initial_portfolio:.2f}")
     print(f"  Final Portfolio Value:   ${final_portfolio:.2f}")
     print(f"  Portfolio Return:        {portfolio_return:.2f}%")
     print(f"  Benchmark Return:        {benchmark_return:.2f}%")
     print(f"  Excess Return:           {excess_return:.2f}%")
+    print(f"\nFee Analysis:")
+    print(f"  Total Fees Paid:         ${total_fees:.2f}")
+    print(f"  Fees as % of Initial:    {total_fees / initial_portfolio * 100:.2f}%")
+    print(f"  Average Turnover/Step:   {avg_turnover * 100:.2f}%")
+    print(f"  Fee-Adjusted Return:     {fee_adjusted_return:.2f}%")
+    print(f"  Fee-Adjusted Excess:     {fee_adjusted_return - benchmark_return:.2f}%")
     print(f"\nRisk Metrics:")
     print(f"  Portfolio Volatility:    {portfolio_volatility*100:.2f}%")
     print(f"  Benchmark Volatility:    {benchmark_volatility*100:.2f}%")
@@ -1399,8 +1456,9 @@ def evaluate_model():
     fig, axes = plt.subplots(2, 2, figsize=(14, 10))
     
     ax1 = axes[0, 0]
-    ax1.plot(timestamps, portfolio_values, label='Model Portfolio', linewidth=2, color='blue', zorder=3)
-    ax1.plot(timestamps, benchmark_values, label='Benchmark', linewidth=2, alpha=0.7, color='gray')
+    ax1.plot(timestamps_detailed, portfolio_values_detailed, label='Model Portfolio', linewidth=1, color='blue', alpha=0.8)
+    ax1.plot(timestamps_detailed, benchmark_values_detailed, label='Benchmark', linewidth=1, alpha=0.7, color='gray')
+    ax1.scatter(timestamps, portfolio_values, color='blue', s=20, zorder=5, alpha=0.6, label='Rebalance points')
     
     pred_rewards_plot = np.concatenate([[0], predicted_rewards])
     pred_stds_plot = np.concatenate([[0], predicted_reward_stds])
@@ -1412,38 +1470,44 @@ def evaluate_model():
     cmap = LinearSegmentedColormap.from_list('reward_cmap', colors, N=100)
     
     band_scale = np.abs(pred_rewards_plot) * 0.5 + pred_stds_plot * 2
-    upper_band = portfolio_values + band_scale
-    lower_band = portfolio_values - band_scale
+    upper_band = np.array(portfolio_values) + band_scale
+    lower_band = np.array(portfolio_values) - band_scale
     
     for i in range(len(timestamps) - 1):
         color = cmap(norm_rewards[i])
         ax1.fill_between([timestamps[i], timestamps[i+1]], 
                         [lower_band[i], lower_band[i+1]], 
                         [upper_band[i], upper_band[i+1]], 
-                        color=color, alpha=0.4)
+                        color=color, alpha=0.3)
     
     sm = plt.cm.ScalarMappable(cmap=cmap, norm=plt.Normalize(vmin=np.min(pred_rewards_plot), vmax=np.max(pred_rewards_plot)))
     sm.set_array([])
     cbar = plt.colorbar(sm, ax=ax1, label='Predicted Reward', shrink=0.8)
     
-    ax1.set_xlabel('Step')
+    ax1.set_xlabel('Rebalance Step')
     ax1.set_ylabel('Portfolio Value ($)')
     ax1.set_title('Portfolio Value with Reward Confidence Band')
     ax1.legend(loc='upper left')
     ax1.grid(True, alpha=0.3)
     
     ax2 = axes[0, 1]
+    fees_array = np.array(fees_paid_history)
+    rewards_before_fees = rewards + fees_array
+    
     ax2.plot(predicted_rewards, label='Predicted', linewidth=1.5, alpha=0.8)
-    ax2.plot(rewards, label='Actual', linewidth=1.5, alpha=0.8)
+    ax2.plot(rewards, label='Actual (after fees)', linewidth=1.5, alpha=0.8)
+    ax2.plot(rewards_before_fees, label='Before fees', linewidth=1.5, alpha=0.5, linestyle='--')
+    ax2.fill_between(range(len(fees_array)), rewards, rewards_before_fees, 
+                     alpha=0.3, color='red', label='Fees lost')
     ax2.fill_between(range(len(predicted_rewards)), 
                      predicted_rewards - predicted_reward_stds,
                      predicted_rewards + predicted_reward_stds,
-                     alpha=0.3, label='Uncertainty')
+                     alpha=0.2, label='Uncertainty')
     ax2.axhline(y=0, color='black', linestyle='--', alpha=0.3)
     ax2.set_xlabel('Step')
     ax2.set_ylabel('Reward ($)')
     ax2.set_title(f'Predicted vs Actual Rewards (Corr: {reward_corr:.3f})')
-    ax2.legend()
+    ax2.legend(loc='best', fontsize=8)
     ax2.grid(True, alpha=0.3)
     
     ax3 = axes[1, 0]
@@ -1475,7 +1539,7 @@ def evaluate_model():
     ax4_twin.set_ylabel('Portfolio Return (%)', color='green')
     
     plt.tight_layout()
-    plt.savefig('evaluation_results/performance_summary.png', dpi=150)
+    plt.savefig('evaluation_results/performance_summary.png', dpi=300)
     plt.close()
     
     fig, axes = plt.subplots(2, 1, figsize=(14, 8))
@@ -1497,15 +1561,24 @@ def evaluate_model():
     ax2.grid(True, alpha=0.3)
     
     plt.tight_layout()
-    plt.savefig('evaluation_results/allocation_analysis.png', dpi=150)
+    plt.savefig('evaluation_results/allocation_analysis.png', dpi=300)
     plt.close()
     
     results = {
+        'rebalance_steps': rebalance_steps,
+        'rebalance_interval': rebalance_interval,
+        'fee_rate': fee_rate,
+        'eval_period_days': float(eval_period_days),
         'initial_portfolio': float(initial_portfolio),
         'final_portfolio': float(final_portfolio),
         'portfolio_return': float(portfolio_return),
         'benchmark_return': float(benchmark_return),
         'excess_return': float(excess_return),
+        'total_fees': float(total_fees),
+        'fees_pct': float(total_fees / initial_portfolio * 100),
+        'avg_turnover': float(avg_turnover),
+        'fee_adjusted_return': float(fee_adjusted_return),
+        'fee_adjusted_excess': float(fee_adjusted_return - benchmark_return),
         'sharpe_ratio': float(sharpe_ratio),
         'max_drawdown': float(max_drawdown),
         'volatility': float(portfolio_volatility),
@@ -1525,6 +1598,11 @@ def evaluate_model():
     print("  - performance_summary.png")
     print("  - allocation_analysis.png")
     print("  - metrics.json")
+    
+    return results
+
+
+
 
 
 if __name__ == "__main__":
