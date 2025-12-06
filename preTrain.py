@@ -11,10 +11,13 @@ import matplotlib.pyplot as plt
 
 tf.keras.mixed_precision.set_global_policy('mixed_float16')
 
-MODEL_VERSIONS = ['v1-transformer', 'v2-cnn-transformer-cnn', 'lstm', 'dense', 'cnn', 'hybrid-attention', 'temporal-cnn']
+MODEL_VERSIONS = ['v1-transformer', 'v2-cnn-transformer-cnn', 'lstm', 'dense', 'cnn', 'hybrid-attention', 'temporal-cnn', 'iterative-refine']
 
-MODEL_TYPE = MODEL_VERSIONS[6]
-TEST = True
+MODEL_TYPE = MODEL_VERSIONS[-1]
+REFINE_ITERATIONS = 8
+SCRATCHPAD_DIM = 768
+ASET_FEATURE_DIM = 2048
+TEST = False
 NUM_PREDICTIONS = 24
 D_MODEL = 4096
 NHEAD = 16
@@ -478,6 +481,192 @@ def build_model_temporal_cnn(sequence_length, features_per_timestep, num_assets,
     allocation_output = layers.Activation('softmax', dtype='float32', name='allocation')(alloc_logits)
     
     reward_logits = layers.Dense(NUM_REWARD_BUCKETS, dtype='float32', name='temporal_reward_logits')(x)
+    reward_output = layers.Activation('softmax', dtype='float32', name='reward')(reward_logits)
+    
+    model = keras.Model(inputs=inputs, outputs=[allocation_output, reward_output])
+    
+    return model
+
+
+class CrossAssetAttention(layers.Layer):
+    def __init__(self, num_assets, feature_dim, num_heads=4, dropout_rate=0.1, **kwargs):
+        super().__init__(**kwargs)
+        self.num_assets = num_assets
+        self.feature_dim = feature_dim
+        self.num_heads = num_heads
+        self.dropout_rate = dropout_rate
+        
+    def build(self, input_shape):
+        self.mha = layers.MultiHeadAttention(
+            num_heads=self.num_heads,
+            key_dim=self.feature_dim // self.num_heads,
+            dropout=self.dropout_rate
+        )
+        self.layernorm = layers.LayerNormalization()
+        self.ffn = keras.Sequential([
+            layers.Dense(self.feature_dim * 2, activation='gelu'),
+            layers.Dropout(self.dropout_rate),
+            layers.Dense(self.feature_dim)
+        ])
+        self.layernorm2 = layers.LayerNormalization()
+        super().build(input_shape)
+    
+    def call(self, x, training=False):
+        attn_out = self.mha(x, x, training=training)
+        x = self.layernorm(x + attn_out)
+        ffn_out = self.ffn(x, training=training)
+        x = self.layernorm2(x + ffn_out)
+        return x
+    
+    def get_config(self):
+        config = super().get_config()
+        config.update({
+            'num_assets': self.num_assets,
+            'feature_dim': self.feature_dim,
+            'num_heads': self.num_heads,
+            'dropout_rate': self.dropout_rate
+        })
+        return config
+
+
+class RefinementBlock(layers.Layer):
+    def __init__(self, num_assets, feature_dim, scratchpad_dim, dropout_rate=0.1, **kwargs):
+        super().__init__(**kwargs)
+        self.num_assets = num_assets
+        self.feature_dim = feature_dim
+        self.scratchpad_dim = scratchpad_dim
+        self.dropout_rate = dropout_rate
+    
+    def build(self, input_shape):
+        self.cross_attn = CrossAssetAttention(
+            self.num_assets, self.feature_dim, num_heads=4, dropout_rate=self.dropout_rate
+        )
+        self.alloc_project = layers.Dense(self.feature_dim)
+        self.scratch_update = keras.Sequential([
+            layers.Dense(self.scratchpad_dim * 2, activation='gelu'),
+            layers.Dense(self.scratchpad_dim)
+        ])
+        self.output_project = layers.Dense(self.feature_dim, activation='gelu')
+        super().build(input_shape)
+    
+    def call(self, inputs, training=False):
+        asset_features, current_alloc, scratchpad = inputs
+        
+        alloc_embed = self.alloc_project(tf.expand_dims(current_alloc, -1))
+        combined = asset_features + alloc_embed
+        
+        scratch_broadcast = tf.tile(tf.expand_dims(scratchpad, 1), [1, self.num_assets, 1])
+        combined = tf.concat([combined, scratch_broadcast], axis=-1)
+        combined = self.output_project(combined)
+        
+        refined = self.cross_attn(combined, training=training)
+        
+        pooled = tf.reduce_mean(refined, axis=1)
+        new_scratchpad = scratchpad + self.scratch_update(pooled)
+        
+        return refined, new_scratchpad
+    
+    def get_config(self):
+        config = super().get_config()
+        config.update({
+            'num_assets': self.num_assets,
+            'feature_dim': self.feature_dim,
+            'scratchpad_dim': self.scratchpad_dim,
+            'dropout_rate': self.dropout_rate
+        })
+        return config
+
+
+class SqueezeLayer(layers.Layer):
+    def __init__(self, axis=-1, **kwargs):
+        super().__init__(**kwargs)
+        self.axis = axis
+    
+    def call(self, x):
+        return tf.squeeze(x, axis=self.axis)
+    
+    def get_config(self):
+        config = super().get_config()
+        config['axis'] = self.axis
+        return config
+
+
+class FlattenAssets(layers.Layer):
+    def __init__(self, num_assets, feature_dim, **kwargs):
+        super().__init__(**kwargs)
+        self.num_assets = num_assets
+        self.feature_dim = feature_dim
+    
+    def call(self, x):
+        return tf.reshape(x, [-1, self.num_assets * self.feature_dim])
+    
+    def get_config(self):
+        config = super().get_config()
+        config.update({'num_assets': self.num_assets, 'feature_dim': self.feature_dim})
+        return config
+
+
+def build_model_iterative_refine(sequence_length, features_per_timestep, num_assets,
+                                  num_layers=NUM_BLOCKS,
+                                  cnn_filters=CNN_FILTERS, dropout_rate=DROPOUT,
+                                  refine_iterations=REFINE_ITERATIONS,
+                                  scratchpad_dim=SCRATCHPAD_DIM,
+                                  asset_feature_dim=ASET_FEATURE_DIM):
+    
+    inputs = layers.Input(shape=(sequence_length, features_per_timestep))
+    
+    x = layers.Conv1D(cnn_filters, 1, name='iter_input_project')(inputs)
+    
+    for i in range(num_layers):
+        residual = x
+        kernel = TEMPORAL_CNN_KERNELS[min(i, len(TEMPORAL_CNN_KERNELS) - 1)]
+        dilation = TEMPORAL_CNN_DILATIONS[min(i, len(TEMPORAL_CNN_DILATIONS) - 1)]
+        
+        x = layers.Conv1D(cnn_filters, kernel, dilation_rate=dilation,
+                         padding='same', activation='gelu',
+                         name=f'iter_conv_{i}')(x)
+        x = layers.BatchNormalization(name=f'iter_bn_{i}')(x)
+        x = layers.Dropout(dropout_rate, name=f'iter_drop_{i}')(x)
+        x = layers.Add(name=f'iter_residual_{i}')([x, residual])
+    
+    pooled = layers.GlobalAveragePooling1D(name='iter_avg_pool')(x)
+    max_pooled = layers.GlobalMaxPooling1D(name='iter_max_pool')(x)
+    global_features = layers.Concatenate(name='iter_pool_concat')([pooled, max_pooled])
+    
+    global_features = layers.Dense(cnn_filters * 2, activation='gelu', name='iter_global_dense')(global_features)
+    
+    asset_features = layers.Dense(num_assets * asset_feature_dim, name='iter_asset_expand')(global_features)
+    asset_features = layers.Reshape((num_assets, asset_feature_dim), name='iter_asset_reshape')(asset_features)
+    
+    initial_alloc = layers.Dense(num_assets, activation='softmax', dtype='float32', name='iter_initial_alloc')(global_features)
+    
+    scratchpad = layers.Dense(scratchpad_dim, activation='gelu', name='iter_scratch_init')(global_features)
+    
+    refinement_block = RefinementBlock(
+        num_assets, asset_feature_dim, scratchpad_dim, dropout_rate,
+        name='refinement_block'
+    )
+    
+    current_alloc = initial_alloc
+    current_features = asset_features
+    
+    for i in range(refine_iterations):
+        current_features, scratchpad = refinement_block(
+            [current_features, current_alloc, scratchpad],
+            training=True
+        )
+        
+        alloc_logits = layers.Dense(1, dtype='float32', name=f'iter_alloc_step_{i}')(current_features)
+        alloc_logits = SqueezeLayer(axis=-1, name=f'iter_squeeze_{i}')(alloc_logits)
+        current_alloc = layers.Activation('softmax', dtype='float32', name=f'iter_softmax_{i}')(alloc_logits)
+    
+    allocation_output = layers.Lambda(lambda x: x, dtype='float32', name='allocation')(current_alloc)
+    
+    flat_features = FlattenAssets(num_assets, asset_feature_dim, name='iter_flatten')(current_features)
+    reward_input = layers.Concatenate(name='iter_reward_concat')([global_features, flat_features, scratchpad])
+    reward_features = layers.Dense(cnn_filters // 2, activation='gelu', name='iter_reward_dense')(reward_input)
+    reward_features = layers.Dropout(dropout_rate, name='iter_reward_drop')(reward_features)
+    reward_logits = layers.Dense(NUM_REWARD_BUCKETS, dtype='float32', name='iter_reward_logits')(reward_features)
     reward_output = layers.Activation('softmax', dtype='float32', name='reward')(reward_logits)
     
     model = keras.Model(inputs=inputs, outputs=[allocation_output, reward_output])
@@ -949,6 +1138,8 @@ def train():
         model = build_model_hybrid_attention(sequence_length, features_per_timestep, num_assets)
     elif MODEL_TYPE == 'temporal-cnn':
         model = build_model_temporal_cnn(sequence_length, features_per_timestep, num_assets)
+    elif MODEL_TYPE == 'iterative-refine':
+        model = build_model_iterative_refine(sequence_length, features_per_timestep, num_assets)
     else:
         model = build_model(sequence_length, features_per_timestep, num_assets)
     
@@ -1192,6 +1383,18 @@ def evaluate_model(rebalance_steps=TEST_REBALANCE_STEPS, fee_rate=TEST_FEE_RATE)
         
         if MODEL_TYPE == 'v2-cnn-transformer-cnn':
             model = build_model_v2(sequence_length, features_per_timestep, num_assets)
+        elif MODEL_TYPE == 'temporal-cnn':
+            model = build_model_temporal_cnn(sequence_length, features_per_timestep, num_assets)
+        elif MODEL_TYPE == 'iterative-refine':
+            model = build_model_iterative_refine(sequence_length, features_per_timestep, num_assets)
+        elif MODEL_TYPE == 'lstm':
+            model = build_model_lstm(sequence_length, features_per_timestep, num_assets)
+        elif MODEL_TYPE == 'dense':
+            model = build_model_dense(sequence_length, features_per_timestep, num_assets)
+        elif MODEL_TYPE == 'cnn':
+            model = build_model_cnn(sequence_length, features_per_timestep, num_assets)
+        elif MODEL_TYPE == 'hybrid-attention':
+            model = build_model_hybrid_attention(sequence_length, features_per_timestep, num_assets)
         else:
             model = build_model(sequence_length, features_per_timestep, num_assets)
         
@@ -1262,6 +1465,12 @@ def evaluate_model(rebalance_steps=TEST_REBALANCE_STEPS, fee_rate=TEST_FEE_RATE)
             cnn_filters=config.get('cnn_filters', CNN_FILTERS),
             dropout_rate=config['dropout_rate']
         )
+    elif model_type == 'iterative-refine':
+        model = build_model_iterative_refine(
+            sequence_length, features_per_timestep, num_assets,
+            cnn_filters=config.get('cnn_filters', CNN_FILTERS),
+            dropout_rate=config['dropout_rate']
+        )
     else:
         model = build_model(
             sequence_length, features_per_timestep, num_assets,
@@ -1272,6 +1481,10 @@ def evaluate_model(rebalance_steps=TEST_REBALANCE_STEPS, fee_rate=TEST_FEE_RATE)
         )
     model.load_weights(BEST_MODEL_PATH)
     print("Model loaded successfully")
+    
+    model.summary()
+    num_params = sum([tf.reduce_prod(w.shape).numpy() for w in model.trainable_weights])
+    print(f"\nTotal trainable params: {num_params:,}")
     
     normalizer = ObservationNormalizer(features_per_timestep)
     if not normalizer.load(NORM_STATS_PATH):

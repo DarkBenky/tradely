@@ -27,7 +27,10 @@ NORM_STATS_PATH = "models/normalization_stats.json"
 LOSS_WINDOW_SIZE = 5
 ENTROPY_BONUS = 0.01
 ALLOCATION_LOSS_WEIGHT = 1.0
-REWARD_LOSS_WEIGHT = 0.5
+REWARD_LOSS_WEIGHT = 2.0
+WIN_RATE_WEIGHT = 0.3
+REWARD_MAXIMIZE_WEIGHT = 0.2
+OUTPERFORMANCE_WEIGHT = 0.5
 REWARD_CLIP_VALUE = 3.0
 
 REPLAY_BUFFER_SIZE = 50000
@@ -76,16 +79,20 @@ class ReplayBuffer:
         self.actions = deque(maxlen=max_size)
         self.rewards = deque(maxlen=max_size)
         self.values = deque(maxlen=max_size)
+        self.benchmark_rewards = deque(maxlen=max_size)
     
-    def add(self, obs, action, reward, value):
+    def add(self, obs, action, reward, value, benchmark_reward=0.0):
         self.observations.append(obs)
         self.actions.append(action)
         self.rewards.append(reward)
         self.values.append(value)
+        self.benchmark_rewards.append(benchmark_reward)
     
-    def add_batch(self, obs_batch, action_batch, reward_batch, value_batch):
+    def add_batch(self, obs_batch, action_batch, reward_batch, value_batch, benchmark_batch=None):
+        if benchmark_batch is None:
+            benchmark_batch = [0.0] * len(obs_batch)
         for i in range(len(obs_batch)):
-            self.add(obs_batch[i], action_batch[i], reward_batch[i], value_batch[i])
+            self.add(obs_batch[i], action_batch[i], reward_batch[i], value_batch[i], benchmark_batch[i])
     
     def sample(self, batch_size):
         indices = np.random.choice(len(self.observations), size=min(batch_size, len(self.observations)), replace=False)
@@ -93,7 +100,8 @@ class ReplayBuffer:
         actions = np.array([self.actions[i] for i in indices])
         rewards = np.array([self.rewards[i] for i in indices])
         values = np.array([self.values[i] for i in indices])
-        return obs, actions, rewards, values
+        benchmark = np.array([self.benchmark_rewards[i] for i in indices])
+        return obs, actions, rewards, values, benchmark
     
     def __len__(self):
         return len(self.observations)
@@ -103,7 +111,8 @@ class ReplayBuffer:
             'observations': list(self.observations),
             'actions': list(self.actions),
             'rewards': list(self.rewards),
-            'values': list(self.values)
+            'values': list(self.values),
+            'benchmark_rewards': list(self.benchmark_rewards)
         }
         with open(filepath, 'wb') as f:
             pickle.dump(data, f)
@@ -116,7 +125,8 @@ class ReplayBuffer:
         self.observations = deque(data['observations'], maxlen=self.max_size)
         self.actions = deque(data['actions'], maxlen=self.max_size)
         self.rewards = deque(data['rewards'], maxlen=self.max_size)
-        self.values = deque(data['values'], maxlen=self.max_size)
+        self.values = deque(data.get('values', [0.0] * len(self.rewards)), maxlen=self.max_size)
+        self.benchmark_rewards = deque(data.get('benchmark_rewards', [0.0] * len(self.rewards)), maxlen=self.max_size)
         return True
 
 
@@ -148,60 +158,14 @@ class ObservationNormalizer:
         return False
 
 
-def build_model_temporal_cnn(sequence_length, features_per_timestep, num_assets,
-                              d_model, num_layers, cnn_filters, dropout_rate):
-    from tensorflow.keras import layers
-    
-    TEMPORAL_CNN_KERNELS = [7, 5, 3, 3, 3, 3, 3, 3]
-    TEMPORAL_CNN_DILATIONS = [1, 1, 2, 4, 8, 16, 32, 64]
-    
-    REWARD_BUCKETS = [-250, -100, -25, 0, 25, 50, 100, 200, 400]
-    NUM_REWARD_BUCKETS = len(REWARD_BUCKETS) + 1
-    
-    inputs = layers.Input(shape=(sequence_length, features_per_timestep))
-    
-    x = layers.Conv1D(cnn_filters, 1, name='temporal_input_project')(inputs)
-    
-    for i in range(num_layers):
-        residual = x
-        
-        kernel = TEMPORAL_CNN_KERNELS[min(i, len(TEMPORAL_CNN_KERNELS) - 1)]
-        dilation = TEMPORAL_CNN_DILATIONS[min(i, len(TEMPORAL_CNN_DILATIONS) - 1)]
-        
-        x = layers.Conv1D(cnn_filters, kernel, dilation_rate=dilation, 
-                         padding='same', activation='gelu', 
-                         name=f'temporal_conv_{i}')(x)
-        x = layers.BatchNormalization(name=f'temporal_bn_{i}')(x)
-        x = layers.Dropout(dropout_rate, name=f'temporal_drop_{i}')(x)
-        
-        x = layers.Add(name=f'temporal_residual_{i}')([x, residual])
-    
-    x = layers.Conv1D(d_model, 1, activation='gelu', name='temporal_project')(x)
-    x = layers.Dropout(dropout_rate, name='temporal_project_drop')(x)
-    
-    pooled = layers.GlobalAveragePooling1D(name='temporal_avg_pool')(x)
-    max_pooled = layers.GlobalMaxPooling1D(name='temporal_max_pool')(x)
-    x = layers.Concatenate(name='temporal_pool_concat')([pooled, max_pooled])
-    
-    x = layers.Dense(d_model, activation='gelu', name='temporal_dense1')(x)
-    x = layers.Dropout(dropout_rate, name='temporal_drop1')(x)
-    x = layers.Dense(d_model // 2, activation='gelu', name='temporal_dense2')(x)
-    x = layers.Dropout(dropout_rate, name='temporal_drop2')(x)
-    
-    alloc_logits = layers.Dense(num_assets, dtype='float32', name='temporal_alloc_logits')(x)
-    allocation_output = layers.Activation('softmax', dtype='float32', name='allocation')(alloc_logits)
-    
-    reward_logits = layers.Dense(NUM_REWARD_BUCKETS, dtype='float32', name='temporal_reward_logits')(x)
-    reward_output = layers.Activation('softmax', dtype='float32', name='reward')(reward_logits)
-    
-    model = keras.Model(inputs=inputs, outputs=[allocation_output, reward_output])
-    
-    return model
-
-
 def bucket_to_reward_estimate(bucket_probs):
     bucket_centers = np.array([-350, -175, -62.5, -12.5, 12.5, 37.5, 75, 150, 300, 500], dtype=np.float32)
-    return np.sum(bucket_probs * bucket_centers, axis=-1)
+    if np.any(np.isnan(bucket_probs)):
+        return 0.0
+    result = np.sum(bucket_probs * bucket_centers, axis=-1)
+    if np.isnan(result):
+        return 0.0
+    return result
 
 
 def check_weights_for_nan(model):
@@ -224,12 +188,13 @@ def restore_weights_checkpoint(model, checkpoint):
 
 
 class OnlineTrainer:
-    def __init__(self, model, normalizer, optimizer, replay_buffer=None):
+    def __init__(self, model, normalizer, optimizer, replay_buffer=None, uses_scratchpad=False):
         self.model = model
         self.normalizer = normalizer
         self.optimizer = optimizer
         self.reward_normalizer = RewardNormalizer()
         self.replay_buffer = replay_buffer
+        self.uses_scratchpad = uses_scratchpad
         self.last_checkpoint = None
         self.episode_stats = {
             'rewards': [],
@@ -243,13 +208,27 @@ class OnlineTrainer:
     def get_action(self, obs, use_monte_carlo=True):
         obs_norm = self.normalizer.normalize(obs.reshape(1, *obs.shape)).astype(np.float32)
         
-        if use_monte_carlo and NUM_PREDICTIONS > 1:
+        if np.any(np.isnan(obs_norm)) or np.any(np.isinf(obs_norm)):
+            obs_norm = np.nan_to_num(obs_norm, nan=0.0, posinf=1.0, neginf=-1.0)
+        
+        bucket_probs = None
+        
+        if use_monte_carlo and NUM_PREDICTIONS > 1 and not self.uses_scratchpad:
             allocation_preds = []
             reward_preds = []
             for _ in range(NUM_PREDICTIONS):
                 alloc, rew = self.model(obs_norm, training=True)
-                allocation_preds.append(alloc.numpy())
-                reward_preds.append(rew.numpy())
+                alloc_np = alloc.numpy()
+                rew_np = rew.numpy()
+                if not np.any(np.isnan(alloc_np)) and not np.any(np.isnan(rew_np)):
+                    allocation_preds.append(alloc_np)
+                    reward_preds.append(rew_np)
+            
+            if len(allocation_preds) == 0:
+                alloc, rew = self.model(obs_norm, training=False)
+                allocation = np.nan_to_num(alloc.numpy()[0], nan=1.0/len(alloc.numpy()[0]))
+                allocation = allocation / (np.sum(allocation) + 1e-8)
+                return allocation, np.zeros_like(allocation), 0.0, 0.0, np.ones(10) / 10.0
             
             allocation_preds = np.array(allocation_preds)
             reward_preds = np.array(reward_preds)
@@ -257,19 +236,24 @@ class OnlineTrainer:
             allocation = np.mean(allocation_preds, axis=0)[0]
             allocation_std = np.std(allocation_preds, axis=0)[0]
             
-            mean_bucket_probs = np.mean(reward_preds, axis=0)[0]
-            pred_reward = bucket_to_reward_estimate(mean_bucket_probs)
+            bucket_probs = np.mean(reward_preds, axis=0)[0]
+            pred_reward = bucket_to_reward_estimate(bucket_probs)
             pred_reward_std = np.std([bucket_to_reward_estimate(r[0]) for r in reward_preds])
         else:
             alloc, rew = self.model(obs_norm, training=False)
             allocation = alloc.numpy()[0]
             allocation_std = np.zeros_like(allocation)
-            pred_reward = bucket_to_reward_estimate(rew.numpy()[0])
+            bucket_probs = rew.numpy()[0]
+            pred_reward = bucket_to_reward_estimate(bucket_probs)
             pred_reward_std = 0.0
         
-        return allocation, allocation_std, pred_reward, pred_reward_std
+        if np.any(np.isnan(allocation)):
+            allocation = np.nan_to_num(allocation, nan=1.0/len(allocation))
+            allocation = allocation / (np.sum(allocation) + 1e-8)
+        
+        return allocation, allocation_std, pred_reward, pred_reward_std, bucket_probs
     
-    def train_step(self, obs_batch, actions_batch, rewards_batch, values_batch):
+    def train_step(self, obs_batch, actions_batch, rewards_batch, values_batch, benchmark_batch=None):
         self.last_checkpoint = save_weights_checkpoint(self.model)
         
         self.reward_normalizer.update(rewards_batch)
@@ -277,42 +261,83 @@ class OnlineTrainer:
         
         obs_norm = tf.constant(self.normalizer.normalize(obs_batch).astype(np.float32))
         actions_tf = tf.constant(actions_batch.astype(np.float32))
+        rewards_tf = tf.constant(rewards_batch.astype(np.float32))
         rewards_norm_tf = tf.constant(rewards_normalized.astype(np.float32))
+        
+        if benchmark_batch is not None:
+            benchmark_tf = tf.constant(benchmark_batch.astype(np.float32))
+            excess_returns = rewards_tf - benchmark_tf
+        else:
+            excess_returns = rewards_tf
+        
+        bucket_centers = tf.constant(
+            np.array([-350, -175, -62.5, -12.5, 12.5, 37.5, 75, 150, 300, 500], dtype=np.float32)
+        )
+        bucket_boundaries = tf.constant(
+            np.array([-250, -100, -25, 0, 25, 50, 100, 200, 400], dtype=np.float32)
+        )
         
         with tf.GradientTape() as tape:
             alloc_pred, reward_pred = self.model(obs_norm, training=True)
             
-            pred_values = tf.reduce_sum(reward_pred * tf.constant(
-                np.array([-350, -175, -62.5, -12.5, 12.5, 37.5, 75, 150, 300, 500], dtype=np.float32)
-            ), axis=-1)
-            norm_mean = tf.constant(self.reward_normalizer.mean, dtype=tf.float32)
-            norm_std = tf.sqrt(tf.constant(self.reward_normalizer.var + 1e-8, dtype=tf.float32))
-            pred_values_normalized = (pred_values - norm_mean) / norm_std
-            value_loss = tf.reduce_mean(tf.square(pred_values_normalized - rewards_norm_tf))
+            pred_values = tf.reduce_sum(reward_pred * bucket_centers, axis=-1)
+            
+            value_mse_loss = tf.reduce_mean(tf.square((pred_values - rewards_tf) / 50.0))
+            
+            reward_bucket_indices = tf.zeros_like(rewards_tf, dtype=tf.int32)
+            for i in range(9):
+                reward_bucket_indices = tf.where(
+                    rewards_tf >= bucket_boundaries[i],
+                    tf.ones_like(reward_bucket_indices) * (i + 1),
+                    reward_bucket_indices
+                )
+            reward_onehot = tf.one_hot(reward_bucket_indices, depth=10)
+            bucket_ce_loss = -tf.reduce_mean(tf.reduce_sum(reward_onehot * tf.math.log(tf.clip_by_value(reward_pred, 1e-8, 1.0)), axis=-1))
+            
+            value_loss = value_mse_loss + bucket_ce_loss
             
             alloc_mse = tf.reduce_mean(tf.square(alloc_pred - actions_tf), axis=-1)
             
-            reward_weight = tf.abs(rewards_norm_tf) + 0.1
+            profitable_mask = tf.cast(rewards_tf > 0, tf.float32)
+            outperform_mask = tf.cast(excess_returns > 0, tf.float32)
+            profitable_and_outperform = profitable_mask * outperform_mask
             
-            allocation_loss = tf.where(
-                rewards_norm_tf > 0,
-                alloc_mse * reward_weight,
-                alloc_mse * reward_weight * 0.1
+            allocation_weight = tf.where(
+                profitable_and_outperform > 0,
+                tf.abs(rewards_tf) / 10.0 + 1.0,
+                tf.where(
+                    profitable_mask > 0,
+                    tf.abs(rewards_tf) / 20.0 + 0.5,
+                    0.05
+                )
             )
-            allocation_loss = tf.reduce_mean(allocation_loss)
+            allocation_loss = tf.reduce_mean(alloc_mse * allocation_weight)
             
-            entropy = -tf.reduce_sum(alloc_pred * tf.math.log(alloc_pred + 1e-8), axis=-1)
+            positive_bucket_probs = tf.reduce_sum(reward_pred[:, 4:], axis=-1)
+            positive_bucket_probs = tf.clip_by_value(positive_bucket_probs, 1e-6, 1.0 - 1e-6)
+            win_rate_loss = -tf.reduce_mean(profitable_mask * tf.math.log(positive_bucket_probs) +
+                                            (1 - profitable_mask) * tf.math.log(1 - positive_bucket_probs))
+            
+            profit_loss = -tf.reduce_mean(rewards_tf) / 50.0
+            
+            profitable_excess = tf.where(rewards_tf > 0, excess_returns, tf.zeros_like(excess_returns))
+            outperformance_loss = -tf.reduce_mean(profitable_excess) / 100.0
+            
+            entropy = -tf.reduce_sum(alloc_pred * tf.math.log(tf.clip_by_value(alloc_pred, 1e-6, 1.0)), axis=-1)
             entropy_bonus = tf.reduce_mean(entropy)
             
             total_loss = (ALLOCATION_LOSS_WEIGHT * allocation_loss + 
-                         REWARD_LOSS_WEIGHT * value_loss - 
+                         REWARD_LOSS_WEIGHT * value_loss +
+                         WIN_RATE_WEIGHT * win_rate_loss +
+                         REWARD_MAXIMIZE_WEIGHT * profit_loss +
+                         OUTPERFORMANCE_WEIGHT * outperformance_loss -
                          ENTROPY_BONUS * entropy_bonus)
         
         if tf.math.is_nan(total_loss) or tf.math.is_inf(total_loss):
             if ROLLBACK_ON_NAN and self.last_checkpoint is not None:
                 restore_weights_checkpoint(self.model, self.last_checkpoint)
                 print("NaN in loss, rolled back weights")
-            return None, None, None, None, True
+            return None, None, None, None, None, None, None, True
         
         gradients = tape.gradient(total_loss, self.model.trainable_variables)
         
@@ -326,7 +351,7 @@ class OnlineTrainer:
             if ROLLBACK_ON_NAN and self.last_checkpoint is not None:
                 restore_weights_checkpoint(self.model, self.last_checkpoint)
                 print("NaN in gradients, rolled back weights")
-            return None, None, None, None, True
+            return None, None, None, None, None, None, None, True
         
         gradients, _ = tf.clip_by_global_norm(gradients, GRADIENT_CLIP_NORM)
         
@@ -336,11 +361,14 @@ class OnlineTrainer:
             if ROLLBACK_ON_NAN and self.last_checkpoint is not None:
                 restore_weights_checkpoint(self.model, self.last_checkpoint)
                 print("NaN in weights after update, rolled back")
-            return None, None, None, None, True
+            return None, None, None, None, None, None, None, True
         
         return (float(total_loss.numpy()), 
                 float(allocation_loss.numpy()), 
                 float(value_loss.numpy()), 
+                float(win_rate_loss.numpy()),
+                float(profit_loss.numpy()),
+                float(outperformance_loss.numpy()),
                 float(entropy_bonus.numpy()),
                 False)
     
@@ -351,6 +379,7 @@ class OnlineTrainer:
         actions = []
         rewards = []
         values = []
+        benchmark_rewards = []
         infos = []
         
         total_fees = 0.0
@@ -358,20 +387,27 @@ class OnlineTrainer:
         
         initial_portfolio = env._portfolio_portfolio_value()
         initial_benchmark = env._update_benchmark_value()
+        prev_benchmark = initial_benchmark
         
         allocation_sums = np.zeros(len(env.asset_names))
+        bucket_centers = np.array([-350, -175, -62.5, -12.5, 12.5, 37.5, 75, 150, 300, 500])
         
         for step in range(max_steps):
-            allocation, alloc_std, pred_reward, pred_std = self.get_action(obs, MONTE_CARLO_ENABLED)
+            allocation, alloc_std, pred_reward, pred_std, bucket_probs = self.get_action(obs, MONTE_CARLO_ENABLED)
             
             prev_value = env._portfolio_portfolio_value()
             
             obs_next, reward, done, info = env.step(allocation)
             
+            current_benchmark = info.get('benchmark_value', prev_benchmark)
+            benchmark_reward = current_benchmark - prev_benchmark
+            prev_benchmark = current_benchmark
+            
             observations.append(obs)
             actions.append(allocation)
             rewards.append(reward)
             values.append(pred_reward)
+            benchmark_rewards.append(benchmark_reward)
             infos.append(info)
             
             total_fees += info.get('fees_paid', 0.0)
@@ -382,9 +418,12 @@ class OnlineTrainer:
             
             if log_steps:
                 current_portfolio = env._portfolio_portfolio_value()
-                current_benchmark = env._update_benchmark_value()
                 step_portfolio_return = (current_portfolio - initial_portfolio) / initial_portfolio * 100
                 step_benchmark_return = (current_benchmark - initial_benchmark) / initial_benchmark * 100
+                
+                max_bucket_idx = int(np.argmax(bucket_probs))
+                max_bucket_prob = float(np.max(bucket_probs))
+                bucket_entropy = float(-np.sum(bucket_probs * np.log(np.clip(bucket_probs, 1e-8, 1.0))))
                 
                 step_log = {
                     'step/portfolio_value': current_portfolio,
@@ -393,10 +432,19 @@ class OnlineTrainer:
                     'step/benchmark_return': step_benchmark_return,
                     'step/excess_return': step_portfolio_return - step_benchmark_return,
                     'step/reward': reward,
+                    'step/benchmark_reward': benchmark_reward,
+                    'step/excess_reward': reward - benchmark_reward,
                     'step/pred_reward': pred_reward,
                     'step/pred_reward_std': pred_std,
-                    'step/fees_cumulative': total_fees
+                    'step/fees_cumulative': total_fees,
+                    'step/bucket_max_prob': max_bucket_prob,
+                    'step/bucket_max_idx': max_bucket_idx,
+                    'step/bucket_max_center': bucket_centers[max_bucket_idx],
+                    'step/bucket_entropy': bucket_entropy
                 }
+                
+                for i in range(len(bucket_probs)):
+                    step_log[f'step/bucket_prob_{i}'] = float(bucket_probs[i])
                 
                 for i, asset in enumerate(env.asset_names):
                     step_log[f'step/alloc_{asset}'] = float(allocation[i])
@@ -423,6 +471,8 @@ class OnlineTrainer:
         for i, asset in enumerate(env.asset_names):
             holding_ratios[asset] = float(avg_allocation[i])
         
+        outperform_rate = sum(1 for r, b in zip(rewards, benchmark_rewards) if r > b) / len(rewards) * 100 if rewards else 0
+        
         episode_info = {
             'n_steps': n_steps,
             'initial_portfolio': initial_portfolio,
@@ -438,11 +488,12 @@ class OnlineTrainer:
             'total_reward': sum(rewards),
             'avg_reward': np.mean(rewards) if rewards else 0,
             'win_rate': sum(1 for r in rewards if r > 0) / len(rewards) * 100 if rewards else 0,
+            'outperform_rate': outperform_rate,
             'holding_ratios': holding_ratios
         }
         
         return (np.array(observations), np.array(actions), 
-                np.array(rewards), np.array(values), episode_info)
+                np.array(rewards), np.array(values), np.array(benchmark_rewards), episode_info)
 
 
 def finetune():
@@ -457,14 +508,53 @@ def finetune():
     sequence_length = config['sequence_length']
     features_per_timestep = config['features_per_timestep']
     num_assets = config['num_assets']
+    model_type = config.get('model_type', 'temporal-cnn')
     
-    model = build_model_temporal_cnn(
-        sequence_length, features_per_timestep, num_assets,
-        d_model=config['d_model'],
-        num_layers=config.get('num_layers', 8),
-        cnn_filters=config.get('cnn_filters', 512),
-        dropout_rate=config['dropout_rate']
-    )
+    from preTrain import (build_model_temporal_cnn, build_model_iterative_refine,
+                          build_model, build_model_v2, build_model_lstm,
+                          build_model_dense, build_model_cnn, build_model_hybrid_attention)
+    
+    print(f"Loading model type: {model_type}")
+    
+    if model_type == 'iterative-refine':
+        model = build_model_iterative_refine(
+            sequence_length, features_per_timestep, num_assets,
+            cnn_filters=config.get('cnn_filters', 512),
+            dropout_rate=config['dropout_rate']
+        )
+    elif model_type == 'temporal-cnn':
+        model = build_model_temporal_cnn(
+            sequence_length, features_per_timestep, num_assets,
+            d_model=config['d_model'],
+            cnn_filters=config.get('cnn_filters', 512),
+            dropout_rate=config['dropout_rate']
+        )
+    elif model_type == 'v2-cnn-transformer-cnn':
+        model = build_model_v2(
+            sequence_length, features_per_timestep, num_assets,
+            d_model=config['d_model'],
+            num_heads=config['num_heads'],
+            num_blocks=config['num_layers'],
+            cnn_filters=config.get('cnn_filters', 512),
+            dropout_rate=config['dropout_rate']
+        )
+    elif model_type == 'hybrid-attention':
+        model = build_model_hybrid_attention(
+            sequence_length, features_per_timestep, num_assets,
+            d_model=config['d_model'],
+            num_heads=config['num_heads'],
+            num_layers=config['num_layers'],
+            cnn_filters=config.get('cnn_filters', 512),
+            dropout_rate=config['dropout_rate']
+        )
+    else:
+        model = build_model(
+            sequence_length, features_per_timestep, num_assets,
+            d_model=config['d_model'],
+            num_heads=config['num_heads'],
+            num_layers=config['num_layers'],
+            dropout_rate=config['dropout_rate']
+        )
     
     if os.path.exists(BEST_MODEL_PATH):
         model.load_weights(BEST_MODEL_PATH)
@@ -489,7 +579,8 @@ def finetune():
         if replay_buffer.load(REPLAY_BUFFER_PATH):
             print(f"Loaded replay buffer with {len(replay_buffer)} experiences")
     
-    trainer = OnlineTrainer(model, normalizer, optimizer, replay_buffer)
+    trainer = OnlineTrainer(model, normalizer, optimizer, replay_buffer, 
+                            uses_scratchpad=(model_type == 'iterative-refine'))
     
     wandb.init(project=WANDB_PROJECT, config={
         'num_predictions': NUM_PREDICTIONS,
@@ -525,10 +616,20 @@ def finetune():
     print(f"  Monte Carlo predictions: {NUM_PREDICTIONS if MONTE_CARLO_ENABLED else 1}")
     print(f"  Replay buffer: {len(replay_buffer)} experiences")
     
+    if len(replay_buffer) >= REPLAY_MIN_SIZE:
+        warmup_batches = min(100, len(replay_buffer) // BATCH_SIZE)
+        print(f"\nWarmup training on {warmup_batches} batches from replay buffer...")
+        for i in range(warmup_batches):
+            obs_batch, act_batch, rew_batch, val_batch, bench_batch = replay_buffer.sample(BATCH_SIZE)
+            result = trainer.train_step(obs_batch, act_batch, rew_batch, val_batch, bench_batch)
+            if i % 20 == 0 and result[7] is False:
+                print(f"  Warmup batch {i}/{warmup_batches}, loss: {result[0]:.4f}")
+        print("Warmup complete\n")
+    
     for episode in range(MAX_EPISODES):
-        observations, actions, rewards, values, episode_info = trainer.run_episode(env)
+        observations, actions, rewards, values, benchmark_rewards, episode_info = trainer.run_episode(env)
         
-        replay_buffer.add_batch(observations, actions, rewards, values)
+        replay_buffer.add_batch(observations, actions, rewards, values, benchmark_rewards)
         
         if len(replay_buffer) >= REPLAY_MIN_SIZE:
             total_loss_sum = 0.0
@@ -553,14 +654,15 @@ def finetune():
                 act_batch = actions[batch_indices]
                 rew_batch = rewards[batch_indices]
                 val_batch = values[batch_indices]
+                bench_batch = benchmark_rewards[batch_indices]
                 
-                result = trainer.train_step(obs_batch, act_batch, rew_batch, val_batch)
+                result = trainer.train_step(obs_batch, act_batch, rew_batch, val_batch, bench_batch)
                 
-                if result[4]:
+                if result[7]:
                     nan_count += 1
                     continue
                 
-                total_loss, alloc_loss, value_loss, entropy = result[:4]
+                total_loss, alloc_loss, value_loss, win_loss, rew_max_loss, outperf_loss, entropy = result[:7]
                 total_loss_sum += total_loss
                 alloc_loss_sum += alloc_loss
                 value_loss_sum += value_loss
@@ -568,15 +670,15 @@ def finetune():
                 n_batches += 1
             
             for _ in range(n_replay_batches):
-                obs_batch, act_batch, rew_batch, val_batch = replay_buffer.sample(BATCH_SIZE)
+                obs_batch, act_batch, rew_batch, val_batch, bench_batch = replay_buffer.sample(BATCH_SIZE)
                 
-                result = trainer.train_step(obs_batch, act_batch, rew_batch, val_batch)
+                result = trainer.train_step(obs_batch, act_batch, rew_batch, val_batch, bench_batch)
                 
-                if result[4]:
+                if result[7]:
                     nan_count += 1
                     continue
                 
-                total_loss, alloc_loss, value_loss, entropy = result[:4]
+                total_loss, alloc_loss, value_loss, win_loss, rew_max_loss, outperf_loss, entropy = result[:7]
                 total_loss_sum += total_loss
                 alloc_loss_sum += alloc_loss
                 value_loss_sum += value_loss
@@ -611,6 +713,7 @@ def finetune():
             'total_reward': episode_info['total_reward'],
             'avg_reward': episode_info['avg_reward'],
             'win_rate': episode_info['win_rate'],
+            'outperform_rate': episode_info['outperform_rate'],
             'loss/total': avg_total_loss,
             'loss/allocation': avg_alloc_loss,
             'loss/value': avg_value_loss,
@@ -629,7 +732,7 @@ def finetune():
             print(f"  Portfolio: {episode_info['portfolio_return']:.2f}% | Benchmark: {episode_info['benchmark_return']:.2f}% | Excess: {episode_info['excess_return']:.2f}%")
             print(f"  Rolling Avg Excess: {rolling_avg_return:.2f}%")
             print(f"  Fees: ${episode_info['total_fees']:.2f} | Turnover: {episode_info['avg_turnover']*100:.1f}%")
-            print(f"  Win Rate: {episode_info['win_rate']:.1f}% | Avg Reward: ${episode_info['avg_reward']:.2f}")
+            print(f"  Win Rate: {episode_info['win_rate']:.1f}% | Outperform Rate: {episode_info['outperform_rate']:.1f}%")
             print(f"  Loss: {avg_total_loss:.4f} (A:{avg_alloc_loss:.4f} V:{avg_value_loss:.4f} E:{avg_entropy:.4f})")
             print(f"  Replay buffer: {len(replay_buffer)} experiences")
             if nan_count > 0:
@@ -652,8 +755,9 @@ def finetune():
                     print(f"  New best model saved! Avg loss: {best_avg_loss:.6f}")
                     wandb.log({'best_avg_loss': best_avg_loss})
         
-        if episode % 100 == 0 and episode > 0:
+        if episode % 20 == 0 and episode > 0:
             replay_buffer.save(REPLAY_BUFFER_PATH)
+            print(f"  Replay buffer saved ({len(replay_buffer)} experiences)")
     
     replay_buffer.save(REPLAY_BUFFER_PATH)
     print(f"Saved replay buffer with {len(replay_buffer)} experiences")
