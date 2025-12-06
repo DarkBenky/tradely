@@ -120,14 +120,18 @@ class ReplayBuffer:
     def load(self, filepath):
         if not os.path.exists(filepath):
             return False
-        with open(filepath, 'rb') as f:
-            data = pickle.load(f)
-        self.observations = deque(data['observations'], maxlen=self.max_size)
-        self.actions = deque(data['actions'], maxlen=self.max_size)
-        self.rewards = deque(data['rewards'], maxlen=self.max_size)
-        self.values = deque(data.get('values', [0.0] * len(self.rewards)), maxlen=self.max_size)
-        self.benchmark_rewards = deque(data.get('benchmark_rewards', [0.0] * len(self.rewards)), maxlen=self.max_size)
-        return True
+        try:
+            with open(filepath, 'rb') as f:
+                data = pickle.load(f)
+            self.observations = deque(data['observations'], maxlen=self.max_size)
+            self.actions = deque(data['actions'], maxlen=self.max_size)
+            self.rewards = deque(data['rewards'], maxlen=self.max_size)
+            self.values = deque(data.get('values', [0.0] * len(self.rewards)), maxlen=self.max_size)
+            self.benchmark_rewards = deque(data.get('benchmark_rewards', [0.0] * len(self.rewards)), maxlen=self.max_size)
+            return True
+        except (EOFError, pickle.UnpicklingError, KeyError):
+            print(f"Corrupted replay buffer at {filepath}, starting fresh")
+            return False
 
 
 def load_model_config():
