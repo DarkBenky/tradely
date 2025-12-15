@@ -9,3 +9,4 @@ trainData
 *.h5
 *.csv
 *.pkl
+*.json
