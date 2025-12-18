@@ -10,3 +10,4 @@ trainData
 *.csv
 *.pkl
 *.json
+*.keras
