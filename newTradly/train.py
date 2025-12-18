@@ -5,7 +5,9 @@ import numpy as np
 import wandb
 from wandb.integration.keras import WandbMetricsLogger, WandbModelCheckpoint
 from createTraningSet import create_training_set
-from params import WINDOW_SIZE, BATCH_SIZE, EPOCHS, LEARNING_RATE
+from params import WINDOW_SIZE, BATCH_SIZE, EPOCHS, LEARNING_RATE, NEXT_PRICE_PREDICTION, NEXT_PRICE_PREDICTION_1, NEXT_PRICE_PREDICTION_2
+import json
+import matplotlib.pyplot as plt
 
 def create_lstm_model(input_shape, num_buckets):
     inputs = keras.Input(shape=input_shape)
@@ -24,6 +26,71 @@ def create_lstm_model(input_shape, num_buckets):
     model = keras.Model(inputs=inputs, outputs=[output_next, output_next_1, output_next_2])
     
     return model
+
+def distribution_to_value(distribution, bucket_config):
+    buckets = np.array(bucket_config['close']['buckets'])
+    bucket_centers = (buckets[:-1] + buckets[1:]) / 2
+    predicted_value = np.sum(distribution * bucket_centers)
+    return predicted_value
+
+def create_prediction_charts(model, X_test, y_test_next, y_test_next_1, y_test_next_2):
+    bucket_config = json.load(open('bucket_config.json'))
+    
+    pred_next, pred_next_1, pred_next_2 = model.predict(X_test, verbose=0)
+    
+    num_samples = min(5, len(X_test))
+    fig, axes = plt.subplots(num_samples, 3, figsize=(18, 5 * num_samples))
+    if num_samples == 1:
+        axes = axes.reshape(1, -1)
+    
+    for sample_idx in range(num_samples):
+        pred_val_next = distribution_to_value(pred_next[sample_idx], bucket_config)
+        pred_val_next_1 = distribution_to_value(pred_next_1[sample_idx], bucket_config)
+        pred_val_next_2 = distribution_to_value(pred_next_2[sample_idx], bucket_config)
+        
+        real_val_next = distribution_to_value(y_test_next[sample_idx], bucket_config)
+        real_val_next_1 = distribution_to_value(y_test_next_1[sample_idx], bucket_config)
+        real_val_next_2 = distribution_to_value(y_test_next_2[sample_idx], bucket_config)
+        
+        buckets = np.array(bucket_config['close']['buckets'])
+        bucket_centers = (buckets[:-1] + buckets[1:]) / 2
+        
+        axes[sample_idx, 0].bar(range(len(pred_next[sample_idx])), pred_next[sample_idx], alpha=0.7, label='Predicted')
+        axes[sample_idx, 0].bar(range(len(y_test_next[sample_idx])), y_test_next[sample_idx], alpha=0.7, label='Real')
+        axes[sample_idx, 0].axvline(np.argmax(pred_next[sample_idx]), color='r', linestyle='--', label=f'Pred: {pred_val_next:.2f}%')
+        axes[sample_idx, 0].axvline(np.argmax(y_test_next[sample_idx]), color='g', linestyle='--', label=f'Real: {real_val_next:.2f}%')
+        axes[sample_idx, 0].set_title(f'Sample {sample_idx + 1} - Next Hour')
+        axes[sample_idx, 0].set_xlabel('Bucket')
+        axes[sample_idx, 0].set_ylabel('Probability')
+        axes[sample_idx, 0].legend()
+        axes[sample_idx, 0].grid(True, alpha=0.3)
+        
+        axes[sample_idx, 1].bar(range(len(pred_next_1[sample_idx])), pred_next_1[sample_idx], alpha=0.7, label='Predicted')
+        axes[sample_idx, 1].bar(range(len(y_test_next_1[sample_idx])), y_test_next_1[sample_idx], alpha=0.7, label='Real')
+        axes[sample_idx, 1].axvline(np.argmax(pred_next_1[sample_idx]), color='r', linestyle='--', label=f'Pred: {pred_val_next_1:.2f}%')
+        axes[sample_idx, 1].axvline(np.argmax(y_test_next_1[sample_idx]), color='g', linestyle='--', label=f'Real: {real_val_next_1:.2f}%')
+        axes[sample_idx, 1].set_title(f'Sample {sample_idx + 1} - Next 12 Hours')
+        axes[sample_idx, 1].set_xlabel('Bucket')
+        axes[sample_idx, 1].set_ylabel('Probability')
+        axes[sample_idx, 1].legend()
+        axes[sample_idx, 1].grid(True, alpha=0.3)
+        
+        axes[sample_idx, 2].bar(range(len(pred_next_2[sample_idx])), pred_next_2[sample_idx], alpha=0.7, label='Predicted')
+        axes[sample_idx, 2].bar(range(len(y_test_next_2[sample_idx])), y_test_next_2[sample_idx], alpha=0.7, label='Real')
+        axes[sample_idx, 2].axvline(np.argmax(pred_next_2[sample_idx]), color='r', linestyle='--', label=f'Pred: {pred_val_next_2:.2f}%')
+        axes[sample_idx, 2].axvline(np.argmax(y_test_next_2[sample_idx]), color='g', linestyle='--', label=f'Real: {real_val_next_2:.2f}%')
+        axes[sample_idx, 2].set_title(f'Sample {sample_idx + 1} - Next 30 Days')
+        axes[sample_idx, 2].set_xlabel('Bucket')
+        axes[sample_idx, 2].set_ylabel('Probability')
+        axes[sample_idx, 2].legend()
+        axes[sample_idx, 2].grid(True, alpha=0.3)
+    
+    plt.tight_layout()
+    plt.savefig('prediction_charts.png', dpi=100, bbox_inches='tight')
+    print("Saved prediction_charts.png")
+    
+    wandb.log({"prediction_charts": wandb.Image("prediction_charts.png")})
+    plt.close()
 
 def train():
     wandb.init(
@@ -90,6 +157,9 @@ def train():
     
     model.save('final_model.keras')
     print("\nTraining complete. Model saved.")
+    
+    print("\nGenerating prediction charts...")
+    create_prediction_charts(model, X_val, y_val_next, y_val_next_1, y_val_next_2)
     
     wandb.finish()
 
