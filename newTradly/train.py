@@ -5,23 +5,22 @@ import numpy as np
 import wandb
 from wandb.integration.keras import WandbMetricsLogger, WandbModelCheckpoint
 from createTraningSet import create_training_set
-from params import WINDOW_SIZE, BATCH_SIZE, EPOCHS, LEARNING_RATE, NEXT_PRICE_PREDICTION, NEXT_PRICE_PREDICTION_1, NEXT_PRICE_PREDICTION_2
+from params import WINDOW_SIZE, BATCH_SIZE, EPOCHS, LEARNING_RATE, NEXT_PRICE_PREDICTION, NEXT_PRICE_PREDICTION_1, NEXT_PRICE_PREDICTION_2, LSTM_LAYERS, DROPOUT_RATE, DENSE_ACTIVATION
 import json
 import matplotlib.pyplot as plt
 
 def create_lstm_model(input_shape, num_buckets):
     inputs = keras.Input(shape=input_shape)
     
-    x = layers.LSTM(128, return_sequences=True)(inputs)
-    x = layers.Dropout(0.2)(x)
-    x = layers.LSTM(64, return_sequences=True)(x)
-    x = layers.Dropout(0.2)(x)
-    x = layers.LSTM(32)(x)
-    x = layers.Dropout(0.2)(x)
+    x = inputs
+    for i, units in enumerate(LSTM_LAYERS):
+        return_sequences = i < len(LSTM_LAYERS) - 1
+        x = layers.LSTM(units, return_sequences=return_sequences)(x)
+        x = layers.Dropout(DROPOUT_RATE)(x)
     
-    output_next = layers.Dense(num_buckets, activation='softmax', name='next')(x)
-    output_next_1 = layers.Dense(num_buckets, activation='softmax', name='next_1')(x)
-    output_next_2 = layers.Dense(num_buckets, activation='softmax', name='next_2')(x)
+    output_next = layers.Dense(num_buckets, activation=DENSE_ACTIVATION, name='next')(x)
+    output_next_1 = layers.Dense(num_buckets, activation=DENSE_ACTIVATION, name='next_1')(x)
+    output_next_2 = layers.Dense(num_buckets, activation=DENSE_ACTIVATION, name='next_2')(x)
     
     model = keras.Model(inputs=inputs, outputs=[output_next, output_next_1, output_next_2])
     
@@ -106,7 +105,7 @@ def train():
     )
     
     print("Generating training data...")
-    X_train, (y_next, y_next_1, y_next_2) = create_training_set(100_000, 5000)
+    X_train, (y_next, y_next_1, y_next_2) = create_training_set(100_000, 15_000)
     print(f"Training data shape: {X_train.shape}")
     print(f"Target shapes: {y_next.shape}, {y_next_1.shape}, {y_next_2.shape}")
     

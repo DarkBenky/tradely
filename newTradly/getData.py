@@ -2,8 +2,8 @@ import yfinance as yf
 import numpy as np
 import json
 import os
+from params import TIMEFRAMES
 
-INTERVAL = '1h'
 BUCKETS = 24
 
 CryptoTickers = ['BTC-USD', 'ETH-USD', 'XRP-USD', 'LTC-USD', 'BCH-USD', 'ADA-USD', 'DOT-USD', 'LINK-USD', 'BNB-USD', 'XLM-USD', 'DOGE-USD', 'SOL-USD', 'MATIC-USD', 'AVAX-USD', 'SHIB-USD']
@@ -21,45 +21,51 @@ crypto_tickers = [{'Symbol': symbol} for symbol in CryptoTickers]
 all_tickers = tickers + crypto_tickers
 
 for i, ticker in enumerate(all_tickers):
-    try:
-        t = ticker['Symbol']
-        print(f"Processing {i+1}/{len(all_tickers)}: {t}")
-        t = yf.Ticker(t)
-        hist = t.history(interval=INTERVAL, period='730d')
-        
-        if len(hist) < 2:
-            continue
+    for timeframe in TIMEFRAMES:
+        try:
+            t = ticker['Symbol']
+            interval = timeframe['interval']
+            period = timeframe['period']
+            minutes = timeframe['minutes']
             
-        close_changes = hist['Close'].pct_change(fill_method=None) * 100
-        open_changes = hist['Open'].pct_change(fill_method=None) * 100
-        high_changes = hist['High'].pct_change(fill_method=None) * 100
-        low_changes = hist['Low'].pct_change(fill_method=None) * 100
-        volume_changes = hist['Volume'].pct_change(fill_method=None) * 100
-        
-        close_changes = close_changes.replace([np.inf, -np.inf], np.nan)
-        open_changes = open_changes.replace([np.inf, -np.inf], np.nan)
-        high_changes = high_changes.replace([np.inf, -np.inf], np.nan)
-        low_changes = low_changes.replace([np.inf, -np.inf], np.nan)
-        volume_changes = volume_changes.replace([np.inf, -np.inf], np.nan)
-        
-        all_close.extend(close_changes.dropna().values)
-        all_open.extend(open_changes.dropna().values)
-        all_high.extend(high_changes.dropna().values)
-        all_low.extend(low_changes.dropna().values)
-        all_volume.extend(volume_changes.dropna().values)
-        
-        data_to_save = {
-            'Open': {str(k): v for k, v in open_changes.to_dict().items() if not (np.isnan(v) or np.isinf(v))},
-            'High': {str(k): v for k, v in high_changes.to_dict().items() if not (np.isnan(v) or np.isinf(v))},
-            'Low': {str(k): v for k, v in low_changes.to_dict().items() if not (np.isnan(v) or np.isinf(v))},
-            'Close': {str(k): v for k, v in close_changes.to_dict().items() if not (np.isnan(v) or np.isinf(v))},
-            'Volume': {str(k): v for k, v in volume_changes.to_dict().items() if not (np.isnan(v) or np.isinf(v))}
-        }
+            print(f"Processing {i+1}/{len(all_tickers)}: {t} [{interval}]")
+            t = yf.Ticker(t)
+            hist = t.history(interval=interval, period=period)
+            
+            if len(hist) < 2:
+                continue
+                
+            close_changes = hist['Close'].pct_change(fill_method=None) * 100 / minutes
+            open_changes = hist['Open'].pct_change(fill_method=None) * 100 / minutes
+            high_changes = hist['High'].pct_change(fill_method=None) * 100 / minutes
+            low_changes = hist['Low'].pct_change(fill_method=None) * 100 / minutes
+            volume_changes = hist['Volume'].pct_change(fill_method=None) * 100 / minutes
+            
+            close_changes = close_changes.replace([np.inf, -np.inf], np.nan)
+            open_changes = open_changes.replace([np.inf, -np.inf], np.nan)
+            high_changes = high_changes.replace([np.inf, -np.inf], np.nan)
+            low_changes = low_changes.replace([np.inf, -np.inf], np.nan)
+            volume_changes = volume_changes.replace([np.inf, -np.inf], np.nan)
+            
+            all_close.extend(close_changes.dropna().values)
+            all_open.extend(open_changes.dropna().values)
+            all_high.extend(high_changes.dropna().values)
+            all_low.extend(low_changes.dropna().values)
+            all_volume.extend(volume_changes.dropna().values)
+            
+            data_to_save = {
+                'Open': {str(k): v for k, v in open_changes.to_dict().items() if not (np.isnan(v) or np.isinf(v))},
+                'High': {str(k): v for k, v in high_changes.to_dict().items() if not (np.isnan(v) or np.isinf(v))},
+                'Low': {str(k): v for k, v in low_changes.to_dict().items() if not (np.isnan(v) or np.isinf(v))},
+                'Close': {str(k): v for k, v in close_changes.to_dict().items() if not (np.isnan(v) or np.isinf(v))},
+                'Volume': {str(k): v for k, v in volume_changes.to_dict().items() if not (np.isnan(v) or np.isinf(v))}
+            }
 
-        with open(f"tickerData/{ticker['Symbol']}.json", "w") as f:
-            json.dump(data_to_save, f)
-    except Exception as e:
-        print(f"Error processing {ticker['Symbol']}: {e}")
+            filename = f"{ticker['Symbol']}_{interval.replace('h', 'H').replace('d', 'D')}.json"
+            with open(f"tickerData/{filename}", "w") as f:
+                json.dump(data_to_save, f)
+        except Exception as e:
+            print(f"Error processing {ticker['Symbol']} [{interval}]: {e}")
 
 all_close = np.array(all_close)
 all_open = np.array(all_open)
