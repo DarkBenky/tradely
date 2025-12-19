@@ -1,55 +1,13 @@
 import json
 import numpy as np
 import os
-from params import WINDOW_SIZE, NEXT_PRICE_PREDICTION, NEXT_PRICE_PREDICTION_1, NEXT_PRICE_PREDICTION_2
-
-def import_bucket_config(file_path='bucket_config.json'):
-    with open(file_path, 'r') as f:
-        bucket_config = json.load(f)
-    return bucket_config
-
-def value_to_distribution(value, buckets):
-    num_buckets = len(buckets) - 1
-    distribution = np.zeros(num_buckets)
-    
-    bucket_idx = np.digitize(value, buckets) - 1
-    bucket_idx = np.clip(bucket_idx, 0, num_buckets - 1)
-    
-    if bucket_idx == 0:
-        lower_bound = buckets[0]
-        upper_bound = buckets[1]
-    elif bucket_idx == num_buckets - 1:
-        lower_bound = buckets[-2]
-        upper_bound = buckets[-1]
-    else:
-        lower_bound = buckets[bucket_idx]
-        upper_bound = buckets[bucket_idx + 1]
-    
-    bucket_range = upper_bound - lower_bound
-    if bucket_range > 0:
-        position = (value - lower_bound) / bucket_range
-        position = np.clip(position, 0, 1)
-    else:
-        position = 0.5
-    
-    distribution[bucket_idx] = 1.0 - abs(position - 0.5) * 0.5
-    
-    if position < 0.5 and bucket_idx > 0:
-        distribution[bucket_idx - 1] = abs(position - 0.5) * 0.5
-    elif position > 0.5 and bucket_idx < num_buckets - 1:
-        distribution[bucket_idx + 1] = abs(position - 0.5) * 0.5
-    
-    distribution = distribution / distribution.sum()
-    
-    return distribution
+from params import WINDOW_SIZE
 
 def create_training_set(number_of_samples: int, number_of_files: int):
-    bucket_config = import_bucket_config()
-    
     X_samples = []
     y_next = []
-    y_next_1 = []
-    y_next_2 = []
+    y_half = []
+    y_full = []
     
     file_list = [f for f in os.listdir('tickerData') if f.endswith('.json')]
     samples_per_file = number_of_samples // number_of_files
@@ -81,12 +39,12 @@ def create_training_set(number_of_samples: int, number_of_files: int):
         low_prices = low_prices[:min_len]
         volume_data = volume_data[:min_len]
         
-        min_length = WINDOW_SIZE + NEXT_PRICE_PREDICTION_2
+        min_length = WINDOW_SIZE * 2
         if min_len < min_length:
             continue
         
         files_processed += 1
-        max_start_index = min_len - WINDOW_SIZE - NEXT_PRICE_PREDICTION_2
+        max_start_index = min_len - WINDOW_SIZE * 2
         
         if max_start_index <= 0:
             continue
@@ -104,37 +62,31 @@ def create_training_set(number_of_samples: int, number_of_files: int):
             X_sample = np.stack([x_close, x_open, x_high, x_low, x_volume], axis=-1)
             X_samples.append(X_sample)
             
-            y_sum = close_prices[end_index:end_index + NEXT_PRICE_PREDICTION].sum()
-            y_sum_1 = close_prices[end_index:end_index + int(NEXT_PRICE_PREDICTION_1)].sum()
-            y_sum_2 = close_prices[end_index:end_index + int(NEXT_PRICE_PREDICTION_2)].sum()
+            half_window = WINDOW_SIZE // 2
             
-            y_normalized = y_sum / NEXT_PRICE_PREDICTION
-            y_normalized_1 = y_sum_1 / NEXT_PRICE_PREDICTION_1
-            y_normalized_2 = y_sum_2 / NEXT_PRICE_PREDICTION_2
+            y_next_val = close_prices[end_index:end_index + 1].sum()
+            y_half_val = close_prices[end_index:end_index + half_window].sum()
+            y_full_val = close_prices[end_index:end_index + WINDOW_SIZE].sum()
             
-            y_dist = value_to_distribution(y_normalized, bucket_config['close']['buckets'])
-            y_dist_1 = value_to_distribution(y_normalized_1, bucket_config['close']['buckets'])
-            y_dist_2 = value_to_distribution(y_normalized_2, bucket_config['close']['buckets'])
-            
-            y_next.append(y_dist)
-            y_next_1.append(y_dist_1)
-            y_next_2.append(y_dist_2)
+            y_next.append(y_next_val)
+            y_half.append(y_half_val)
+            y_full.append(y_full_val)
     
     X = np.array(X_samples)
     y_next = np.array(y_next)
-    y_next_1 = np.array(y_next_1)
-    y_next_2 = np.array(y_next_2)
+    y_half = np.array(y_half)
+    y_full = np.array(y_full)
     
-    return X, (y_next, y_next_1, y_next_2)
+    return X, (y_next, y_half, y_full)
 
 if __name__ == "__main__":
-    X, (y_next, y_next_1, y_next_2) = create_training_set(128, 10)
+    X, (y_next, y_half, y_full) = create_training_set(128, 10)
     print("X shape:", X.shape)
     print("y_next shape:", y_next.shape)
-    print("y_next_1 shape:", y_next_1.shape)
-    print("y_next_2 shape:", y_next_2.shape)
-
+    print("y_half shape:", y_half.shape)
+    print("y_full shape:", y_full.shape)
     print("\nFirst X sample shape:", X[0].shape)
-    print("First y_next distribution:", y_next[0])
-    print("Sum of first y_next distribution:", y_next[0].sum())
+    print("First y_next:", y_next[0])
+    print("First y_half:", y_half[0])
+    print("First y_full:", y_full[0])
 

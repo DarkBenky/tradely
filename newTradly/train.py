@@ -5,11 +5,24 @@ import numpy as np
 import wandb
 from wandb.integration.keras import WandbMetricsLogger, WandbModelCheckpoint
 from createTraningSet import create_training_set
-from params import WINDOW_SIZE, BATCH_SIZE, EPOCHS, LEARNING_RATE, NEXT_PRICE_PREDICTION, NEXT_PRICE_PREDICTION_1, NEXT_PRICE_PREDICTION_2, LSTM_LAYERS, DROPOUT_RATE, DENSE_ACTIVATION
-import json
+from params import WINDOW_SIZE, BATCH_SIZE, EPOCHS, LEARNING_RATE, LSTM_LAYERS, DROPOUT_RATE, MODEL
 import matplotlib.pyplot as plt
 
-def create_lstm_model(input_shape, num_buckets):
+gpus = tf.config.list_physical_devices('GPU')
+if gpus:
+    try:
+        for gpu in gpus:
+            tf.config.experimental.set_memory_growth(gpu, True)
+        
+        tf.config.set_logical_device_configuration(
+            gpus[0],
+            [tf.config.LogicalDeviceConfiguration(memory_limit=20480)]
+        )
+        print(f"GPU memory growth enabled for {len(gpus)} GPU(s)")
+    except RuntimeError as e:
+        print(f"GPU configuration error: {e}")
+
+def create_lstm_model(input_shape):
     inputs = keras.Input(shape=input_shape)
     
     x = inputs
@@ -18,24 +31,74 @@ def create_lstm_model(input_shape, num_buckets):
         x = layers.LSTM(units, return_sequences=return_sequences)(x)
         x = layers.Dropout(DROPOUT_RATE)(x)
     
-    output_next = layers.Dense(num_buckets, activation=DENSE_ACTIVATION, name='next')(x)
-    output_next_1 = layers.Dense(num_buckets, activation=DENSE_ACTIVATION, name='next_1')(x)
-    output_next_2 = layers.Dense(num_buckets, activation=DENSE_ACTIVATION, name='next_2')(x)
+    output_next = layers.Dense(1, name='next')(x)
+    output_half = layers.Dense(1, name='half')(x)
+    output_full = layers.Dense(1, name='full')(x)
     
-    model = keras.Model(inputs=inputs, outputs=[output_next, output_next_1, output_next_2])
+    model = keras.Model(inputs=inputs, outputs=[output_next, output_half, output_full])
     
     return model
 
-def distribution_to_value(distribution, bucket_config):
-    buckets = np.array(bucket_config['close']['buckets'])
-    bucket_centers = (buckets[:-1] + buckets[1:]) / 2
-    predicted_value = np.sum(distribution * bucket_centers)
-    return predicted_value
-
-def create_prediction_charts(model, X_test, y_test_next, y_test_next_1, y_test_next_2):
-    bucket_config = json.load(open('bucket_config.json'))
+def create_gru_model(input_shape):
+    inputs = keras.Input(shape=input_shape)
     
-    pred_next, pred_next_1, pred_next_2 = model.predict(X_test, verbose=0)
+    x = inputs
+    for i, units in enumerate(LSTM_LAYERS):
+        return_sequences = i < len(LSTM_LAYERS) - 1
+        x = layers.GRU(units, return_sequences=return_sequences)(x)
+        x = layers.Dropout(DROPOUT_RATE)(x)
+    
+    output_next = layers.Dense(1, name='next')(x)
+    output_half = layers.Dense(1, name='half')(x)
+    output_full = layers.Dense(1, name='full')(x)
+    
+    model = keras.Model(inputs=inputs, outputs=[output_next, output_half, output_full])
+    
+    return model
+
+def create_transformer_model(input_shape):
+    inputs = keras.Input(shape=input_shape)
+    
+    x = layers.Dense(LSTM_LAYERS[0])(inputs)
+    
+    for i, units in enumerate(LSTM_LAYERS):
+        num_heads = min(8, units // 64)
+        if num_heads < 1:
+            num_heads = 1
+        
+        attn_output = layers.MultiHeadAttention(
+            num_heads=num_heads,
+            key_dim=units // num_heads,
+            dropout=DROPOUT_RATE
+        )(x, x)
+        attn_output = layers.Dropout(DROPOUT_RATE)(attn_output)
+        x = layers.LayerNormalization(epsilon=1e-6)(x + attn_output)
+        
+        ffn = keras.Sequential([
+            layers.Dense(units * 4, activation='relu'),
+            layers.Dropout(DROPOUT_RATE),
+            layers.Dense(units)
+        ])
+        ffn_output = ffn(x)
+        ffn_output = layers.Dropout(DROPOUT_RATE)(ffn_output)
+        x = layers.LayerNormalization(epsilon=1e-6)(x + ffn_output)
+        
+        if i < len(LSTM_LAYERS) - 1:
+            x = layers.Dense(LSTM_LAYERS[i + 1])(x)
+    
+    x = layers.GlobalAveragePooling1D()(x)
+    x = layers.Dropout(DROPOUT_RATE)(x)
+    
+    output_next = layers.Dense(1, name='next')(x)
+    output_half = layers.Dense(1, name='half')(x)
+    output_full = layers.Dense(1, name='full')(x)
+    
+    model = keras.Model(inputs=inputs, outputs=[output_next, output_half, output_full])
+    
+    return model
+
+def create_prediction_charts(model, X_test, y_test_next, y_test_half, y_test_full):
+    pred_next, pred_half, pred_full = model.predict(X_test, verbose=0)
     
     num_samples = min(5, len(X_test))
     fig, axes = plt.subplots(num_samples, 3, figsize=(18, 5 * num_samples))
@@ -43,45 +106,19 @@ def create_prediction_charts(model, X_test, y_test_next, y_test_next_1, y_test_n
         axes = axes.reshape(1, -1)
     
     for sample_idx in range(num_samples):
-        pred_val_next = distribution_to_value(pred_next[sample_idx], bucket_config)
-        pred_val_next_1 = distribution_to_value(pred_next_1[sample_idx], bucket_config)
-        pred_val_next_2 = distribution_to_value(pred_next_2[sample_idx], bucket_config)
-        
-        real_val_next = distribution_to_value(y_test_next[sample_idx], bucket_config)
-        real_val_next_1 = distribution_to_value(y_test_next_1[sample_idx], bucket_config)
-        real_val_next_2 = distribution_to_value(y_test_next_2[sample_idx], bucket_config)
-        
-        buckets = np.array(bucket_config['close']['buckets'])
-        bucket_centers = (buckets[:-1] + buckets[1:]) / 2
-        
-        axes[sample_idx, 0].bar(range(len(pred_next[sample_idx])), pred_next[sample_idx], alpha=0.7, label='Predicted')
-        axes[sample_idx, 0].bar(range(len(y_test_next[sample_idx])), y_test_next[sample_idx], alpha=0.7, label='Real')
-        axes[sample_idx, 0].axvline(np.argmax(pred_next[sample_idx]), color='r', linestyle='--', label=f'Pred: {pred_val_next:.2f}%')
-        axes[sample_idx, 0].axvline(np.argmax(y_test_next[sample_idx]), color='g', linestyle='--', label=f'Real: {real_val_next:.2f}%')
-        axes[sample_idx, 0].set_title(f'Sample {sample_idx + 1} - Next Hour')
-        axes[sample_idx, 0].set_xlabel('Bucket')
-        axes[sample_idx, 0].set_ylabel('Probability')
-        axes[sample_idx, 0].legend()
+        axes[sample_idx, 0].bar(['Predicted', 'Real'], [pred_next[sample_idx][0], y_test_next[sample_idx]], alpha=0.7)
+        axes[sample_idx, 0].set_title(f'Sample {sample_idx + 1} - Next Value')
+        axes[sample_idx, 0].set_ylabel('Cumsum Price Change')
         axes[sample_idx, 0].grid(True, alpha=0.3)
         
-        axes[sample_idx, 1].bar(range(len(pred_next_1[sample_idx])), pred_next_1[sample_idx], alpha=0.7, label='Predicted')
-        axes[sample_idx, 1].bar(range(len(y_test_next_1[sample_idx])), y_test_next_1[sample_idx], alpha=0.7, label='Real')
-        axes[sample_idx, 1].axvline(np.argmax(pred_next_1[sample_idx]), color='r', linestyle='--', label=f'Pred: {pred_val_next_1:.2f}%')
-        axes[sample_idx, 1].axvline(np.argmax(y_test_next_1[sample_idx]), color='g', linestyle='--', label=f'Real: {real_val_next_1:.2f}%')
-        axes[sample_idx, 1].set_title(f'Sample {sample_idx + 1} - Next 12 Hours')
-        axes[sample_idx, 1].set_xlabel('Bucket')
-        axes[sample_idx, 1].set_ylabel('Probability')
-        axes[sample_idx, 1].legend()
+        axes[sample_idx, 1].bar(['Predicted', 'Real'], [pred_half[sample_idx][0], y_test_half[sample_idx]], alpha=0.7)
+        axes[sample_idx, 1].set_title(f'Sample {sample_idx + 1} - Half Window')
+        axes[sample_idx, 1].set_ylabel('Cumsum Price Change')
         axes[sample_idx, 1].grid(True, alpha=0.3)
         
-        axes[sample_idx, 2].bar(range(len(pred_next_2[sample_idx])), pred_next_2[sample_idx], alpha=0.7, label='Predicted')
-        axes[sample_idx, 2].bar(range(len(y_test_next_2[sample_idx])), y_test_next_2[sample_idx], alpha=0.7, label='Real')
-        axes[sample_idx, 2].axvline(np.argmax(pred_next_2[sample_idx]), color='r', linestyle='--', label=f'Pred: {pred_val_next_2:.2f}%')
-        axes[sample_idx, 2].axvline(np.argmax(y_test_next_2[sample_idx]), color='g', linestyle='--', label=f'Real: {real_val_next_2:.2f}%')
-        axes[sample_idx, 2].set_title(f'Sample {sample_idx + 1} - Next 30 Days')
-        axes[sample_idx, 2].set_xlabel('Bucket')
-        axes[sample_idx, 2].set_ylabel('Probability')
-        axes[sample_idx, 2].legend()
+        axes[sample_idx, 2].bar(['Predicted', 'Real'], [pred_full[sample_idx][0], y_test_full[sample_idx]], alpha=0.7)
+        axes[sample_idx, 2].set_title(f'Sample {sample_idx + 1} - Full Window')
+        axes[sample_idx, 2].set_ylabel('Cumsum Price Change')
         axes[sample_idx, 2].grid(True, alpha=0.3)
     
     plt.tight_layout()
@@ -99,30 +136,39 @@ def train():
             "batch_size": BATCH_SIZE,
             "epochs": EPOCHS,
             "learning_rate": LEARNING_RATE,
-            "architecture": "LSTM",
-            "optimizer": "adam"
+            "architecture": MODEL,
+            "optimizer": "adamw",
+            "layers": LSTM_LAYERS,
+            "dropout_rate": DROPOUT_RATE
         }
     )
     
     print("Generating training data...")
-    X_train, (y_next, y_next_1, y_next_2) = create_training_set(100_000, 15_000)
+    X_train, (y_next, y_half, y_full) = create_training_set(25_000, 5_000)
     print(f"Training data shape: {X_train.shape}")
-    print(f"Target shapes: {y_next.shape}, {y_next_1.shape}, {y_next_2.shape}")
+    print(f"Target shapes: {y_next.shape}, {y_half.shape}, {y_full.shape}")
     
     print("\nGenerating validation data...")
-    X_val, (y_val_next, y_val_next_1, y_val_next_2) = create_training_set(2000, 20)
+    X_val, (y_val_next, y_val_half, y_val_full) = create_training_set(2000, 20)
     
-    num_buckets = y_next.shape[1]
     input_shape = (WINDOW_SIZE, 5)
     
-    print(f"\nCreating model with input shape {input_shape} and {num_buckets} buckets...")
-    model = create_lstm_model(input_shape, num_buckets)
+    print(f"\nCreating {MODEL} model with input shape {input_shape}...")
     
-    optimizer = keras.optimizers.Adam(learning_rate=LEARNING_RATE)
+    if MODEL == "LSTM":
+        model = create_lstm_model(input_shape)
+    elif MODEL == "GRU":
+        model = create_gru_model(input_shape)
+    elif MODEL == "Transformer":
+        model = create_transformer_model(input_shape)
+    else:
+        raise ValueError(f"Unknown model type: {MODEL}")
+    
+    optimizer = keras.optimizers.AdamW(learning_rate=LEARNING_RATE)
     model.compile(
         optimizer=optimizer,
-        loss={'next': 'categorical_crossentropy', 'next_1': 'categorical_crossentropy', 'next_2': 'categorical_crossentropy'},
-        metrics={'next': ['accuracy'], 'next_1': ['accuracy'], 'next_2': ['accuracy']}
+        loss={'next': 'mse', 'half': 'mse', 'full': 'mse'},
+        metrics={'next': ['mae'], 'half': ['mae'], 'full': ['mae']}
     )
     
     model.summary()
@@ -146,8 +192,8 @@ def train():
     print("\nStarting training...")
     history = model.fit(
         X_train,
-        {'next': y_next, 'next_1': y_next_1, 'next_2': y_next_2},
-        validation_data=(X_val, {'next': y_val_next, 'next_1': y_val_next_1, 'next_2': y_val_next_2}),
+        {'next': y_next, 'half': y_half, 'full': y_full},
+        validation_data=(X_val, {'next': y_val_next, 'half': y_val_half, 'full': y_val_full}),
         batch_size=BATCH_SIZE,
         epochs=EPOCHS,
         callbacks=callbacks,
@@ -158,7 +204,7 @@ def train():
     print("\nTraining complete. Model saved.")
     
     print("\nGenerating prediction charts...")
-    create_prediction_charts(model, X_val, y_val_next, y_val_next_1, y_val_next_2)
+    create_prediction_charts(model, X_val, y_val_next, y_val_half, y_val_full)
     
     wandb.finish()
 
