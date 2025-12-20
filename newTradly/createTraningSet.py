@@ -65,8 +65,8 @@ def create_training_set(number_of_samples: int, number_of_files: int):
             half_window = WINDOW_SIZE // 2
             
             y_next_val = close_prices[end_index:end_index + 1].sum()
-            y_half_val = close_prices[end_index:end_index + half_window].sum()
-            y_full_val = close_prices[end_index:end_index + WINDOW_SIZE].sum()
+            y_half_val = close_prices[end_index:end_index + half_window].sum() / half_window
+            y_full_val = close_prices[end_index:end_index + WINDOW_SIZE].sum() / WINDOW_SIZE
             
             y_next.append(y_next_val)
             y_half.append(y_half_val)
