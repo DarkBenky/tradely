@@ -10,17 +10,17 @@ import random
 import json
 import os
 
-MAX_PARAMS = 100_000
+MAX_PARAMS = 100_000_000
 BASE_MUTATION_RATE = 0.2
-BASE_ADD_LAYER_RATE = 0.15
+BASE_ADD_LAYER_RATE = 0.1
 BASE_REMOVE_LAYER_RATE = 0.05
 ELITE_RATIO = 0.5
-POPULATION_SIZE = 20
+POPULATION_SIZE = 40
 GENERATIONS = 10_000
-EPOCHS_PER_GEN = 1
+EPOCHS_PER_GEN = 3
 EXPLORATION_PHASE_RATIO = 0.7
-TRAIN_SAMPLES_BASE = 2_500
-TRAIN_SAMPLES_MAX = 10_000
+TRAIN_SAMPLES_BASE = 7_500
+TRAIN_SAMPLES_MAX = 125_000
 
 LAYER_TYPES = ['lstm', 'gru', 'dense', 'transformer', 'cnn']
 
@@ -99,41 +99,64 @@ def build_model_from_genome(genome, input_shape):
     inputs = keras.Input(shape=input_shape)
     x = inputs
     
-    recurrent_layers = []
     for i, layer in enumerate(genome):
         layer_type = layer['type']
         units = layer['units']
         
-        if layer_type == 'lstm':
-            return_sequences = i < len(genome) - 1 and genome[i+1]['type'] in ['lstm', 'gru', 'transformer']
-            x = layers.LSTM(units, return_sequences=return_sequences)(x)
-            recurrent_layers.append(i)
-        elif layer_type == 'gru':
-            return_sequences = i < len(genome) - 1 and genome[i+1]['type'] in ['lstm', 'gru', 'transformer']
-            x = layers.GRU(units, return_sequences=return_sequences)(x)
-            recurrent_layers.append(i)
-        elif layer_type == 'dense':
-            if len(x.shape) == 3:
-                x = layers.Flatten()(x)
-            x = layers.Dense(units, activation='relu')(x)
-        elif layer_type == 'transformer':
-            num_heads = layer.get('num_heads', 4)
-            if len(x.shape) == 2:
-                x = layers.Reshape((1, -1))(x)
+        try:
+            if layer_type == 'lstm':
+                if len(x.shape) == 2:
+                    x = layers.Reshape((1, -1))(x)
+                return_sequences = i < len(genome) - 1 and genome[i+1]['type'] in ['lstm', 'gru', 'transformer', 'cnn']
+                x = layers.LSTM(units, return_sequences=return_sequences)(x)
+            elif layer_type == 'gru':
+                if len(x.shape) == 2:
+                    x = layers.Reshape((1, -1))(x)
+                return_sequences = i < len(genome) - 1 and genome[i+1]['type'] in ['lstm', 'gru', 'transformer', 'cnn']
+                x = layers.GRU(units, return_sequences=return_sequences)(x)
+            elif layer_type == 'dense':
+                if len(x.shape) == 3:
+                    x = layers.Flatten()(x)
+                x = layers.Dense(units, activation='relu')(x)
+            elif layer_type == 'transformer':
+                num_heads = layer.get('num_heads', 4)
+                if num_heads > units:
+                    num_heads = max(1, units // 4)
+                key_dim = max(1, units // num_heads)
+                
+                if len(x.shape) == 2:
+                    x = layers.Reshape((1, -1))(x)
+                
+                current_dim = int(x.shape[-1])
+                if current_dim != units:
+                    x = layers.Dense(units)(x)
+                
+                attn = layers.MultiHeadAttention(num_heads=num_heads, key_dim=key_dim)(x, x)
+                x = layers.LayerNormalization()(x + attn)
+                ffn = layers.Dense(units * 4, activation='relu')(x)
+                ffn = layers.Dense(units)(ffn)
+                x = layers.LayerNormalization()(x + ffn)
+            elif layer_type == 'cnn':
+                kernel_size = layer.get('kernel_size', 3)
+                if len(x.shape) == 2:
+                    x = layers.Reshape((1, -1))(x)
+                
+                seq_len = int(x.shape[1])
+                if kernel_size > seq_len:
+                    kernel_size = max(1, seq_len)
+                
+                current_dim = int(x.shape[-1])
+                if current_dim != units:
+                    x = layers.Conv1D(units, 1, padding='same')(x)
+                
+                x = layers.Conv1D(units, kernel_size, padding='same', activation='relu')(x)
+                if seq_len >= 4:
+                    x = layers.MaxPooling1D(2, padding='same')(x)
             
-            attn = layers.MultiHeadAttention(num_heads=num_heads, key_dim=units//num_heads)(x, x)
-            x = layers.LayerNormalization()(x + attn)
-            ffn = layers.Dense(units * 4, activation='relu')(x)
-            ffn = layers.Dense(units)(ffn)
-            x = layers.LayerNormalization()(x + ffn)
-        elif layer_type == 'cnn':
-            kernel_size = layer.get('kernel_size', 3)
-            if len(x.shape) == 2:
-                x = layers.Reshape((1, -1))(x)
-            x = layers.Conv1D(units, kernel_size, padding='same', activation='relu')(x)
-            x = layers.MaxPooling1D(2)(x)
-        
-        x = layers.Dropout(DROPOUT_RATE)(x)
+            x = layers.Dropout(DROPOUT_RATE)(x)
+        except Exception as e:
+            print(f"Warning: Skipping {layer_type} layer due to: {e}")
+            continue
     
     if len(x.shape) == 3:
         x = layers.Flatten()(x)
@@ -290,11 +313,11 @@ def evolve():
     })
     
     print("Generating initial training data...")
-    X_train, (y_next, y_half, y_full) = create_training_set(TRAIN_SAMPLES_BASE, 1000)
+    X_train, (y_next, y_half, y_full) = create_training_set(TRAIN_SAMPLES_BASE, 5_000)
     print(f"Training data: {X_train.shape}")
     
     print("Generating validation data...")
-    X_val, (y_val_next, y_val_half, y_val_full) = create_training_set(500, 200)
+    X_val, (y_val_next, y_val_half, y_val_full) = create_training_set(2500, 1000)
     
     y_train = (y_next, y_half, y_full)
     y_val = (y_val_next, y_val_half, y_val_full)
@@ -405,12 +428,12 @@ def evolve():
         num_elites = int(POPULATION_SIZE * ELITE_RATIO)
         elites = population[:num_elites]
         
-        new_population = [{'genome': elite['genome'], 'fitness': None} for elite in elites]
+        new_population = [{'genome': elite['genome'], 'fitness': elite['fitness'], 'metrics': elite.get('metrics')} for elite in elites]
         
         while len(new_population) < POPULATION_SIZE:
             parent = random.choice(elites)
             child_genome = mutate_genome(parent['genome'], mutation_rate, add_layer_rate, remove_layer_rate)
-            new_population.append({'genome': child_genome, 'fitness': None})
+            new_population.append({'genome': child_genome, 'fitness': None, 'metrics': None})
         
         population = new_population
         
@@ -427,12 +450,11 @@ def evolve():
             json.dump(checkpoint, f, indent=2)
         print(f"Checkpoint saved at generation {generation}")
         
-        if generation > 0:
-            prev_gen = generation - 1
-            for model_file in os.listdir('models'):
-                if model_file.startswith(f'gen_{prev_gen}_'):
+        for model_file in os.listdir('models'):
+            if model_file.startswith('gen_') and model_file.endswith('.keras'):
+                file_gen = int(model_file.split('_')[1])
+                if file_gen < generation:
                     os.remove(f'models/{model_file}')
-                    print(f"Removed old model: {model_file}")
     
     print(f"\n=== Evolution Complete ===")
     print(f"Best fitness ever: {best_fitness_ever:.6f}")
