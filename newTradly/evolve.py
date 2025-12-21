@@ -9,11 +9,12 @@ from params import WINDOW_SIZE, BATCH_SIZE, LEARNING_RATE, DROPOUT_RATE
 import random
 import json
 import os
+import gc
 
 MAX_PARAMS = 100_000_000
-BASE_MUTATION_RATE = 0.2
-BASE_ADD_LAYER_RATE = 0.1
-BASE_REMOVE_LAYER_RATE = 0.05
+BASE_MUTATION_RATE = 0.35
+BASE_ADD_LAYER_RATE = 0.25
+BASE_REMOVE_LAYER_RATE = 0.15
 ELITE_RATIO = 0.5
 POPULATION_SIZE = 40
 GENERATIONS = 10_000
@@ -275,6 +276,7 @@ def evaluate_individual(genome, X_train, y_train, X_val, y_val, generation, indi
         del model
         keras.backend.clear_session()
         tf.keras.backend.clear_session()
+        gc.collect()
         
         return fitness, individual_metrics
     except Exception as e:
@@ -340,6 +342,16 @@ def evolve():
             decay_factor = 1.0
             epochs_this_gen = EPOCHS_PER_GEN
             use_callbacks = False
+            
+            if generation > 0 and generation % 10 == 0:
+                print("\nRefreshing training data...")
+                X_train, (y_next, y_half, y_full) = create_training_set(TRAIN_SAMPLES_BASE, 5_000)
+                y_train = (y_next, y_half, y_full)
+                print(f"New training data: {X_train.shape}")
+                
+                print("Refreshing validation data...")
+                X_val, (y_val_next, y_val_half, y_val_full) = create_training_set(2500, 1000)
+                y_val = (y_val_next, y_val_half, y_val_full)
         else:
             consolidation_progress = (generation - exploration_phase) / (GENERATIONS - exploration_phase)
             decay_factor = 1.0 - consolidation_progress

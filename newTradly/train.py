@@ -31,6 +31,13 @@ def create_lstm_model(input_shape):
         x = layers.LSTM(units, return_sequences=return_sequences)(x)
         x = layers.Dropout(DROPOUT_RATE)(x)
     
+    middle = layers.Dense(1024, activation='relu')(x)
+    x = layers.Dropout(DROPOUT_RATE)(middle)
+    middle2 = layers.Dense(512, activation='relu')(x)
+    x = layers.Dropout(DROPOUT_RATE)(middle2)
+    middle3 = layers.Dense(256, activation='relu')(x)
+    x = layers.Dropout(DROPOUT_RATE)(middle3)
+
     output_next = layers.Dense(1, name='next')(x)
     output_half = layers.Dense(1, name='half')(x)
     output_full = layers.Dense(1, name='full')(x)
@@ -144,7 +151,7 @@ def train():
     )
     
     print("Generating training data...")
-    X_train, (y_next, y_half, y_full) = create_training_set(25_000, 5_000)
+    X_train, (y_next, y_half, y_full) = create_training_set(500_000, 15_000)
     print(f"Training data shape: {X_train.shape}")
     print(f"Target shapes: {y_next.shape}, {y_half.shape}, {y_full.shape}")
     
